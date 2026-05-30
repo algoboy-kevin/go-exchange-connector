@@ -47,12 +47,12 @@ type ExchangeConnector interface {
 	// Unsubscribe stops receiving market data for the given asset IDs.
 	Unsubscribe(assetIDs []string)
 
-	// SetOnEvent registers a callback fired for every raw typed event
-	// before handler dispatch. Used for recording/monitoring.
-	SetOnEvent(cb func(any))
-
-	// SetHandlers configures all event and lifecycle handlers at once.
-	SetHandlers(handlers ConnectorHandlers)
+	// SetDispatcher sets the event dispatcher callback. Exchange-specific
+	// code pushes typed events (PriceChangeEvent, BookSnapshotEvent,
+	// TradeEvent, OrderPlacementEvent, etc.) through DispatchEvent, which
+	// routes them here. The application mounts a switch to forward events
+	// to the appropriate actor/manager.
+	SetDispatcher(d func(any))
 
 	// ── Lifecycle ───────────────────────────────────────────
 
@@ -61,33 +61,6 @@ type ExchangeConnector interface {
 
 	// Stop shuts down the connector gracefully.
 	Stop()
-}
-
-// ─────────────────────────────────────────────────────────────
-// ConnectorHandlers
-// ─────────────────────────────────────────────────────────────
-
-// ConnectorHandlers groups all event and lifecycle callbacks that can be
-// mounted on a Connector. Pass to SetHandlers for a clean one-shot setup.
-type ConnectorHandlers struct {
-	// Market data handlers — called by exchange-specific WS code.
-	OnPriceChange    func(marketID string, changes []PriceChange)
-	OnBook           func(snapshot BookSnapshot)
-	OnTrade          func(trade Trade)
-	OnMarketResolved func(ev MarketResolved)
-	OnTickChange     func(ev TickChange)
-
-	// Order lifecycle handlers — PAPER mode calls these directly;
-	// LIVE mode calls them after exchange WS confirmation.
-	OnReservation func(order LimitOrder) error
-	OnPlacement   func(order LimitOrder) error
-	OnCancel      func(orderID string) error
-	OnFill        func(fill Fill)
-
-	// Other handlers.
-	OnError   func(err error)
-	OnWSOpen  func()
-	OnWSClose func()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -113,21 +86,21 @@ type LiveExecutor interface {
 //
 // Usage:
 //
-//	// PAPER mode — orders are simulated via mounted handlers:
+//	// PAPER mode — orders are simulated, events dispatched:
 //	conn := connector.New(false, nil)
-//	conn.OnReservation = func(o connector.LimitOrder) error { ... }
-//	conn.OnPlacement   = func(o connector.LimitOrder) error { ... }
+//	conn.SetDispatcher(func(ev any) {
+//	    switch e := ev.(type) {
+//	    case *connector.OrderPlacementEvent: ...
+//	    case *connector.OrderFillEvent: ...
+//	    }
+//	})
 //
 //	// LIVE mode — delegates to a LiveExecutor:
 //	exec := &polymarket.LiveExecutor{...}
 //	conn := connector.New(true, exec)
 //
-// Market data handlers (OnPriceChange, OnBook, etc.) are called by
-// exchange-specific WS code. Mount them to process incoming data:
-//
-//	conn.OnPriceChange = func(marketID string, changes []connector.PriceChange) {
-//	    // forward to internal actor system
-//	}
+// Exchange-specific WS code pushes typed events through DispatchEvent,
+// which routes them to the mounted dispatcher.
 type Connector struct {
 	// IsLive controls execution routing.
 	//   false → PlaceLimitOrders/CancelOrders simulate via handler chain
@@ -142,43 +115,10 @@ type Connector struct {
 	// Override for backtest mode (e.g. return clock.Now()).
 	Now func() time.Time
 
-	// ── Market data handlers ────────────────────────────────
-	// Called by exchange-specific WebSocket code when events arrive.
-
-	OnPriceChange    func(marketID string, changes []PriceChange)
-	OnBook           func(snapshot BookSnapshot)
-	OnTrade          func(trade Trade)
-	OnMarketResolved func(ev MarketResolved)
-	OnTickChange     func(ev TickChange)
-
-	// ── Order lifecycle handlers ────────────────────────────
-	// Mounted by the application to bridge into the internal
-	// order management system (OrderManager, Store, etc.).
-	//
-	// PAPER mode: Connector calls these directly in PlaceLimitOrders.
-	// LIVE mode:  exchange WS confirmation calls these after the
-	//             exchange confirms the order.
-
-	OnReservation func(order LimitOrder) error
-	OnPlacement   func(order LimitOrder) error
-	OnCancel      func(orderID string) error
-	OnFill        func(fill Fill)
-
-	// ── Other handlers ──────────────────────────────────────
-
-	// OnError is called for non-fatal errors.
-	OnError func(err error)
-
-	// OnWSOpen is called when the WebSocket connects.
-	OnWSOpen func()
-
-	// OnWSClose is called when the WebSocket disconnects.
-	OnWSClose func()
-
 	// ── Internal ────────────────────────────────────────────
 
-	seqID   atomic.Int64
-	onEvent func(any)
+	seqID      atomic.Int64
+	onDispatch func(any)
 }
 
 // New creates a new Connector.
@@ -212,24 +152,27 @@ func (c *Connector) PlaceLimitOrders(orders []LimitOrder) (OrderResult, error) {
 		return c.Live.PlaceLimitOrders(orders)
 	}
 
-	// ── PAPER mode: simulate order lifecycle ────────────────
+	// ── PAPER mode: simulate order lifecycle via dispatch ────
 	for i, o := range orders {
-		if c.OnReservation != nil {
-			if err := c.OnReservation(o); err != nil {
-				return OrderResult{
-					Success:  false,
-					ErrorMsg: err.Error(),
-				}, err
-			}
-		}
-		if c.OnPlacement != nil {
-			if err := c.OnPlacement(o); err != nil {
-				return OrderResult{
-					Success:  false,
-					ErrorMsg: err.Error(),
-				}, err
-			}
-		}
+		now := c.Now()
+		c.DispatchEvent(&OrderReservationEvent{
+			ClientID:  o.OrderID,
+			MarketID:  o.MarketID,
+			AssetID:   o.AssetID,
+			Side:      o.Side,
+			Price:     o.Price,
+			Size:      o.Size,
+			Timestamp: now,
+		})
+		c.DispatchEvent(&OrderPlacementEvent{
+			BrokerID:  o.OrderID,
+			MarketID:  o.MarketID,
+			AssetID:   o.AssetID,
+			Side:      o.Side,
+			Price:     o.Price,
+			Size:      o.Size,
+			Timestamp: now,
+		})
 
 		// Log progress for large batches.
 		if i > 0 && i%100 == 0 {
@@ -261,13 +204,12 @@ func (c *Connector) CancelOrders(orderIDs []string) error {
 		return c.Live.CancelOrders(orderIDs)
 	}
 
-	// ── PAPER mode: simulate cancellation ───────────────────
+	// ── PAPER mode: simulate cancellation via dispatch ──────
 	for _, id := range orderIDs {
-		if c.OnCancel != nil {
-			if err := c.OnCancel(id); err != nil {
-				return err
-			}
-		}
+		c.DispatchEvent(&OrderCancelEvent{
+			BrokerID:  id,
+			Timestamp: c.Now(),
+		})
 	}
 	return nil
 }
@@ -300,27 +242,12 @@ func (c *Connector) Unsubscribe(assetIDs []string) {
 	slog.Warn("connector: Unsubscribe not implemented (override in exchange-specific code)")
 }
 
-// SetOnEvent registers a callback for raw typed events.
-// The callback receives the same struct that is passed to the handler
-// fields (e.g. BookSnapshot, Trade), before handler dispatch.
-func (c *Connector) SetOnEvent(cb func(any)) {
-	c.onEvent = cb
-}
-
-// SetHandlers configures all event and lifecycle handlers at once.
-func (c *Connector) SetHandlers(handlers ConnectorHandlers) {
-	c.OnPriceChange = handlers.OnPriceChange
-	c.OnBook = handlers.OnBook
-	c.OnTrade = handlers.OnTrade
-	c.OnMarketResolved = handlers.OnMarketResolved
-	c.OnTickChange = handlers.OnTickChange
-	c.OnReservation = handlers.OnReservation
-	c.OnPlacement = handlers.OnPlacement
-	c.OnCancel = handlers.OnCancel
-	c.OnFill = handlers.OnFill
-	c.OnError = handlers.OnError
-	c.OnWSOpen = handlers.OnWSOpen
-	c.OnWSClose = handlers.OnWSClose
+// SetDispatcher sets the event dispatcher callback. All typed events
+// (PriceChangeEvent, BookSnapshotEvent, TradeEvent, OrderPlacementEvent,
+// etc.) from exchange-specific WS code are routed through DispatchEvent
+// to this callback.
+func (c *Connector) SetDispatcher(d func(any)) {
+	c.onDispatch = d
 }
 
 // Start initialises the connector. Override in exchange-specific code
@@ -340,11 +267,12 @@ func (c *Connector) Stop() {
 
 // ── Helpers ──────────────────────────────────────────────────
 
-// DispatchEvent fires the OnEvent hook (if set). Call this from
+// DispatchEvent fires the OnEvent hook (for recording/monitoring)
+// and the dispatcher callback (for actor routing). Call this from
 // exchange-specific code after constructing typed event structs.
 func (c *Connector) DispatchEvent(ev any) {
-	if c.onEvent != nil {
-		c.onEvent(ev)
+	if c.onDispatch != nil {
+		c.onDispatch(ev)
 	}
 }
 

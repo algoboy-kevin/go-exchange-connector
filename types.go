@@ -20,23 +20,21 @@
 // to paper simulation or live executor based on isLive).
 package connector
 
-import "time"
-
 // ─────────────────────────────────────────────────────────────
 // Market types
 // ─────────────────────────────────────────────────────────────
 
 // Market represents an exchange-agnostic prediction market.
 type Market struct {
-	ID          string   `json:"id"`
-	Slug        string   `json:"slug"`
-	Question    string   `json:"question"`
-	ConditionID string   `json:"condition_id"`
-	YesAssetID  string   `json:"yes_asset_id"`
-	NoAssetID   string   `json:"no_asset_id"`
-	Outcomes    []string `json:"outcomes"`
-	TickSize    float64  `json:"tick_size"`
-	IsResolved  bool     `json:"is_resolved"`
+	ID          string      `json:"id"`
+	Slug        string      `json:"slug"`
+	Question    string      `json:"question"`
+	ConditionID string      `json:"condition_id"`
+	YesAssetID  string      `json:"yes_asset_id"`
+	NoAssetID   string      `json:"no_asset_id"`
+	Outcomes    []string    `json:"outcomes"`
+	TickSize    float64     `json:"tick_size"`
+	IsResolved  bool        `json:"is_resolved"`
 	Resolution  *Resolution `json:"resolution,omitempty"`
 }
 
@@ -84,68 +82,5 @@ type CancelOrder struct {
 	AssetID string `json:"asset_id,omitempty"`
 }
 
-// ─────────────────────────────────────────────────────────────
-// Market data types
-// ─────────────────────────────────────────────────────────────
-
-// PriceLevel represents a single price level in an orderbook.
-type PriceLevel struct {
-	Price string `json:"price"`
-	Size  string `json:"size"`
-}
-
-// PriceChange describes a single price level change event.
-type PriceChange struct {
-	AssetID string `json:"asset_id"`
-	Price   string `json:"price"`
-	Size    string `json:"size"`
-	Side    string `json:"side"` // "BUY" or "SELL"
-	Hash    string `json:"hash,omitempty"`
-}
-
-// BookSnapshot is a full orderbook snapshot.
-type BookSnapshot struct {
-	MarketID  string       `json:"market_id"`
-	AssetID   string       `json:"asset_id"`
-	Timestamp time.Time    `json:"timestamp"`
-	Bids      []PriceLevel `json:"bids"`
-	Asks      []PriceLevel `json:"asks"`
-}
-
-// Trade is a trade/match event.
-type Trade struct {
-	AssetID   string    `json:"asset_id"`
-	Side      string    `json:"side"` // "BUY" or "SELL"
-	Price     string    `json:"price"`
-	Size      string    `json:"size"`
-	TradeID   string    `json:"trade_id,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-// Fill represents a partial or full order fill.
-type Fill struct {
-	TradeID   string    `json:"trade_id"`
-	OrderID   string    `json:"order_id"`
-	AssetID   string    `json:"asset_id"`
-	Side      string    `json:"side"`
-	Price     float64   `json:"price"`
-	Size      float64   `json:"size"`
-	Fee       float64   `json:"fee"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-// MarketResolved is a market resolution event.
-type MarketResolved struct {
-	MarketID       string    `json:"market_id"`
-	ConditionID    string    `json:"condition_id"`
-	WinningAssetID string    `json:"winning_asset_id"`
-	WinningOutcome string    `json:"winning_outcome"`
-	Timestamp      time.Time `json:"timestamp"`
-}
-
-// TickChange represents a tick size change event.
-type TickChange struct {
-	AssetID     string `json:"asset_id"`
-	OldTickSize string `json:"old_tick_size"`
-	NewTickSize string `json:"new_tick_size"`
-}
+// ── Events (PriceChangeEvent, BookSnapshotEvent, TradeEvent, etc.)
+// are in events.go — use those for actor dispatch.

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/algoboy-kevin/go-exchange-connector"
+	connector "github.com/algoboy-kevin/go-exchange-connector"
 	"github.com/algoboy-kevin/go-exchange-connector/internal/utils"
 	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
 	gws "github.com/gorilla/websocket"
@@ -65,8 +65,8 @@ func NewWSPolymarketUserWS(base *connector.Connector, auth UserAuth, handlers Us
 	u.OnError = func(err error) {
 		if u.handlers.OnError != nil {
 			u.handlers.OnError(err)
-		} else if u.base.OnError != nil {
-			u.base.OnError(err)
+		} else {
+			slog.Warn("user WS: error", "err", err)
 		}
 	}
 
@@ -214,8 +214,8 @@ func (u *WSPolymarketUserWS) onConnect(ctx context.Context, conn *gws.Conn) erro
 func (u *WSPolymarketUserWS) onDisconnect(err error) {
 	if u.handlers.OnWSClose != nil {
 		u.handlers.OnWSClose()
-	} else if u.base.OnWSClose != nil {
-		u.base.OnWSClose()
+	} else {
+		slog.Debug("user WS: disconnected")
 	}
 }
 
@@ -265,27 +265,27 @@ func (u *WSPolymarketUserWS) handleOrder(raw json.RawMessage) {
 		u.handlers.OnOrder([]OrderWSEvent{ev})
 	}
 
-	// Also translate to connector lifecycle handlers for common events.
-	// ts := utils.SafeParseTimestamp(ev.Timestamp)
+	ts := utils.SafeParseTimestamp(ev.Timestamp)
 	price := safeParseFloat(ev.Price)
 	size := safeParseFloat(ev.OriginalSize)
 
 	switch ev.Type {
 	case "PLACEMENT":
-		if u.base.OnPlacement != nil {
-			u.base.OnPlacement(connector.LimitOrder{
-				OrderID:  ev.ID,
-				MarketID: ev.Market,
-				AssetID:  ev.AssetID,
-				Side:     ev.Side,
-				Price:    price,
-				Size:     size,
-			})
-		}
+		u.base.DispatchEvent(&connector.OrderPlacementEvent{
+			BrokerID:  ev.ID,
+			MarketID:  ev.Market,
+			AssetID:   ev.AssetID,
+			Side:      ev.Side,
+			Price:     price,
+			Size:      size,
+			Timestamp: ts,
+		})
 	case "CANCELLATION":
-		if u.base.OnCancel != nil {
-			u.base.OnCancel(ev.ID)
-		}
+		u.base.DispatchEvent(&connector.OrderCancelEvent{
+			BrokerID:  ev.ID,
+			AssetID:   ev.AssetID,
+			Timestamp: ts,
+		})
 	}
 }
 
@@ -301,22 +301,19 @@ func (u *WSPolymarketUserWS) handleTrade(raw json.RawMessage) {
 		u.handlers.OnTrade([]TradeWSEvent{ev})
 	}
 
-	// Translate to connector fill handler.
-	if u.base.OnFill != nil {
-		ts := utils.SafeParseTimestamp(ev.Timestamp)
-		price := safeParseFloat(ev.Price)
-		size := safeParseFloat(ev.Size)
+	ts := utils.SafeParseTimestamp(ev.Timestamp)
+	price := safeParseFloat(ev.Price)
+	size := safeParseFloat(ev.Size)
 
-		u.base.OnFill(connector.Fill{
-			TradeID:   ev.ID,
-			OrderID:   ev.TakerOrderID,
-			AssetID:   ev.AssetID,
-			Side:      ev.Side,
-			Price:     price,
-			Size:      size,
-			Timestamp: ts,
-		})
-	}
+	u.base.DispatchEvent(&connector.OrderFillEvent{
+		TradeID:   ev.ID,
+		BrokerID:  ev.TakerOrderID,
+		AssetID:   ev.AssetID,
+		Side:      ev.Side,
+		Price:     price,
+		Size:      size,
+		Timestamp: ts,
+	})
 }
 
 // ─────────────────────────────────────────────────────────────

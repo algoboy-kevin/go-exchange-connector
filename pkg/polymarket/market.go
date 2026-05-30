@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/algoboy-kevin/go-exchange-connector"
+	connector "github.com/algoboy-kevin/go-exchange-connector"
 	"github.com/algoboy-kevin/go-exchange-connector/internal/utils"
 	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
 	gws "github.com/gorilla/websocket"
@@ -60,9 +60,7 @@ func NewWSPolymarketMarket(base *connector.Connector) *WSPolymarketMarket {
 	pm.OnMessage = pm.onMessage
 	pm.OnDisconnect = pm.onDisconnect
 	pm.OnError = func(err error) {
-		if pm.base.OnError != nil {
-			pm.base.OnError(err)
-		}
+		slog.Warn("market WS: error", "err", err)
 	}
 
 	return pm
@@ -244,9 +242,7 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 	pm.subscribedAssetIDs = make(map[string]struct{})
 	pm.mu.Unlock()
 
-	if pm.base.OnWSClose != nil {
-		pm.base.OnWSClose()
-	}
+	slog.Debug("market WS: disconnected")
 }
 
 func (pm *WSPolymarketMarket) onMessage(ctx context.Context, data []byte) error {
@@ -293,7 +289,7 @@ func (pm *WSPolymarketMarket) onMessage(ctx context.Context, data []byte) error 
 }
 
 // ─────────────────────────────────────────────────────────────
-// Event handlers — parse Polymarket JSON → call connector.On*
+// Event handlers — parse Polymarket JSON → dispatch typed events
 // ─────────────────────────────────────────────────────────────
 
 func (pm *WSPolymarketMarket) handlePriceChange(raw json.RawMessage) {
@@ -302,28 +298,35 @@ func (pm *WSPolymarketMarket) handlePriceChange(raw json.RawMessage) {
 		slog.Warn("market WS: failed to parse price_change", "err", err)
 		return
 	}
-	if pm.base.OnPriceChange == nil {
-		return
-	}
 
 	pm.mu.RLock()
-	filtered := make([]connector.PriceChange, 0, len(ev.PriceChanges))
+	items := make([]connector.PriceChangeItem, 0, len(ev.PriceChanges))
 	for _, pc := range ev.PriceChanges {
 		if _, ok := pm.subscribedAssetIDs[pc.AssetID]; ok {
-			filtered = append(filtered, connector.PriceChange{
+			items = append(items, connector.PriceChangeItem{
 				AssetID: pc.AssetID,
 				Price:   pc.Price,
 				Size:    pc.Size,
 				Side:    pc.Side,
 				Hash:    pc.Hash,
+				BestBid: pc.BestBid,
+				BestAsk: pc.BestAsk,
 			})
 		}
 	}
 	pm.mu.RUnlock()
 
-	if len(filtered) > 0 {
-		pm.base.OnPriceChange(ev.Market, filtered)
+	if len(items) == 0 {
+		return
 	}
+
+	pm.base.DispatchEvent(&connector.PriceChangeEvent{
+		SeqID:      pm.base.NextSeqID(),
+		ReceivedAt: pm.base.Now(),
+		Market:     ev.Market,
+		Timestamp:  utils.SafeParseTimestamp(ev.Timestamp),
+		Changes:    items,
+	})
 }
 
 func (pm *WSPolymarketMarket) handleBook(raw json.RawMessage) {
@@ -332,25 +335,28 @@ func (pm *WSPolymarketMarket) handleBook(raw json.RawMessage) {
 		slog.Warn("market WS: failed to parse book", "err", err)
 		return
 	}
-	if !pm.isSubscribed(ev.AssetID) || pm.base.OnBook == nil {
+	if !pm.isSubscribed(ev.AssetID) {
 		return
 	}
 
-	bids := make([]connector.PriceLevel, len(ev.Bids))
+	bids := make([]connector.Level, len(ev.Bids))
 	for i, l := range ev.Bids {
-		bids[i] = connector.PriceLevel{Price: l.Price, Size: l.Size}
+		bids[i] = connector.Level{Price: l.Price, Size: l.Size}
 	}
-	asks := make([]connector.PriceLevel, len(ev.Asks))
+	asks := make([]connector.Level, len(ev.Asks))
 	for i, l := range ev.Asks {
-		asks[i] = connector.PriceLevel{Price: l.Price, Size: l.Size}
+		asks[i] = connector.Level{Price: l.Price, Size: l.Size}
 	}
 
-	pm.base.OnBook(connector.BookSnapshot{
-		MarketID:  ev.Market,
-		AssetID:   ev.AssetID,
-		Timestamp: utils.SafeParseTimestamp(ev.Timestamp),
-		Bids:      bids,
-		Asks:      asks,
+	pm.base.DispatchEvent(&connector.BookSnapshotEvent{
+		SeqID:      pm.base.NextSeqID(),
+		ReceivedAt: pm.base.Now(),
+		Market:     ev.Market,
+		AssetID:    ev.AssetID,
+		Timestamp:  utils.SafeParseTimestamp(ev.Timestamp),
+		Hash:       ev.Hash,
+		Bids:       bids,
+		Asks:       asks,
 	})
 }
 
@@ -360,16 +366,18 @@ func (pm *WSPolymarketMarket) handleLastTradePrice(raw json.RawMessage) {
 		slog.Warn("market WS: failed to parse last_trade_price", "err", err)
 		return
 	}
-	if !pm.isSubscribed(ev.AssetID) || pm.base.OnTrade == nil {
+	if !pm.isSubscribed(ev.AssetID) {
 		return
 	}
 
-	pm.base.OnTrade(connector.Trade{
-		AssetID:   ev.AssetID,
-		Side:      ev.Side,
-		Price:     ev.Price,
-		Size:      ev.Size,
-		Timestamp: utils.SafeParseTimestamp(ev.Timestamp),
+	pm.base.DispatchEvent(&connector.TradeEvent{
+		SeqID:      pm.base.NextSeqID(),
+		ReceivedAt: pm.base.Now(),
+		AssetID:    ev.AssetID,
+		Side:       ev.Side,
+		Size:       ev.Size,
+		Price:      ev.Price,
+		Timestamp:  utils.SafeParseTimestamp(ev.Timestamp),
 	})
 }
 
@@ -379,14 +387,18 @@ func (pm *WSPolymarketMarket) handleTickSizeChange(raw json.RawMessage) {
 		slog.Warn("market WS: failed to parse tick_size_change", "err", err)
 		return
 	}
-	if !pm.isSubscribed(ev.AssetID) || pm.base.OnTickChange == nil {
+	if !pm.isSubscribed(ev.AssetID) {
 		return
 	}
 
-	pm.base.OnTickChange(connector.TickChange{
+	pm.base.DispatchEvent(&connector.TickChangeEvent{
+		SeqID:       pm.base.NextSeqID(),
+		ReceivedAt:  pm.base.Now(),
 		AssetID:     ev.AssetID,
+		Market:      ev.Market,
 		OldTickSize: ev.OldTickSize,
 		NewTickSize: ev.NewTickSize,
+		Timestamp:   utils.SafeParseTimestamp(ev.Timestamp),
 	})
 }
 
@@ -396,11 +408,10 @@ func (pm *WSPolymarketMarket) handleMarketResolved(raw json.RawMessage) {
 		slog.Warn("market WS: failed to parse market_resolved", "err", err)
 		return
 	}
-	if pm.base.OnMarketResolved == nil {
-		return
-	}
 
-	pm.base.OnMarketResolved(connector.MarketResolved{
+	pm.base.DispatchEvent(&connector.MarketResolvedEvent{
+		SeqID:          pm.base.NextSeqID(),
+		ReceivedAt:     pm.base.Now(),
 		MarketID:       ev.ID,
 		ConditionID:    ev.Market,
 		WinningAssetID: ev.WinningAssetID,

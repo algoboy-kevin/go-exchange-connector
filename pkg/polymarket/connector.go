@@ -21,9 +21,15 @@ import (
 //
 //	cfg := polymarket.Config{APIKey: "...", Secret: "..."}
 //	conn := polymarket.New(false, cfg)
-//	conn.OnBook = func(snap connector.BookSnapshot) { ... }
-//	conn.OnReservation = func(o connector.LimitOrder) error { ... }
-//	conn.OnPlacement = func(o connector.LimitOrder) error { ... }
+//	conn.SetDispatcher(func(ev any) {
+//	    switch e := ev.(type) {
+//	    case *connector.PriceChangeEvent:     ...
+//	    case *connector.BookSnapshotEvent:    ...
+//	    case *connector.TradeEvent:           ...
+//	    case *connector.OrderPlacementEvent:  ...
+//	    case *connector.OrderFillEvent:       ...
+//	    }
+//	})
 //	conn.Start(ctx)
 //	defer conn.Stop()
 //	conn.Subscribe([]string{"asset_id_1"})
@@ -104,10 +110,6 @@ func (p *PolymarketConnector) Start(ctx context.Context) error {
 		"user_ws", p.user != nil,
 	)
 
-	if p.Connector.OnWSOpen != nil {
-		p.Connector.OnWSOpen()
-	}
-
 	return nil
 }
 
@@ -120,10 +122,6 @@ func (p *PolymarketConnector) Stop() {
 		p.market.Stop()
 	}
 	slog.Info("polymarket: connector stopped")
-
-	if p.Connector.OnWSClose != nil {
-		p.Connector.OnWSClose()
-	}
 }
 
 // Subscribe starts receiving market data for the given asset IDs.
