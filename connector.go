@@ -51,6 +51,9 @@ type ExchangeConnector interface {
 	// before handler dispatch. Used for recording/monitoring.
 	SetOnEvent(cb func(any))
 
+	// SetHandlers configures all event and lifecycle handlers at once.
+	SetHandlers(handlers ConnectorHandlers)
+
 	// ── Lifecycle ───────────────────────────────────────────
 
 	// Start initialises the connector (connects WebSockets, etc.).
@@ -58,6 +61,33 @@ type ExchangeConnector interface {
 
 	// Stop shuts down the connector gracefully.
 	Stop()
+}
+
+// ─────────────────────────────────────────────────────────────
+// ConnectorHandlers
+// ─────────────────────────────────────────────────────────────
+
+// ConnectorHandlers groups all event and lifecycle callbacks that can be
+// mounted on a Connector. Pass to SetHandlers for a clean one-shot setup.
+type ConnectorHandlers struct {
+	// Market data handlers — called by exchange-specific WS code.
+	OnPriceChange    func(marketID string, changes []PriceChange)
+	OnBook           func(snapshot BookSnapshot)
+	OnTrade          func(trade Trade)
+	OnMarketResolved func(ev MarketResolved)
+	OnTickChange     func(ev TickChange)
+
+	// Order lifecycle handlers — PAPER mode calls these directly;
+	// LIVE mode calls them after exchange WS confirmation.
+	OnReservation func(order LimitOrder) error
+	OnPlacement   func(order LimitOrder) error
+	OnCancel      func(orderID string) error
+	OnFill        func(fill Fill)
+
+	// Other handlers.
+	OnError   func(err error)
+	OnWSOpen  func()
+	OnWSClose func()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -275,6 +305,22 @@ func (c *Connector) Unsubscribe(assetIDs []string) {
 // fields (e.g. BookSnapshot, Trade), before handler dispatch.
 func (c *Connector) SetOnEvent(cb func(any)) {
 	c.onEvent = cb
+}
+
+// SetHandlers configures all event and lifecycle handlers at once.
+func (c *Connector) SetHandlers(handlers ConnectorHandlers) {
+	c.OnPriceChange = handlers.OnPriceChange
+	c.OnBook = handlers.OnBook
+	c.OnTrade = handlers.OnTrade
+	c.OnMarketResolved = handlers.OnMarketResolved
+	c.OnTickChange = handlers.OnTickChange
+	c.OnReservation = handlers.OnReservation
+	c.OnPlacement = handlers.OnPlacement
+	c.OnCancel = handlers.OnCancel
+	c.OnFill = handlers.OnFill
+	c.OnError = handlers.OnError
+	c.OnWSOpen = handlers.OnWSOpen
+	c.OnWSClose = handlers.OnWSClose
 }
 
 // Start initialises the connector. Override in exchange-specific code

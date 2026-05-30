@@ -63,6 +63,10 @@ func (m *MockConnector) SetOnEvent(cb func(any)) {
 	m.OnEvent = cb
 }
 
+func (m *MockConnector) SetHandlers(handlers ConnectorHandlers) {
+	// No-op — mock doesn't route to handlers.
+}
+
 func (m *MockConnector) Start(ctx context.Context) error {
 	slog.Info("mock: connector started")
 	return nil
