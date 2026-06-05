@@ -206,14 +206,26 @@ func (b *BaseWebSocket) dialSync(ctx context.Context) error {
 // ─────────────────────────────────────────────────────────────
 
 func (b *BaseWebSocket) readLoop(ctx context.Context) {
-	defer b.reconnCleanup()
+	// Capture the connection at the start so cleanup only closes this
+	// specific connection — not a replacement set by a concurrent dialSync.
+	conn := b.Conn()
+	if conn == nil {
+		return
+	}
+	cleanup := func() {
+		b.mu.Lock()
+		if b.conn == conn {
+			b.conn.Close()
+			b.conn = nil
+		}
+		if b.status != StatusDisconnected {
+			b.status = StatusDisconnected
+		}
+		b.mu.Unlock()
+	}
+	defer cleanup()
 
 	for {
-		conn := b.Conn()
-		if conn == nil {
-			return
-		}
-
 		// Check context before blocking on read.
 		if ctx.Err() != nil {
 			return
