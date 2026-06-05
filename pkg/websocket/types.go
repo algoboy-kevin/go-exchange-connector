@@ -54,9 +54,9 @@ type WSOptions struct {
 // DefaultWSOptions returns sensible defaults for a production WebSocket connection.
 func DefaultWSOptions() WSOptions {
 	return WSOptions{
-		ReconnectInterval: 5000,   // 5s
-		ConnectionTimeout: 30000,  // 30s
-		PingInterval:      20000,  // 20s
+		ReconnectInterval: 5000,  // 5s
+		ConnectionTimeout: 30000, // 30s
+		PingInterval:      20000, // 20s
 	}
 }
 
@@ -73,5 +73,3 @@ type WSocketError struct {
 }
 
 func (e *WSocketError) Error() string { return "websocket: " + e.Msg }
-
-
