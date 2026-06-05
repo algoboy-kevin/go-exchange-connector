@@ -247,13 +247,19 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 					"code", code, "reason", err.Error())
 			}
 
-			// Only fire OnDisconnect if the connection wasn't already
-			// intentionally disconnected (e.g. by Disconnect()). This
-			// prevents the double-fire race between Disconnect() and
-			// a dying readLoop goroutine.
+			// Check whether this readLoop is still the active one.
+			// If a reconnection already happened (b.conn was replaced),
+			// this goroutine is stale — exit without firing OnDisconnect
+			// to avoid wiping subscriptions on the active connection.
 			b.mu.RLock()
+			connIsCurrent := b.conn == conn
 			alreadyDisconnected := b.status == StatusDisconnected
 			b.mu.RUnlock()
+
+			if !connIsCurrent {
+				// Stale readLoop — a newer connection replaced us.
+				return
+			}
 
 			if !alreadyDisconnected {
 				b.safeCallOnDisconnect(err)
