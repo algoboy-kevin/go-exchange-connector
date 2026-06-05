@@ -217,9 +217,9 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 		if b.conn == conn {
 			b.conn.Close()
 			b.conn = nil
-		}
-		if b.status != StatusDisconnected {
-			b.status = StatusDisconnected
+			if b.status != StatusDisconnected {
+				b.status = StatusDisconnected
+			}
 		}
 		b.mu.Unlock()
 	}
