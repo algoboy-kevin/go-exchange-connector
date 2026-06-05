@@ -143,7 +143,7 @@ func (pm *WSPolymarketMarket) Unsubscribe(ctx context.Context, assetIDs []string
 	pm.mu.Unlock()
 
 	if needsReconnect {
-		pm.Close()
+		pm.Disconnect()
 	}
 }
 
@@ -262,8 +262,13 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn)
 	for id := range pm.pendingSubscribeIDs {
 		allIDs[id] = struct{}{}
 	}
+	// Remove any assets that are pending unsubscribe.
+	for id := range pm.pendingUnsubscribeIDs {
+		delete(allIDs, id)
+	}
 	pm.subscribedAssetIDs = allIDs
 	pm.pendingSubscribeIDs = make(map[string]struct{})
+	pm.pendingUnsubscribeIDs = make(map[string]struct{})
 	pm.mu.Unlock()
 
 	if len(allIDs) == 0 {
