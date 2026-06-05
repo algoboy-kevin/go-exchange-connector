@@ -79,13 +79,13 @@ type TickSizeChangeWSEvent struct {
 
 // MarketResolvedWSEvent is a market_resolved event.
 type MarketResolvedWSEvent struct {
-	EventType      string `json:"event_type"` // "market_resolved"
-	ID             string `json:"id"`
-	Market         string `json:"market"`
+	EventType      string   `json:"event_type"` // "market_resolved"
+	ID             string   `json:"id"`
+	Market         string   `json:"market"`
 	AssetsIDs      []string `json:"assets_ids"`
-	WinningAssetID string `json:"winning_asset_id"`
-	WinningOutcome string `json:"winning_outcome"`
-	Timestamp      string `json:"timestamp"`
+	WinningAssetID string   `json:"winning_asset_id"`
+	WinningOutcome string   `json:"winning_outcome"`
+	Timestamp      string   `json:"timestamp"`
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -152,15 +152,15 @@ type GammaMarket struct {
 
 // RawGammaMarket is the raw JSON shape from the Gamma API.
 type RawGammaMarket struct {
-	ID          string  `json:"id"`
-	ConditionID string  `json:"conditionId"`
-	Slug        string  `json:"slug"`
-	Question    string  `json:"question"`
-	Outcomes    string  `json:"outcomes"`      // JSON string: ["Up", "Down"]
-	OutcomePrices string `json:"outcomePrices"` // JSON string: ["0.505", "0.495"]
-	ClobTokenIDs string  `json:"clobTokenIds"` // JSON string: ["<yesId>", "<noId>"]
-	Closed      bool    `json:"closed"`
-	TickSize    float64 `json:"orderPriceMinTickSize"`
+	ID            string  `json:"id"`
+	ConditionID   string  `json:"conditionId"`
+	Slug          string  `json:"slug"`
+	Question      string  `json:"question"`
+	Outcomes      string  `json:"outcomes"`      // JSON string: ["Up", "Down"]
+	OutcomePrices string  `json:"outcomePrices"` // JSON string: ["0.505", "0.495"]
+	ClobTokenIDs  string  `json:"clobTokenIds"`  // JSON string: ["<yesId>", "<noId>"]
+	Closed        bool    `json:"closed"`
+	TickSize      float64 `json:"orderPriceMinTickSize"`
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -169,10 +169,12 @@ type RawGammaMarket struct {
 
 // Config holds Polymarket connection settings.
 type Config struct {
-	APIKey       string `yaml:"api_key"`
-	Secret       string `yaml:"api_secret"`
-	Passphrase   string `yaml:"api_passphrase"`
-	GammaAPIURL  string `yaml:"gamma_api_url,omitempty"`
-	MarketWSURL  string `yaml:"market_ws_url,omitempty"`
-	UserWSURL    string `yaml:"user_ws_url,omitempty"`
+	APIKey              string `yaml:"api_key"`
+	Secret              string `yaml:"api_secret"`
+	Passphrase          string `yaml:"api_passphrase"`
+	GammaAPIURL         string `yaml:"gamma_api_url,omitempty"`
+	MarketWSURL         string `yaml:"market_ws_url,omitempty"`
+	UserWSURL           string `yaml:"user_ws_url,omitempty"`
+	ReconnectIntervalMs int64  `yaml:"reconnect_interval_ms,omitempty"`
+	PendingFlushMs      int64  `yaml:"pending_flush_ms,omitempty"`
 }

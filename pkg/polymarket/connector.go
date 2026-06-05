@@ -7,6 +7,7 @@ import (
 	"time"
 
 	connector "github.com/algoboy-kevin/go-exchange-connector"
+	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
 )
 
 // PolymarketConnector is the full Polymarket exchange connector.
@@ -80,8 +81,8 @@ func (p *PolymarketConnector) Start(ctx context.Context) error {
 		wsURL = marketWSSURL
 	}
 
-	p.market = NewWSPolymarketMarket(p.Connector)
-	if err := p.market.Start(ctx, wsURL); err != nil {
+	p.market = NewWSPolymarketMarket(p.Connector, p.cfg)
+	if err := p.market.Start(ctx, wsURL, p.cfg.ReconnectIntervalMs); err != nil {
 		return err
 	}
 
@@ -122,6 +123,25 @@ func (p *PolymarketConnector) Stop() {
 		p.market.Stop()
 	}
 	slog.Info("polymarket: connector stopped")
+}
+
+// MarketStatus returns the current WebSocket connection status.
+// Consumers can use this to track uptime or disconnection duration.
+func (p *PolymarketConnector) MarketStatus() ws.ConnectionStatus {
+	if p.market == nil {
+		return ws.StatusDisconnected
+	}
+	return p.market.Status()
+}
+
+// SetOnMarketStatusChange registers a callback that fires whenever the market
+// WebSocket connection status changes (connected/disconnected/connecting).
+// Useful for tracking uptime, computing disconnect duration, etc.
+// Must be called before Start.
+func (p *PolymarketConnector) SetOnMarketStatusChange(fn func(ws.ConnectionStatus)) {
+	if p.market != nil {
+		p.market.SetOnStatusChange(fn)
+	}
 }
 
 // Subscribe starts receiving market data for the given asset IDs.

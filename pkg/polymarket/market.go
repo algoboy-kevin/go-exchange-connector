@@ -38,17 +38,31 @@ type WSPolymarketMarket struct {
 	flushCancel          context.CancelFunc
 
 	eventCount atomic.Int64
+
+	onStatusChange func(ws.ConnectionStatus)
+}
+
+// SetOnStatusChange registers a callback that fires whenever the WebSocket
+// connection status changes. Useful for tracking uptime, disconnection
+// duration, or triggering reconnection logic.
+func (pm *WSPolymarketMarket) SetOnStatusChange(fn func(ws.ConnectionStatus)) {
+	pm.onStatusChange = fn
 }
 
 // NewWSPolymarketMarket creates a new market WebSocket manager.
-func NewWSPolymarketMarket(base *connector.Connector) *WSPolymarketMarket {
+func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketMarket {
+	flushMs := cfg.PendingFlushMs
+	if flushMs <= 0 {
+		flushMs = defaultPendingFlushMs
+	}
+
 	pm := &WSPolymarketMarket{
 		BaseWebSocket:         &ws.BaseWebSocket{},
 		base:                  base,
 		subscribedAssetIDs:    make(map[string]struct{}),
 		pendingSubscribeIDs:   make(map[string]struct{}),
 		pendingUnsubscribeIDs: make(map[string]struct{}),
-		pendingFlushInterval:  time.Duration(defaultPendingFlushMs) * time.Millisecond,
+		pendingFlushInterval:  time.Duration(flushMs) * time.Millisecond,
 	}
 
 	pm.ShouldConnect = func() bool {
@@ -68,14 +82,18 @@ func NewWSPolymarketMarket(base *connector.Connector) *WSPolymarketMarket {
 
 // Start sets up the reconnection loop and pending flush timer.
 // Actual connection is deferred until subscriptions are queued.
-func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string) error {
+func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnectIntervalMs int64) error {
 	flushCtx, flushCancel := context.WithCancel(ctx)
 	pm.flushCancel = flushCancel
 	pm.flushTicker = time.NewTicker(pm.pendingFlushInterval)
 	go pm.flushLoop(flushCtx)
 
 	opts := ws.DefaultWSOptions()
-	opts.ReconnectInterval = defaultReconnectIntervalMs
+	if reconnectIntervalMs > 0 {
+		opts.ReconnectInterval = reconnectIntervalMs
+	} else {
+		opts.ReconnectInterval = defaultReconnectIntervalMs
+	}
 
 	return pm.Connect(ctx, wsURL, opts)
 }
@@ -210,6 +228,10 @@ func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
 // ─────────────────────────────────────────────────────────────
 
 func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *gws.Conn) error {
+	slog.Info("market WS: reconnected")
+	if pm.onStatusChange != nil {
+		pm.onStatusChange(ws.StatusConnected)
+	}
 	pm.mu.Lock()
 	allIDs := make(map[string]struct{})
 	for id := range pm.subscribedAssetIDs {
@@ -242,7 +264,10 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 	pm.subscribedAssetIDs = make(map[string]struct{})
 	pm.mu.Unlock()
 
-	slog.Info("market WS: disconnected")
+	slog.Info("market WS: disconnected", "reason", err)
+	if pm.onStatusChange != nil {
+		pm.onStatusChange(ws.StatusDisconnected)
+	}
 }
 
 func (pm *WSPolymarketMarket) onMessage(ctx context.Context, data []byte) error {
