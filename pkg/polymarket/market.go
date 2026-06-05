@@ -11,7 +11,7 @@ import (
 	connector "github.com/algoboy-kevin/go-exchange-connector"
 	"github.com/algoboy-kevin/go-exchange-connector/internal/utils"
 	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
-	gws "github.com/gorilla/websocket"
+	coderws "github.com/coder/websocket"
 )
 
 const (
@@ -184,7 +184,12 @@ func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
 
 	flushUnsub := func(ids []string) {
 		msg := unsubscribeMessage{Operation: "unsubscribe", AssetsIDs: ids}
-		if err := conn.WriteJSON(msg); err != nil {
+		data, marshalErr := json.Marshal(msg)
+		if marshalErr != nil {
+			slog.Warn("market WS: failed to marshal unsubscribe", "err", marshalErr)
+			return
+		}
+		if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
 			slog.Warn("market WS: failed to send unsubscribe", "err", err)
 			pm.mu.Lock()
 			for _, id := range ids {
@@ -202,7 +207,12 @@ func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
 
 	flushSub := func(ids []string) {
 		msg := subscribeMessage{Operation: "subscribe", AssetsIDs: ids}
-		if err := conn.WriteJSON(msg); err != nil {
+		data, marshalErr := json.Marshal(msg)
+		if marshalErr != nil {
+			slog.Warn("market WS: failed to marshal subscribe", "err", marshalErr)
+			return
+		}
+		if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
 			slog.Warn("market WS: failed to send subscribe", "err", err)
 			pm.mu.Lock()
 			for _, id := range ids {
@@ -238,7 +248,7 @@ func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
 // BaseWebSocket hooks
 // ─────────────────────────────────────────────────────────────
 
-func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *gws.Conn) error {
+func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn) error {
 	slog.Info("market WS: reconnected")
 	if pm.onStatusChange != nil {
 		pm.onStatusChange(ws.StatusConnected)
@@ -265,7 +275,11 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *gws.Conn) err
 	}
 	slog.Info("market WS: subscribed on reconnect", "sub_count", len(ids))
 
-	return conn.WriteJSON(subscriptionMessage{AssetsIDs: ids, Type: "market"})
+	data, err := json.Marshal(subscriptionMessage{AssetsIDs: ids, Type: "market"})
+	if err != nil {
+		return err
+	}
+	return conn.Write(ctx, coderws.MessageText, data)
 }
 
 func (pm *WSPolymarketMarket) onDisconnect(err error) {
@@ -276,28 +290,9 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 	pm.subscribedAssetIDs = make(map[string]struct{})
 	pm.mu.Unlock()
 
-	// Extract close info — the server rarely sends a clean CloseError,
-	// so also unwrap the panic value from gorilla's "repeated read" panic.
-	closeCode := -1
-	var closeText string
-	if ce, ok := err.(*gws.CloseError); ok {
-		closeCode = ce.Code
-		closeText = ce.Text
-	} else if pe, ok := err.(*ws.PanicError); ok {
-		closeCode = 0
-		if s, ok := pe.Value.(string); ok {
-			closeText = s
-		} else {
-			closeText = "unknown panic"
-		}
-	}
-
-	if closeText != "" {
-		slog.Info("market WS: disconnected",
-			"reason", err,
-			"close_text", closeText,
-		)
-	} else if closeCode >= 0 {
+	// Extract close info.
+	closeCode := coderws.CloseStatus(err)
+	if closeCode != -1 {
 		slog.Info("market WS: disconnected",
 			"reason", err,
 			"close_code", closeCode,

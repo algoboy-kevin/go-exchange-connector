@@ -15,8 +15,6 @@
 //	defer ws.Close()
 package websocket
 
-import "fmt"
-
 // ─────────────────────────────────────────────────────────────
 // Connection status
 // ─────────────────────────────────────────────────────────────
@@ -76,24 +74,4 @@ type WSocketError struct {
 
 func (e *WSocketError) Error() string { return "websocket: " + e.Msg }
 
-// PanicError wraps a recovered panic value as an error.
-type PanicError struct {
-	Value any
-}
 
-func (e *PanicError) Error() string {
-	switch v := e.Value.(type) {
-	case error:
-		return "websocket panic: " + v.Error()
-	case string:
-		return "websocket panic: " + v
-	default:
-		return fmt.Sprintf("websocket panic: %v", v)
-	}
-}
-
-// Unwrap returns the underlying panic value if it's an error.
-func (e *PanicError) Unwrap() error {
-	err, _ := e.Value.(error)
-	return err
-}

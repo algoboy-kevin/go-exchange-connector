@@ -2,16 +2,17 @@ package websocket
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
-	"net"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	coderws "github.com/coder/websocket"
 )
 
-// BaseWebSocket manages a WebSocket connection with automatic reconnection,
-// ping/pong keepalive, and status tracking.
+// BaseWebSocket manages a WebSocket connection with automatic reconnection
+// and status tracking.
 //
 // Embed this struct in an exchange-specific manager and set the hook functions
 // (OnConnect, OnMessage, OnDisconnect, ShouldConnect) to implement custom
@@ -34,7 +35,7 @@ type BaseWebSocket struct {
 	// read loop starts. Use it to send handshake/subscription messages.
 	// If it returns an error, the connection is closed and reconnection
 	// is attempted.
-	OnConnect func(ctx context.Context, conn *websocket.Conn) error
+	OnConnect func(ctx context.Context, conn *coderws.Conn) error
 
 	// OnMessage is called for every text or binary message received.
 	// Return an error to log it; the read loop continues unless the
@@ -61,7 +62,7 @@ type BaseWebSocket struct {
 	// ── Internal state ──────────────────────────────────────
 
 	mu     sync.RWMutex
-	conn   *websocket.Conn
+	conn   *coderws.Conn
 	status ConnectionStatus
 	cancel context.CancelFunc // cancels the entire WS goroutine tree
 	done   chan struct{}      // closed when all goroutines exit
@@ -108,7 +109,7 @@ func (b *BaseWebSocket) Close() {
 	b.mu.Lock()
 	hasCancel := b.cancel != nil
 	if b.conn != nil {
-		b.conn.Close()
+		b.conn.Close(coderws.StatusNormalClosure, "shutdown")
 		b.conn = nil
 	}
 	b.mu.Unlock()
@@ -125,7 +126,7 @@ func (b *BaseWebSocket) Close() {
 func (b *BaseWebSocket) Disconnect() {
 	b.mu.Lock()
 	if b.conn != nil {
-		b.conn.Close()
+		b.conn.Close(coderws.StatusGoingAway, "reconnect")
 		b.conn = nil
 	}
 	b.status = StatusDisconnected
@@ -144,7 +145,7 @@ func (b *BaseWebSocket) Status() ConnectionStatus {
 
 // Conn returns the underlying WebSocket connection, or nil if not connected.
 // Use this for sending messages.
-func (b *BaseWebSocket) Conn() *websocket.Conn {
+func (b *BaseWebSocket) Conn() *coderws.Conn {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.conn
@@ -156,16 +157,20 @@ func (b *BaseWebSocket) SendText(ctx context.Context, data string) error {
 	if conn == nil {
 		return ErrNotConnected
 	}
-	return conn.WriteMessage(websocket.TextMessage, []byte(data))
+	return conn.Write(ctx, coderws.MessageText, []byte(data))
 }
 
-// SendJSON sends data as a JSON text message. Equivalent to conn.WriteJSON.
+// SendJSON sends data as a JSON text message.
 func (b *BaseWebSocket) SendJSON(ctx context.Context, v any) error {
 	conn := b.Conn()
 	if conn == nil {
 		return ErrNotConnected
 	}
-	return conn.WriteJSON(v)
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return conn.Write(ctx, coderws.MessageText, data)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -177,7 +182,7 @@ func (b *BaseWebSocket) dialSync(ctx context.Context) error {
 	b.setStatus(StatusConnecting)
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, time.Duration(b.opts.ConnectionTimeout)*time.Millisecond)
-	conn, _, err := websocket.DefaultDialer.DialContext(dialCtx, b.url, nil)
+	conn, _, err := coderws.Dial(dialCtx, b.url, nil)
 	dialCancel()
 
 	if err != nil {
@@ -215,7 +220,7 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 	cleanup := func() {
 		b.mu.Lock()
 		if b.conn == conn {
-			b.conn.Close()
+			conn.Close(coderws.StatusNormalClosure, "readloop-exit")
 			b.conn = nil
 			if b.status != StatusDisconnected {
 				b.status = StatusDisconnected
@@ -226,65 +231,38 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 	defer cleanup()
 
 	for {
-		// Check context before blocking on read.
-		if ctx.Err() != nil {
-			return
-		}
-
-		if err := conn.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
-			return
-		}
-
-		// gorilla/websocket panics with "repeated read on failed websocket
-		// connection" if the conn was closed by another goroutine between
-		// our Conn() call and ReadMessage. Catch the panic gracefully.
-		var msg []byte
-		readErr := safeCall(func() error {
-			var err error
-			_, msg, err = conn.ReadMessage()
-			return err
-		})
-
-		if readErr != nil {
-			// Timeout — check if we should shut down.
+		_, msg, err := conn.Read(ctx)
+		if err != nil {
+			// Context cancelled — clean shutdown requested via Close().
 			if ctx.Err() != nil {
 				return
 			}
-			// Log close frame details if the server sent one.
-			var closeCode int
-			var closeText string
-			if ce, ok := readErr.(*websocket.CloseError); ok {
-				closeCode = ce.Code
-				closeText = ce.Text
-			}
-			if closeCode != 0 {
+
+			// Log close frame details.
+			if code := coderws.CloseStatus(err); code != -1 {
 				slog.Warn("websocket: server closed connection",
-					"code", closeCode, "text", closeText)
+					"code", code, "reason", err.Error())
 			}
-			// Handle known close codes.
-			if websocket.IsCloseError(readErr, websocket.CloseNormalClosure,
-				websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				b.safeCallOnDisconnect(readErr)
-				return
+
+			// Only fire OnDisconnect if the connection wasn't already
+			// intentionally disconnected (e.g. by Disconnect()). This
+			// prevents the double-fire race between Disconnect() and
+			// a dying readLoop goroutine.
+			b.mu.RLock()
+			alreadyDisconnected := b.status == StatusDisconnected
+			b.mu.RUnlock()
+
+			if !alreadyDisconnected {
+				b.safeCallOnDisconnect(err)
 			}
-			if _, ok := readErr.(*websocket.CloseError); ok {
-				b.safeCallOnDisconnect(readErr)
-				return
-			}
-			// Network error — connection is dead.
-			if !isTimeoutError(readErr) {
-				b.safeCallOnDisconnect(readErr)
-				return
-			}
-			// Timeout only — continue loop.
-			continue
+			return
 		}
 
 		if b.OnMessage != nil {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						b.safeCallOnError(&PanicError{Value: r})
+						b.safeCallOnError(fmt.Errorf("message handler panic: %v", r))
 					}
 				}()
 				if err := b.OnMessage(ctx, msg); err != nil {
@@ -293,23 +271,6 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 			}()
 		}
 	}
-}
-
-func isTimeoutError(err error) bool {
-	e, ok := err.(net.Error)
-	return ok && e.Timeout()
-}
-
-// safeCall executes fn and recovers any panic, returning it as an error.
-// This is needed because gorilla/websocket panics on repeated reads after
-// the connection is closed by another goroutine.
-func safeCall(fn func() error) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = &PanicError{Value: r}
-		}
-	}()
-	return fn()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -371,32 +332,35 @@ func (b *BaseWebSocket) closeConn() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.conn != nil {
-		b.conn.Close()
+		b.conn.Close(coderws.StatusGoingAway, "close")
 		b.conn = nil
 	}
 }
 
-// reconnCleanup is called when the read loop exits. It closes the connection
-// so the reconnection loop notices and triggers a re-dial.
-func (b *BaseWebSocket) reconnCleanup() {
-	b.closeConn()
-	b.setStatus(StatusDisconnected)
-}
-
 func (b *BaseWebSocket) safeCallOnDisconnect(err error) {
-	b.safeCall(func() {
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("websocket: OnDisconnect panic", "err", r)
+			}
+		}()
 		if b.OnDisconnect != nil {
 			b.OnDisconnect(err)
 		}
-	})
+	}()
 }
 
 func (b *BaseWebSocket) safeCallOnError(err error) {
-	b.safeCall(func() {
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("websocket: OnError panic", "err", r)
+			}
+		}()
 		if b.OnError != nil {
 			b.OnError(err)
 		}
-	})
+	}()
 }
 
 func (b *BaseWebSocket) safeCall(fn func()) {

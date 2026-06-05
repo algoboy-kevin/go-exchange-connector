@@ -11,7 +11,7 @@ import (
 	connector "github.com/algoboy-kevin/go-exchange-connector"
 	"github.com/algoboy-kevin/go-exchange-connector/internal/utils"
 	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
-	gws "github.com/gorilla/websocket"
+	coderws "github.com/coder/websocket"
 )
 
 const (
@@ -135,7 +135,7 @@ func (u *WSPolymarketUserWS) pingLoop(ctx context.Context) {
 		case <-ticker.C:
 			conn := u.Conn()
 			if conn != nil {
-				conn.WriteMessage(gws.TextMessage, []byte("PING"))
+				conn.Write(ctx, coderws.MessageText, []byte("PING"))
 			}
 		}
 	}
@@ -171,10 +171,11 @@ func (u *WSPolymarketUserWS) flushMarketSubscriptions() {
 		for id := range unsubIDs {
 			ids = append(ids, id)
 		}
-		conn.WriteJSON(map[string]any{
+		data, _ := json.Marshal(map[string]any{
 			"operation": "unsubscribe",
 			"markets":   ids,
 		})
+		conn.Write(context.Background(), coderws.MessageText, data)
 		u.mu.Lock()
 		for _, id := range ids {
 			delete(u.subscribedMarketIDs, id)
@@ -187,10 +188,11 @@ func (u *WSPolymarketUserWS) flushMarketSubscriptions() {
 		for id := range subIDs {
 			ids = append(ids, id)
 		}
-		conn.WriteJSON(map[string]any{
+		data, _ := json.Marshal(map[string]any{
 			"operation": "subscribe",
 			"markets":   ids,
 		})
+		conn.Write(context.Background(), coderws.MessageText, data)
 		u.mu.Lock()
 		for _, id := range ids {
 			u.subscribedMarketIDs[id] = struct{}{}
@@ -203,12 +205,16 @@ func (u *WSPolymarketUserWS) flushMarketSubscriptions() {
 // BaseWebSocket hooks
 // ─────────────────────────────────────────────────────────────
 
-func (u *WSPolymarketUserWS) onConnect(ctx context.Context, conn *gws.Conn) error {
+func (u *WSPolymarketUserWS) onConnect(ctx context.Context, conn *coderws.Conn) error {
 	handshake := map[string]any{
 		"type": "user",
 		"auth": u.auth,
 	}
-	return conn.WriteJSON(handshake)
+	data, err := json.Marshal(handshake)
+	if err != nil {
+		return err
+	}
+	return conn.Write(ctx, coderws.MessageText, data)
 }
 
 func (u *WSPolymarketUserWS) onDisconnect(err error) {
