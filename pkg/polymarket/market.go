@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	defaultReconnectIntervalMs = 5000
+	defaultReconnectIntervalMs = 500
 	defaultPendingFlushMs      = 100
 	marketWSSURL               = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 )
@@ -242,7 +242,7 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 	pm.subscribedAssetIDs = make(map[string]struct{})
 	pm.mu.Unlock()
 
-	slog.Debug("market WS: disconnected")
+	slog.Info("market WS: disconnected")
 }
 
 func (pm *WSPolymarketMarket) onMessage(ctx context.Context, data []byte) error {
