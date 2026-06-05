@@ -110,7 +110,10 @@ func (pm *WSPolymarketMarket) Stop() {
 	pm.clearSubscriptions()
 }
 
-// Subscribe queues asset IDs for subscription and immediately flushes.
+// Subscribe queues asset IDs and triggers a reconnect so the full
+// updated subscription list is sent via the initial handshake.
+// Polymarket's market channel does not reliably support incremental
+// subscribe operations — a full re-subscribe on reconnect avoids issues.
 func (pm *WSPolymarketMarket) Subscribe(ctx context.Context, assetIDs []string) {
 	pm.mu.Lock()
 	for _, id := range assetIDs {
@@ -120,19 +123,27 @@ func (pm *WSPolymarketMarket) Subscribe(ctx context.Context, assetIDs []string) 
 		}
 		pm.pendingSubscribeIDs[id] = struct{}{}
 	}
+	needsReconnect := len(pm.pendingSubscribeIDs) > 0
 	pm.mu.Unlock()
-	pm.flushPending(ctx)
+
+	if needsReconnect {
+		pm.Disconnect()
+	}
 }
 
-// Unsubscribe queues asset IDs for removal.
+// Unsubscribe queues asset IDs for removal and triggers a reconnect.
 func (pm *WSPolymarketMarket) Unsubscribe(ctx context.Context, assetIDs []string) {
 	pm.mu.Lock()
 	for _, id := range assetIDs {
 		delete(pm.pendingSubscribeIDs, id)
 		pm.pendingUnsubscribeIDs[id] = struct{}{}
 	}
+	needsReconnect := len(pm.pendingUnsubscribeIDs) > 0
 	pm.mu.Unlock()
-	pm.flushPending(ctx)
+
+	if needsReconnect {
+		pm.Close()
+	}
 }
 
 // ─────────────────────────────────────────────────────────────

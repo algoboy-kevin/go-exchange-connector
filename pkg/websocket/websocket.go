@@ -119,6 +119,22 @@ func (b *BaseWebSocket) Close() {
 	}
 }
 
+// Disconnect closes the current WebSocket connection without shutting down
+// the reconnection loop. The reconnLoop will automatically reconnect.
+// Unlike Close(), this does not permanently terminate the WebSocket.
+func (b *BaseWebSocket) Disconnect() {
+	b.mu.Lock()
+	if b.conn != nil {
+		b.conn.Close()
+		b.conn = nil
+	}
+	b.status = StatusDisconnected
+	b.mu.Unlock()
+
+	// Fire OnDisconnect so subscriptions get re-queued.
+	b.safeCallOnDisconnect(nil)
+}
+
 // Status returns the current connection status.
 func (b *BaseWebSocket) Status() ConnectionStatus {
 	b.mu.RLock()
