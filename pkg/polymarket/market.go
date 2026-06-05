@@ -276,18 +276,28 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 	pm.subscribedAssetIDs = make(map[string]struct{})
 	pm.mu.Unlock()
 
-	// Unwrap PanicError to check if gorilla had a close code.
+	// Extract close info — the server rarely sends a clean CloseError,
+	// so also unwrap the panic value from gorilla's "repeated read" panic.
 	closeCode := -1
-	if pe, ok := err.(*ws.PanicError); ok {
-		if ce, ok := pe.Unwrap().(*gws.CloseError); ok {
-			closeCode = ce.Code
-		}
-	}
+	var closeText string
 	if ce, ok := err.(*gws.CloseError); ok {
 		closeCode = ce.Code
+		closeText = ce.Text
+	} else if pe, ok := err.(*ws.PanicError); ok {
+		closeCode = 0
+		if s, ok := pe.Value.(string); ok {
+			closeText = s
+		} else {
+			closeText = "unknown panic"
+		}
 	}
 
-	if closeCode >= 0 {
+	if closeText != "" {
+		slog.Info("market WS: disconnected",
+			"reason", err,
+			"close_text", closeText,
+		)
+	} else if closeCode >= 0 {
 		slog.Info("market WS: disconnected",
 			"reason", err,
 			"close_code", closeCode,
