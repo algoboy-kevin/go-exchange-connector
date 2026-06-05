@@ -252,6 +252,7 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *gws.Conn) err
 	for id := range allIDs {
 		ids = append(ids, id)
 	}
+	slog.Info("market WS: subscribed on reconnect", "sub_count", len(ids))
 
 	return conn.WriteJSON(subscriptionMessage{AssetsIDs: ids, Type: "market"})
 }
