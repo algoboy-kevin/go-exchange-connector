@@ -42,13 +42,9 @@ type WSOptions struct {
 	// Default: 30s.
 	ConnectionTimeout int64 `json:"connection_timeout_ms,omitempty"`
 
-	// PingInterval is how often to send a ping keepalive.
-	// If zero, no periodic ping is sent.
+	// PingInterval is how often to send a WebSocket-level ping keepalive.
+	// If zero, coder/websocket's default of 30s is used.
 	PingInterval int64 `json:"ping_interval_ms,omitempty"`
-
-	// PingMessage is the raw bytes sent as a ping.
-	// Default: nil (uses gorilla's built-in ping).
-	PingMessage []byte `json:"-"`
 }
 
 // DefaultWSOptions returns sensible defaults for a production WebSocket connection.

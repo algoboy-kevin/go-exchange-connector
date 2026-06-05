@@ -89,6 +89,7 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 	go pm.flushLoop(flushCtx)
 
 	opts := ws.DefaultWSOptions()
+	opts.PingInterval = 5000 // 5s keepalive — server drops idle connections
 	if reconnectIntervalMs > 0 {
 		opts.ReconnectInterval = reconnectIntervalMs
 	} else {

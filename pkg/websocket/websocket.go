@@ -195,6 +195,9 @@ func (b *BaseWebSocket) dialSync(ctx context.Context) error {
 	b.mu.Unlock()
 	b.setStatus(StatusConnected)
 
+	// Start keepalive pings.
+	b.startPingLoop(ctx, conn)
+
 	// Fire the OnConnect hook.
 	if b.OnConnect != nil {
 		if err := b.OnConnect(ctx, conn); err != nil {
@@ -309,6 +312,41 @@ func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
 		// Successful reconnection — restart the read loop.
 		go b.readLoop(ctx)
 	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// Internal: ping loop
+// ─────────────────────────────────────────────────────────────
+
+// startPingLoop starts a background goroutine that sends WebSocket-level
+// ping frames at the configured interval. This keeps the connection alive
+// through proxies, load balancers, and server-side idle timeouts.
+//
+// The loop exits when the context is cancelled (shutdown) or when a ping
+// fails (connection dropped). A new ping loop is started automatically
+// after each successful reconnection.
+func (b *BaseWebSocket) startPingLoop(ctx context.Context, conn *coderws.Conn) {
+	if b.opts.PingInterval <= 0 {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(time.Duration(b.opts.PingInterval) * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := conn.Ping(ctx); err != nil {
+					// Connection died — ping loop exits naturally.
+					// A new one will start after reconnection.
+					return
+				}
+			}
+		}
+	}()
 }
 
 // ─────────────────────────────────────────────────────────────
