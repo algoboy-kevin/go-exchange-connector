@@ -222,7 +222,18 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			// Ignore timeout errors, keep reading.
+			// Log close frame details if the server sent one.
+			var closeCode int
+			var closeText string
+			if ce, ok := readErr.(*websocket.CloseError); ok {
+				closeCode = ce.Code
+				closeText = ce.Text
+			}
+			if closeCode != 0 {
+				slog.Warn("websocket: server closed connection",
+					"code", closeCode, "text", closeText)
+			}
+			// Handle known close codes.
 			if websocket.IsCloseError(readErr, websocket.CloseNormalClosure,
 				websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				b.safeCallOnDisconnect(readErr)
