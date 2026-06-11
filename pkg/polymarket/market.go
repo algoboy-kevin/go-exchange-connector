@@ -76,7 +76,7 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 		return len(pm.pendingSubscribeIDs) > 0 || len(pm.subscribedAssetIDs) > 0
 	}
 
-	pm.dispatcherWorkers = 4
+	pm.dispatcherWorkers = 1
 
 	pm.OnConnect = pm.onConnect
 	pm.OnMessage = pm.onMessage

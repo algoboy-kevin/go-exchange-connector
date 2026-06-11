@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -119,6 +120,9 @@ type Connector struct {
 
 	seqID      atomic.Int64
 	onDispatch func(any)
+
+	dispatchCh chan any
+	dispatchWg sync.WaitGroup
 }
 
 // New creates a new Connector.
@@ -260,20 +264,64 @@ func (c *Connector) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop shuts down the connector. Override in exchange-specific code.
+// Stop shuts down the connector. If async dispatch is enabled, it
+// drains the event channel gracefully before returning.
 func (c *Connector) Stop() {
+	if c.dispatchCh != nil {
+		close(c.dispatchCh)
+		c.dispatchWg.Wait()
+		c.dispatchCh = nil
+	}
 	slog.Info("connector: stopped")
 }
 
 // ── Helpers ──────────────────────────────────────────────────
 
-// DispatchEvent fires the OnEvent hook (for recording/monitoring)
-// and the dispatcher callback (for actor routing). Call this from
-// exchange-specific code after constructing typed event structs.
+// DispatchEvent routes an event to the engine.
+//
+// In asynchronous mode (after EnableAsyncDispatch): pushes to a buffered
+// channel and returns immediately — the engine processes events on its
+// own goroutine. If the channel is full, the event is dropped with a
+// warning.
+//
+// In synchronous mode (default): calls the dispatcher callback directly
+// and blocks until it returns.
 func (c *Connector) DispatchEvent(ev any) {
+	if c.dispatchCh != nil {
+		select {
+		case c.dispatchCh <- ev:
+		default:
+			slog.Warn("connector: dropping event, dispatch channel full")
+		}
+		return
+	}
 	if c.onDispatch != nil {
 		c.onDispatch(ev)
 	}
+}
+
+// EnableAsyncDispatch switches DispatchEvent to asynchronous mode.
+// Events are pushed into a buffered channel and processed by a
+// background goroutine, so the caller never blocks on the engine.
+//
+// Call this after SetDispatcher but before Start. The buffer size
+// controls how many events can queue up before drops occur.
+// If bufferSize <= 0, a default of 4096 is used.
+func (c *Connector) EnableAsyncDispatch(bufferSize int) {
+	if bufferSize <= 0 {
+		bufferSize = 4096
+	}
+	c.dispatchCh = make(chan any, bufferSize)
+	c.dispatchWg.Add(1)
+	go func() {
+		defer c.dispatchWg.Done()
+		for ev := range c.dispatchCh {
+			if c.onDispatch != nil {
+				c.onDispatch(ev)
+			}
+		}
+	}()
+	slog.Debug("connector: async dispatch enabled", "buffer", bufferSize)
 }
 
 // NextSeqID atomically increments and returns the sequence counter.
