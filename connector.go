@@ -53,6 +53,8 @@ type ExchangeConnector interface {
 	// TradeEvent, OrderPlacementEvent, etc.) through DispatchEvent, which
 	// routes them here. The application mounts a switch to forward events
 	// to the appropriate actor/manager.
+	//
+	// Call EnableAsyncDispatch after this to make DispatchEvent non-blocking.
 	SetDispatcher(d func(any))
 
 	// ── Lifecycle ───────────────────────────────────────────
@@ -88,17 +90,18 @@ type LiveExecutor interface {
 // Usage:
 //
 //	// PAPER mode — orders are simulated, events dispatched:
-//	conn := connector.New(false, nil, 8192)
+//	conn := connector.New(false, nil)
 //	conn.SetDispatcher(func(ev any) {
 //	    switch e := ev.(type) {
 //	    case *connector.OrderPlacementEvent: ...
 //	    case *connector.OrderFillEvent: ...
 //	    }
 //	})
+//	conn.EnableAsyncDispatch(8192) // optional: fire-and-forget dispatch
 //
 //	// LIVE mode — delegates to a LiveExecutor:
 //	exec := &polymarket.LiveExecutor{...}
-//	conn := connector.New(true, exec, 0) // 0 = synchronous dispatch
+//	conn := connector.New(true, exec)
 //
 // Exchange-specific WS code pushes typed events through DispatchEvent,
 // which routes them to the mounted dispatcher.
@@ -130,23 +133,15 @@ type Connector struct {
 
 // New creates a new Connector.
 //
-//	isLive:      true  → LIVE mode (requires LiveExecutor)
-//	             false → PAPER mode (simulates via handlers)
-//	live:        LiveExecutor for LIVE mode, or nil for PAPER mode.
-//	asyncBuffer: buffer size for async dispatch; 0 disables (synchronous).
-//	             When > 0, DispatchEvent becomes fire-and-forget and the
-//	             engine processes events on a background goroutine.
-//	             Recommended: 8192 for production.
-func New(isLive bool, live LiveExecutor, asyncBuffer int) *Connector {
-	c := &Connector{
+//	isLive: true  → LIVE mode (requires LiveExecutor)
+//	        false → PAPER mode (simulates via handlers)
+//	live:   LiveExecutor for LIVE mode, or nil for PAPER mode.
+func New(isLive bool, live LiveExecutor) *Connector {
+	return &Connector{
 		IsLive: isLive,
 		Live:   live,
 		Now:    time.Now,
 	}
-	if asyncBuffer > 0 {
-		c.EnableAsyncDispatch(asyncBuffer)
-	}
-	return c
 }
 
 // ── ExchangeConnector implementation ─────────────────────────
@@ -292,14 +287,18 @@ func (c *Connector) Stop() {
 //
 // In asynchronous mode (after EnableAsyncDispatch): pushes to a buffered
 // channel and returns immediately — the engine processes events on its
-// own goroutine. Blocks when the channel is full, providing natural
-// backpressure so no events are ever dropped.
+// own goroutine. If the channel is full, the event is dropped with a
+// warning.
 //
 // In synchronous mode (default): calls the dispatcher callback directly
 // and blocks until it returns.
 func (c *Connector) DispatchEvent(ev any) {
 	if c.dispatchCh != nil {
-		c.dispatchCh <- ev
+		select {
+		case c.dispatchCh <- ev:
+		default:
+			slog.Warn("connector: dropping event, dispatch channel full")
+		}
 		return
 	}
 	if c.onDispatch != nil {

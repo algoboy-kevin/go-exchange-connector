@@ -58,15 +58,10 @@ func New(isLive bool, cfg Config, now func() time.Time) *PolymarketConnector {
 
 	gamma := NewGammaClient(gammaURL)
 
-	asyncBuffer := cfg.AsyncDispatchBuffer
-	if asyncBuffer <= 0 {
-		asyncBuffer = 8192
-	}
-
 	pc := &PolymarketConnector{
 		Connector: connector.New(isLive, &polymarketLiveExecutor{
 			gamma: gamma,
-		}, asyncBuffer),
+		}),
 		cfg:   cfg,
 		gamma: gamma,
 	}
