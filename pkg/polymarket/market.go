@@ -37,8 +37,9 @@ type WSPolymarketMarket struct {
 	flushTicker          *time.Ticker
 	flushCancel          context.CancelFunc
 
-	eventCh          chan []byte
-	dispatcherCancel context.CancelFunc
+	eventCh           chan []byte
+	dispatcherCancel  context.CancelFunc
+	dispatcherWorkers int
 
 	eventCount atomic.Int64
 
@@ -74,6 +75,9 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 		defer pm.mu.RUnlock()
 		return len(pm.pendingSubscribeIDs) > 0 || len(pm.subscribedAssetIDs) > 0
 	}
+
+	pm.dispatcherWorkers = 4
+
 	pm.OnConnect = pm.onConnect
 	pm.OnMessage = pm.onMessage
 	pm.OnDisconnect = pm.onDisconnect
@@ -94,7 +98,9 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 
 	dispatchCtx, dispatchCancel := context.WithCancel(ctx)
 	pm.dispatcherCancel = dispatchCancel
-	go pm.eventDispatcher(dispatchCtx)
+	for i := 0; i < pm.dispatcherWorkers; i++ {
+		go pm.eventDispatcher(dispatchCtx)
+	}
 
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — server drops idle connections
