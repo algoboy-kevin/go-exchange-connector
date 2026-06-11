@@ -326,11 +326,10 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 func (pm *WSPolymarketMarket) onMessage(ctx context.Context, data []byte) error {
 	select {
 	case pm.eventCh <- data:
-		return nil
-	default:
-		slog.Warn("market WS: dropping message, event channel full")
-		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────

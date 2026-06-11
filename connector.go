@@ -292,18 +292,14 @@ func (c *Connector) Stop() {
 //
 // In asynchronous mode (after EnableAsyncDispatch): pushes to a buffered
 // channel and returns immediately — the engine processes events on its
-// own goroutine. If the channel is full, the event is dropped with a
-// warning.
+// own goroutine. Blocks when the channel is full, providing natural
+// backpressure so no events are ever dropped.
 //
 // In synchronous mode (default): calls the dispatcher callback directly
 // and blocks until it returns.
 func (c *Connector) DispatchEvent(ev any) {
 	if c.dispatchCh != nil {
-		select {
-		case c.dispatchCh <- ev:
-		default:
-			slog.Warn("connector: dropping event, dispatch channel full")
-		}
+		c.dispatchCh <- ev
 		return
 	}
 	if c.onDispatch != nil {
