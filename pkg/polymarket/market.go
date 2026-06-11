@@ -37,6 +37,9 @@ type WSPolymarketMarket struct {
 	flushTicker          *time.Ticker
 	flushCancel          context.CancelFunc
 
+	eventCh          chan []byte
+	dispatcherCancel context.CancelFunc
+
 	eventCount atomic.Int64
 
 	onStatusChange func(ws.ConnectionStatus)
@@ -63,6 +66,7 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 		pendingSubscribeIDs:   make(map[string]struct{}),
 		pendingUnsubscribeIDs: make(map[string]struct{}),
 		pendingFlushInterval:  time.Duration(flushMs) * time.Millisecond,
+		eventCh:               make(chan []byte, 8192),
 	}
 
 	pm.ShouldConnect = func() bool {
@@ -88,6 +92,10 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 	pm.flushTicker = time.NewTicker(pm.pendingFlushInterval)
 	go pm.flushLoop(flushCtx)
 
+	dispatchCtx, dispatchCancel := context.WithCancel(ctx)
+	pm.dispatcherCancel = dispatchCancel
+	go pm.eventDispatcher(dispatchCtx)
+
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — server drops idle connections
 	if reconnectIntervalMs > 0 {
@@ -101,6 +109,9 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 
 // Stop shuts down the WebSocket, stops all timers, and clears state.
 func (pm *WSPolymarketMarket) Stop() {
+	if pm.dispatcherCancel != nil {
+		pm.dispatcherCancel()
+	}
 	if pm.flushCancel != nil {
 		pm.flushCancel()
 	}
@@ -313,46 +324,13 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 }
 
 func (pm *WSPolymarketMarket) onMessage(ctx context.Context, data []byte) error {
-	var raw []json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		var single json.RawMessage
-		if err2 := json.Unmarshal(data, &single); err2 != nil {
-			return err2
-		}
-		raw = []json.RawMessage{single}
+	select {
+	case pm.eventCh <- data:
+		return nil
+	default:
+		slog.Warn("market WS: dropping message, event channel full")
+		return nil
 	}
-
-	for _, r := range raw {
-		var envelope struct {
-			EventType string `json:"event_type"`
-		}
-		if err := json.Unmarshal(r, &envelope); err != nil {
-			continue
-		}
-
-		switch envelope.EventType {
-		case "price_change":
-			pm.handlePriceChange(r)
-		case "book":
-			pm.handleBook(r)
-		case "last_trade_price":
-			pm.handleLastTradePrice(r)
-		case "tick_size_change":
-			pm.handleTickSizeChange(r)
-		case "new_market":
-			slog.Debug("market WS: new_market event ignored")
-		case "market_resolved":
-			pm.handleMarketResolved(r)
-		default:
-			slog.Debug("market WS: unknown event type", "type", envelope.EventType)
-		}
-
-		count := pm.eventCount.Add(1)
-		if count%10000 == 0 {
-			slog.Debug("market WS: events received", "count", count)
-		}
-	}
-	return nil
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -504,6 +482,66 @@ func (pm *WSPolymarketMarket) clearSubscriptions() {
 	pm.subscribedAssetIDs = make(map[string]struct{})
 	pm.pendingSubscribeIDs = make(map[string]struct{})
 	pm.pendingUnsubscribeIDs = make(map[string]struct{})
+}
+
+// eventDispatcher runs in a dedicated goroutine, pulling raw WS messages
+// from the buffered channel and processing them asynchronously. This
+// decouples socket reading from parsing/dispatching, preventing backpressure
+// on the read loop during event bursts.
+func (pm *WSPolymarketMarket) eventDispatcher(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case data := <-pm.eventCh:
+			pm.processMessage(data)
+		}
+	}
+}
+
+// processMessage parses a raw WebSocket message and dispatches typed events.
+// Runs off the read-loop goroutine — safe to block on DispatchEvent.
+func (pm *WSPolymarketMarket) processMessage(data []byte) {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		var single json.RawMessage
+		if err2 := json.Unmarshal(data, &single); err2 != nil {
+			slog.Warn("market WS: failed to parse message", "err", err2)
+			return
+		}
+		raw = []json.RawMessage{single}
+	}
+
+	for _, r := range raw {
+		var envelope struct {
+			EventType string `json:"event_type"`
+		}
+		if err := json.Unmarshal(r, &envelope); err != nil {
+			continue
+		}
+
+		switch envelope.EventType {
+		case "price_change":
+			pm.handlePriceChange(r)
+		case "book":
+			pm.handleBook(r)
+		case "last_trade_price":
+			pm.handleLastTradePrice(r)
+		case "tick_size_change":
+			pm.handleTickSizeChange(r)
+		case "new_market":
+			slog.Debug("market WS: new_market event ignored")
+		case "market_resolved":
+			pm.handleMarketResolved(r)
+		default:
+			slog.Debug("market WS: unknown event type", "type", envelope.EventType)
+		}
+
+		count := pm.eventCount.Add(1)
+		if count%10000 == 0 {
+			slog.Debug("market WS: events received", "count", count)
+		}
+	}
 }
 
 // ─────────────────────────────────────────────────────────────
