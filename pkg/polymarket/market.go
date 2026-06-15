@@ -45,6 +45,9 @@ type WSPolymarketMarket struct {
 	eventCount atomic.Int64
 
 	onStatusChange func(ws.ConnectionStatus)
+
+	latencyTracker latencyTracker
+	latencyCancel  context.CancelFunc
 }
 
 // SetOnStatusChange registers a callback that fires whenever the WebSocket
@@ -111,6 +114,10 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 		go pm.eventDispatcher(dispatchCtx)
 	}
 
+	latencyCtx, latencyCancel := context.WithCancel(ctx)
+	pm.latencyCancel = latencyCancel
+	go pm.latencyLogger(latencyCtx)
+
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — server drops idle connections
 	if reconnectIntervalMs > 0 {
@@ -132,6 +139,9 @@ func (pm *WSPolymarketMarket) Stop() {
 	}
 	if pm.flushTicker != nil {
 		pm.flushTicker.Stop()
+	}
+	if pm.latencyCancel != nil {
+		pm.latencyCancel()
 	}
 	pm.Close()
 	pm.clearSubscriptions()
@@ -365,6 +375,8 @@ func (pm *WSPolymarketMarket) handlePriceChange(raw json.RawMessage) {
 		return
 	}
 
+	exchangeTS := utils.SafeParseTimestamp(ev.Timestamp)
+
 	pm.subMu.RLock()
 	items := make([]connector.PriceChangeItem, 0, len(ev.PriceChanges))
 	for _, pc := range ev.PriceChanges {
@@ -386,11 +398,14 @@ func (pm *WSPolymarketMarket) handlePriceChange(raw json.RawMessage) {
 		return
 	}
 
+	now := pm.base.Now()
+	pm.latencyTracker.record(now.Sub(exchangeTS))
+
 	pm.base.DispatchEvent(&connector.PriceChangeEvent{
 		SeqID:      pm.base.NextSeqID(),
-		ReceivedAt: pm.base.Now(),
+		ReceivedAt: now,
 		Market:     ev.Market,
-		Timestamp:  utils.SafeParseTimestamp(ev.Timestamp),
+		Timestamp:  exchangeTS,
 		Changes:    items,
 	})
 }
@@ -405,6 +420,10 @@ func (pm *WSPolymarketMarket) handleBook(raw json.RawMessage) {
 		return
 	}
 
+	exchangeTS := utils.SafeParseTimestamp(ev.Timestamp)
+	now := pm.base.Now()
+	pm.latencyTracker.record(now.Sub(exchangeTS))
+
 	bids := make([]connector.Level, len(ev.Bids))
 	for i, l := range ev.Bids {
 		bids[i] = connector.Level{Price: l.Price, Size: l.Size}
@@ -416,10 +435,10 @@ func (pm *WSPolymarketMarket) handleBook(raw json.RawMessage) {
 
 	pm.base.DispatchEvent(&connector.BookSnapshotEvent{
 		SeqID:      pm.base.NextSeqID(),
-		ReceivedAt: pm.base.Now(),
+		ReceivedAt: now,
 		Market:     ev.Market,
 		AssetID:    ev.AssetID,
-		Timestamp:  utils.SafeParseTimestamp(ev.Timestamp),
+		Timestamp:  exchangeTS,
 		Hash:       ev.Hash,
 		Bids:       bids,
 		Asks:       asks,
@@ -505,6 +524,63 @@ func (pm *WSPolymarketMarket) clearSubscriptions() {
 	pm.pendingUnsubscribeIDs = make(map[string]struct{})
 	pm.pendingMu.Unlock()
 	pm.subMu.Unlock()
+}
+
+// ─────────────────────────────────────────────────────────────
+// Latency monitoring
+// ─────────────────────────────────────────────────────────────
+
+// latencyTracker keeps a rolling window of the last 100 event latencies
+// (difference between local receive time and exchange timestamp) for
+// price_change and book events. Report is called every 5s from the
+// latencyLogger goroutine.
+type latencyTracker struct {
+	mu      sync.Mutex
+	samples [100]time.Duration
+	count   int
+	idx     int // next write position (ring buffer)
+}
+
+func (lt *latencyTracker) record(d time.Duration) {
+	lt.mu.Lock()
+	lt.samples[lt.idx] = d
+	lt.idx = (lt.idx + 1) % len(lt.samples)
+	if lt.count < len(lt.samples) {
+		lt.count++
+	}
+	lt.mu.Unlock()
+}
+
+func (lt *latencyTracker) report() (time.Duration, int) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	if lt.count == 0 {
+		return 0, 0
+	}
+	var total int64
+	for i := 0; i < lt.count; i++ {
+		total += int64(lt.samples[i])
+	}
+	return time.Duration(total / int64(lt.count)), lt.count
+}
+
+func (pm *WSPolymarketMarket) latencyLogger(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			avg, count := pm.latencyTracker.report()
+			if count > 0 {
+				slog.Info("market WS: event latency",
+					"avg_ms", avg.Milliseconds(),
+					"samples", count,
+				)
+			}
+		}
+	}
 }
 
 // eventDispatcher runs in a dedicated goroutine, pulling raw WS messages
