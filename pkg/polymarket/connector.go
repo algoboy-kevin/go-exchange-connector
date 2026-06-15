@@ -75,6 +75,9 @@ func New(isLive bool, cfg Config, now func() time.Time) *PolymarketConnector {
 
 // Start connects the market WebSocket (always) and user WebSocket (LIVE only).
 func (p *PolymarketConnector) Start(ctx context.Context) error {
+	// Enable async dispatch so WS goroutines never block on the engine handler.
+	p.Connector.EnableAsyncDispatch(0) // 0 = default buffer (4096)
+
 	// ── Market WS (all modes) ───────────────────────────────
 	wsURL := p.cfg.MarketWSURL
 	if wsURL == "" {
