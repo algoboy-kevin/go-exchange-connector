@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,7 +87,7 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 
 	workers := cfg.DispatcherWorkers
 	if workers <= 0 {
-		workers = 1
+		workers = runtime.GOMAXPROCS(0)
 	}
 	pm.dispatcherWorkers = workers
 
