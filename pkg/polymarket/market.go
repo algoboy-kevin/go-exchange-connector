@@ -38,9 +38,9 @@ type WSPolymarketMarket struct {
 	flushTicker          *time.Ticker
 	flushCancel          context.CancelFunc
 
-	eventCh             chan []byte
-	dispatcherCancel    context.CancelFunc
-	dispatcherWorkers   int
+	eventCh           chan []byte
+	dispatcherCancel  context.CancelFunc
+	dispatcherWorkers int
 
 	eventCount atomic.Int64
 
