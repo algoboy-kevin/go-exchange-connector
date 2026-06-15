@@ -28,7 +28,8 @@ type WSPolymarketMarket struct {
 
 	base *connector.Connector
 
-	mu                    sync.RWMutex
+	subMu                 sync.RWMutex
+	pendingMu             sync.Mutex
 	subscribedAssetIDs    map[string]struct{}
 	pendingSubscribeIDs   map[string]struct{}
 	pendingUnsubscribeIDs map[string]struct{}
@@ -37,9 +38,9 @@ type WSPolymarketMarket struct {
 	flushTicker          *time.Ticker
 	flushCancel          context.CancelFunc
 
-	eventCh           chan []byte
-	dispatcherCancel  context.CancelFunc
-	dispatcherWorkers int
+	eventCh             chan []byte
+	dispatcherCancel    context.CancelFunc
+	dispatcherWorkers   int
 
 	eventCount atomic.Int64
 
@@ -71,12 +72,20 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 	}
 
 	pm.ShouldConnect = func() bool {
-		pm.mu.RLock()
-		defer pm.mu.RUnlock()
-		return len(pm.pendingSubscribeIDs) > 0 || len(pm.subscribedAssetIDs) > 0
+		pm.pendingMu.Lock()
+		hasPending := len(pm.pendingSubscribeIDs) > 0
+		pm.pendingMu.Unlock()
+		pm.subMu.RLock()
+		hasSubscribed := len(pm.subscribedAssetIDs) > 0
+		pm.subMu.RUnlock()
+		return hasPending || hasSubscribed
 	}
 
-	pm.dispatcherWorkers = 1
+	workers := cfg.DispatcherWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	pm.dispatcherWorkers = workers
 
 	pm.OnConnect = pm.onConnect
 	pm.OnMessage = pm.onMessage
@@ -133,7 +142,8 @@ func (pm *WSPolymarketMarket) Stop() {
 // Polymarket's market channel does not reliably support incremental
 // subscribe operations — a full re-subscribe on reconnect avoids issues.
 func (pm *WSPolymarketMarket) Subscribe(ctx context.Context, assetIDs []string) {
-	pm.mu.Lock()
+	pm.subMu.Lock()
+	pm.pendingMu.Lock()
 	for _, id := range assetIDs {
 		delete(pm.pendingUnsubscribeIDs, id)
 		if _, ok := pm.subscribedAssetIDs[id]; ok {
@@ -142,7 +152,8 @@ func (pm *WSPolymarketMarket) Subscribe(ctx context.Context, assetIDs []string) 
 		pm.pendingSubscribeIDs[id] = struct{}{}
 	}
 	needsReconnect := len(pm.pendingSubscribeIDs) > 0
-	pm.mu.Unlock()
+	pm.pendingMu.Unlock()
+	pm.subMu.Unlock()
 
 	if needsReconnect {
 		pm.Disconnect()
@@ -151,13 +162,13 @@ func (pm *WSPolymarketMarket) Subscribe(ctx context.Context, assetIDs []string) 
 
 // Unsubscribe queues asset IDs for removal and triggers a reconnect.
 func (pm *WSPolymarketMarket) Unsubscribe(ctx context.Context, assetIDs []string) {
-	pm.mu.Lock()
+	pm.pendingMu.Lock()
 	for _, id := range assetIDs {
 		delete(pm.pendingSubscribeIDs, id)
 		pm.pendingUnsubscribeIDs[id] = struct{}{}
 	}
 	needsReconnect := len(pm.pendingUnsubscribeIDs) > 0
-	pm.mu.Unlock()
+	pm.pendingMu.Unlock()
 
 	if needsReconnect {
 		pm.Disconnect()
@@ -180,23 +191,23 @@ func (pm *WSPolymarketMarket) flushLoop(ctx context.Context) {
 }
 
 func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
-	pm.mu.Lock()
+	pm.pendingMu.Lock()
 	subIDs := pm.pendingSubscribeIDs
 	unsubIDs := pm.pendingUnsubscribeIDs
 	pm.pendingSubscribeIDs = make(map[string]struct{})
 	pm.pendingUnsubscribeIDs = make(map[string]struct{})
-	pm.mu.Unlock()
+	pm.pendingMu.Unlock()
 
 	conn := pm.Conn()
 	if conn == nil {
-		pm.mu.Lock()
+		pm.pendingMu.Lock()
 		for id := range subIDs {
 			pm.pendingSubscribeIDs[id] = struct{}{}
 		}
 		for id := range unsubIDs {
 			pm.pendingUnsubscribeIDs[id] = struct{}{}
 		}
-		pm.mu.Unlock()
+		pm.pendingMu.Unlock()
 		return
 	}
 
@@ -209,18 +220,18 @@ func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
 		}
 		if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
 			slog.Warn("market WS: failed to send unsubscribe", "err", err)
-			pm.mu.Lock()
+			pm.pendingMu.Lock()
 			for _, id := range ids {
 				pm.pendingUnsubscribeIDs[id] = struct{}{}
 			}
-			pm.mu.Unlock()
+			pm.pendingMu.Unlock()
 			return
 		}
-		pm.mu.Lock()
+		pm.subMu.Lock()
 		for _, id := range ids {
 			delete(pm.subscribedAssetIDs, id)
 		}
-		pm.mu.Unlock()
+		pm.subMu.Unlock()
 	}
 
 	flushSub := func(ids []string) {
@@ -232,18 +243,18 @@ func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
 		}
 		if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
 			slog.Warn("market WS: failed to send subscribe", "err", err)
-			pm.mu.Lock()
+			pm.pendingMu.Lock()
 			for _, id := range ids {
 				pm.pendingSubscribeIDs[id] = struct{}{}
 			}
-			pm.mu.Unlock()
+			pm.pendingMu.Unlock()
 			return
 		}
-		pm.mu.Lock()
+		pm.subMu.Lock()
 		for _, id := range ids {
 			pm.subscribedAssetIDs[id] = struct{}{}
 		}
-		pm.mu.Unlock()
+		pm.subMu.Unlock()
 	}
 
 	if len(unsubIDs) > 0 {
@@ -271,7 +282,8 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn)
 	if pm.onStatusChange != nil {
 		pm.onStatusChange(ws.StatusConnected)
 	}
-	pm.mu.Lock()
+	pm.subMu.Lock()
+	pm.pendingMu.Lock()
 	allIDs := make(map[string]struct{})
 	for id := range pm.subscribedAssetIDs {
 		allIDs[id] = struct{}{}
@@ -286,7 +298,8 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn)
 	pm.subscribedAssetIDs = allIDs
 	pm.pendingSubscribeIDs = make(map[string]struct{})
 	pm.pendingUnsubscribeIDs = make(map[string]struct{})
-	pm.mu.Unlock()
+	pm.pendingMu.Unlock()
+	pm.subMu.Unlock()
 
 	if len(allIDs) == 0 {
 		return nil
@@ -306,12 +319,14 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn)
 }
 
 func (pm *WSPolymarketMarket) onDisconnect(err error) {
-	pm.mu.Lock()
+	pm.subMu.Lock()
+	pm.pendingMu.Lock()
 	for id := range pm.subscribedAssetIDs {
 		pm.pendingSubscribeIDs[id] = struct{}{}
 	}
 	pm.subscribedAssetIDs = make(map[string]struct{})
-	pm.mu.Unlock()
+	pm.pendingMu.Unlock()
+	pm.subMu.Unlock()
 
 	// Extract close info.
 	closeCode := coderws.CloseStatus(err)
@@ -350,7 +365,7 @@ func (pm *WSPolymarketMarket) handlePriceChange(raw json.RawMessage) {
 		return
 	}
 
-	pm.mu.RLock()
+	pm.subMu.RLock()
 	items := make([]connector.PriceChangeItem, 0, len(ev.PriceChanges))
 	for _, pc := range ev.PriceChanges {
 		if _, ok := pm.subscribedAssetIDs[pc.AssetID]; ok {
@@ -365,7 +380,7 @@ func (pm *WSPolymarketMarket) handlePriceChange(raw json.RawMessage) {
 			})
 		}
 	}
-	pm.mu.RUnlock()
+	pm.subMu.RUnlock()
 
 	if len(items) == 0 {
 		return
@@ -476,18 +491,20 @@ func (pm *WSPolymarketMarket) handleMarketResolved(raw json.RawMessage) {
 // ─────────────────────────────────────────────────────────────
 
 func (pm *WSPolymarketMarket) isSubscribed(assetID string) bool {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
+	pm.subMu.RLock()
+	defer pm.subMu.RUnlock()
 	_, ok := pm.subscribedAssetIDs[assetID]
 	return ok
 }
 
 func (pm *WSPolymarketMarket) clearSubscriptions() {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
+	pm.subMu.Lock()
+	pm.pendingMu.Lock()
 	pm.subscribedAssetIDs = make(map[string]struct{})
 	pm.pendingSubscribeIDs = make(map[string]struct{})
 	pm.pendingUnsubscribeIDs = make(map[string]struct{})
+	pm.pendingMu.Unlock()
+	pm.subMu.Unlock()
 }
 
 // eventDispatcher runs in a dedicated goroutine, pulling raw WS messages

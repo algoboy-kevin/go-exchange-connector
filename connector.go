@@ -159,15 +159,7 @@ func (c *Connector) PlaceLimitOrders(orders []LimitOrder) (OrderResult, error) {
 	// ── PAPER mode: simulate order lifecycle via dispatch ────
 	for i, o := range orders {
 		now := c.Now()
-		c.DispatchEvent(&OrderReservationEvent{
-			ClientID:  o.OrderID,
-			MarketID:  o.MarketID,
-			AssetID:   o.AssetID,
-			Side:      o.Side,
-			Price:     o.Price,
-			Size:      o.Size,
-			Timestamp: now,
-		})
+	
 		c.DispatchEvent(&OrderPlacementEvent{
 			BrokerID:  o.OrderID,
 			MarketID:  o.MarketID,
