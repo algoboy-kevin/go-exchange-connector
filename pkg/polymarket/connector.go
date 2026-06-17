@@ -223,6 +223,10 @@ func (e *polymarketLiveExecutor) PlaceLimitOrders(orders []connector.LimitOrder)
 	return connector.OrderResult{}, fmt.Errorf("polymarket LIVE PlaceLimitOrders not yet implemented")
 }
 
+func (e *polymarketLiveExecutor) PlaceMarketOrder(order connector.MarketOrder) (connector.OrderResult, error) {
+	return connector.OrderResult{}, fmt.Errorf("polymarket LIVE PlaceMarketOrder not yet implemented")
+}
+
 func (e *polymarketLiveExecutor) CancelOrders(orderIDs []string) error {
 	return fmt.Errorf("polymarket LIVE CancelOrders not yet implemented")
 }

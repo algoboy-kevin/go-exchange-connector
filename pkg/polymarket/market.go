@@ -47,8 +47,9 @@ type WSPolymarketMarket struct {
 
 	onStatusChange func(ws.ConnectionStatus)
 
-	latencyTracker latencyTracker
-	latencyCancel  context.CancelFunc
+	latencyTracker     latencyTracker
+	latencyCancel      context.CancelFunc
+	latencyLogEnabled  bool
 }
 
 // SetOnStatusChange registers a callback that fires whenever the WebSocket
@@ -90,6 +91,7 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 		workers = runtime.GOMAXPROCS(0)
 	}
 	pm.dispatcherWorkers = workers
+	pm.latencyLogEnabled = cfg.LatencyLogEnabled
 
 	pm.OnConnect = pm.onConnect
 	pm.OnMessage = pm.onMessage
@@ -115,9 +117,11 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 		go pm.eventDispatcher(dispatchCtx)
 	}
 
-	latencyCtx, latencyCancel := context.WithCancel(ctx)
-	pm.latencyCancel = latencyCancel
-	go pm.latencyLogger(latencyCtx)
+	if pm.latencyLogEnabled {
+		latencyCtx, latencyCancel := context.WithCancel(ctx)
+		pm.latencyCancel = latencyCancel
+		go pm.latencyLogger(latencyCtx)
+	}
 
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — server drops idle connections
@@ -141,7 +145,7 @@ func (pm *WSPolymarketMarket) Stop() {
 	if pm.flushTicker != nil {
 		pm.flushTicker.Stop()
 	}
-	if pm.latencyCancel != nil {
+	if pm.latencyLogEnabled && pm.latencyCancel != nil {
 		pm.latencyCancel()
 	}
 	pm.Close()

@@ -36,6 +36,17 @@ func (m *MockConnector) PlaceLimitOrders(orders []LimitOrder) (OrderResult, erro
 	return OrderResult{Success: true, Orders: results}, nil
 }
 
+func (m *MockConnector) PlaceMarketOrder(order MarketOrder) (OrderResult, error) {
+	slog.Debug("mock: accepted market order", "id", order.OrderID, "side", order.Side, "size", order.Size)
+	return OrderResult{
+		Success: true,
+		Orders: []SingleOrderResult{{
+			OrderID: order.OrderID,
+			Success: true,
+		}},
+	}, nil
+}
+
 func (m *MockConnector) CancelOrders(orderIDs []string) error {
 	for _, id := range orderIDs {
 		slog.Debug("mock: cancelled order", "id", id)

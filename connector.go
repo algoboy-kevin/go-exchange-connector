@@ -29,6 +29,8 @@ type ExchangeConnector interface {
 	// In PAPER mode, simulates via the OnReservation → OnPlacement chain.
 	PlaceLimitOrders(orders []LimitOrder) (OrderResult, error)
 
+	PlaceMarketOrder(order MarketOrder) (OrderResult, error)
+
 	// CancelOrders cancels a set of orders by ID.
 	CancelOrders(orderIDs []string) error
 
@@ -73,6 +75,7 @@ type ExchangeConnector interface {
 // HTTP/RPC calls to the exchange.
 type LiveExecutor interface {
 	PlaceLimitOrders(orders []LimitOrder) (OrderResult, error)
+	PlaceMarketOrder(order MarketOrder) (OrderResult, error)
 	CancelOrders(orderIDs []string) error
 	GetMarket(id, slug string) (*Market, error)
 	GetResolution(marketID string) (*Resolution, error)
@@ -159,7 +162,7 @@ func (c *Connector) PlaceLimitOrders(orders []LimitOrder) (OrderResult, error) {
 	// ── PAPER mode: simulate order lifecycle via dispatch ────
 	for i, o := range orders {
 		now := c.Now()
-	
+
 		c.DispatchEvent(&OrderPlacementEvent{
 			BrokerID:  o.OrderID,
 			MarketID:  o.MarketID,
@@ -186,6 +189,59 @@ func (c *Connector) PlaceLimitOrders(orders []LimitOrder) (OrderResult, error) {
 		results[i] = SingleOrderResult{OrderID: o.OrderID, Success: true}
 	}
 	return OrderResult{Success: true, Orders: results}, nil
+}
+
+// PlaceMarketOrder submits a market order.
+//
+// In PAPER mode (IsLive=false): simulates immediate fill by dispatching
+// OrderPlacementEvent + OrderFillEvent in sequence.
+//
+// In LIVE mode (IsLive=true): delegates to LiveExecutor.PlaceMarketOrder.
+func (c *Connector) PlaceMarketOrder(order MarketOrder) (OrderResult, error) {
+	if c.IsLive {
+		if c.Live == nil {
+			return OrderResult{Success: false}, fmt.Errorf("not implemented")
+		}
+		return c.Live.PlaceMarketOrder(order)
+	}
+
+	// ── PAPER mode: simulate immediate market buy/sell ──────
+	now := c.Now()
+
+	c.DispatchEvent(&OrderPlacementEvent{
+		BrokerID:  order.OrderID,
+		MarketID:  order.MarketID,
+		AssetID:   order.AssetID,
+		Side:      order.Side,
+		Price:     order.Price,
+		Size:      order.Size,
+		Timestamp: now,
+	})
+
+	c.DispatchEvent(&OrderFillEvent{
+		TradeID:   order.OrderID + "-fill",
+		BrokerID:  order.OrderID,
+		AssetID:   order.AssetID,
+		Side:      order.Side,
+		Price:     order.Price,
+		Size:      order.Size,
+		Timestamp: now,
+	})
+
+	slog.Debug("paper: market order filled",
+		"id", order.OrderID,
+		"side", order.Side,
+		"size", order.Size,
+		"price", order.Price,
+	)
+
+	return OrderResult{
+		Success: true,
+		Orders: []SingleOrderResult{{
+			OrderID: order.OrderID,
+			Success: true,
+		}},
+	}, nil
 }
 
 // CancelOrders cancels a set of orders.

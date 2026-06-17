@@ -61,6 +61,16 @@ type LimitOrder struct {
 	Size     float64 `json:"size"`
 }
 
+//
+type MarketOrder struct {
+	OrderID  string  `json:"order_id"`
+	AssetID  string  `json:"asset_id"`
+	MarketID string  `json:"market_id"`
+	Side     string  `json:"side"` // "BUY" or "SELL"
+	Price    float64 `json:"price"` // slippage protection
+	Size     float64 `json:"size"`
+}
+
 // OrderResult describes the outcome of a batch order operation.
 type OrderResult struct {
 	Success  bool                `json:"success"`

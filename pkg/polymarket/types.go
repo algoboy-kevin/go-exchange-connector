@@ -178,4 +178,5 @@ type Config struct {
 	ReconnectIntervalMs int64  `yaml:"reconnect_interval_ms,omitempty"`
 	PendingFlushMs      int64  `yaml:"pending_flush_ms,omitempty"`
 	DispatcherWorkers   int    `yaml:"dispatcher_workers,omitempty"`
+	LatencyLogEnabled   bool   `yaml:"latency_log_enabled,omitempty"`
 }
