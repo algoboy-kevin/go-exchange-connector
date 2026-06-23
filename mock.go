@@ -79,12 +79,11 @@ func (m *MockConnector) SetDispatcher(d func(any)) {
 }
 
 func (m *MockConnector) Start(ctx context.Context) error {
-	slog.Info("mock: connector started")
 	return nil
 }
 
 func (m *MockConnector) Stop() {
-	slog.Info("mock: connector stopped")
+	// No-op
 }
 
 // Compile-time interface check.

@@ -122,10 +122,10 @@ func (p *PolymarketConnector) Stop() {
 	if p.user != nil {
 		p.user.Stop()
 	}
+	
 	if p.market != nil {
 		p.market.Stop()
 	}
-	slog.Info("polymarket: connector stopped")
 }
 
 // MarketStatus returns the current WebSocket connection status.

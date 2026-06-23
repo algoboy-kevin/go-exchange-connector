@@ -293,7 +293,6 @@ func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
 // ─────────────────────────────────────────────────────────────
 
 func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn) error {
-	slog.Info("market WS: reconnected")
 	if pm.onStatusChange != nil {
 		pm.onStatusChange(ws.StatusConnected)
 	}
@@ -324,7 +323,6 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn)
 	for id := range allIDs {
 		ids = append(ids, id)
 	}
-	slog.Info("market WS: subscribed on reconnect", "sub_count", len(ids))
 
 	data, err := json.Marshal(subscriptionMessage{AssetsIDs: ids, Type: "market"})
 	if err != nil {

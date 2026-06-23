@@ -305,10 +305,11 @@ func (c *Connector) SetDispatcher(d func(any)) {
 // Start initialises the connector. Override in exchange-specific code
 // to start WebSocket connections.
 func (c *Connector) Start(ctx context.Context) error {
-	slog.Info("connector: started",
-		"is_live", c.IsLive,
-		"has_live_exec", c.Live != nil,
-	)
+	// slog.Info("connector: started",
+	// 	"is_live", c.IsLive,
+	// 	"has_live_exec", c.Live != nil,
+	// )
+	
 	return nil
 }
 
@@ -320,7 +321,6 @@ func (c *Connector) Stop() {
 		c.dispatchWg.Wait()
 		c.dispatchCh = nil
 	}
-	slog.Info("connector: stopped")
 }
 
 // ── Helpers ──────────────────────────────────────────────────
