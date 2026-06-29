@@ -47,9 +47,9 @@ type WSPolymarketMarket struct {
 
 	onStatusChange func(ws.ConnectionStatus)
 
-	latencyTracker     latencyTracker
-	latencyCancel      context.CancelFunc
-	latencyLogEnabled  bool
+	latencyTracker    latencyTracker
+	latencyCancel     context.CancelFunc
+	latencyLogEnabled bool
 }
 
 // SetOnStatusChange registers a callback that fires whenever the WebSocket
@@ -324,7 +324,7 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn)
 		ids = append(ids, id)
 	}
 
-	data, err := json.Marshal(subscriptionMessage{AssetsIDs: ids, Type: "market"})
+	data, err := json.Marshal(subscriptionMessage{AssetsIDs: ids, Type: "market", CustomFeatureEnabled: true})
 	if err != nil {
 		return err
 	}
@@ -651,8 +651,9 @@ func (pm *WSPolymarketMarket) processMessage(data []byte) {
 // ─────────────────────────────────────────────────────────────
 
 type subscriptionMessage struct {
-	AssetsIDs []string `json:"assets_ids"`
-	Type      string   `json:"type"`
+	AssetsIDs            []string `json:"assets_ids"`
+	Type                 string   `json:"type"`
+	CustomFeatureEnabled bool     `json:"custom_feature_enabled"`
 }
 
 type subscribeMessage struct {
