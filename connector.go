@@ -148,6 +148,16 @@ func New(isLive bool, live LiveExecutor) *Connector {
 	}
 }
 
+// SetValidateOrder sets the optional paper-mode order validation callback.
+func (c *Connector) SetValidateOrder(fn func(LimitOrder) error) {
+	c.ValidateOrder = fn
+}
+
+// IsPaperMode returns true when running in PAPER mode.
+func (c *Connector) IsPaperMode() bool {
+	return !c.IsLive
+}
+
 // ── ExchangeConnector implementation ─────────────────────────
 
 // PlaceLimitOrders submits a batch of limit orders.
