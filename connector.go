@@ -119,6 +119,13 @@ type Connector struct {
 	// Override for backtest mode (e.g. return clock.Now()).
 	Now func() time.Time
 
+	// ValidateOrder is an optional callback for PAPER mode.
+	// If set, it's called before each order is placed. Return a non-nil error
+	// to reject the order (simulating an exchange API rejection). The rejected
+	// order will have success=false in the returned OrderResult and no event
+	// will be dispatched for it.
+	ValidateOrder func(LimitOrder) error
+
 	// ── Internal ────────────────────────────────────────────
 
 	seqID      atomic.Int64
@@ -160,7 +167,22 @@ func (c *Connector) PlaceLimitOrders(orders []LimitOrder) (OrderResult, error) {
 	}
 
 	// ── PAPER mode: simulate order lifecycle via dispatch ────
+	results := make([]SingleOrderResult, len(orders))
 	for i, o := range orders {
+		// Optional pre-placement validation (simulates exchange API rejection)
+		if c.ValidateOrder != nil {
+			if err := c.ValidateOrder(o); err != nil {
+				slog.Debug("paper: order rejected by ValidateOrder",
+					"id", o.OrderID, "reason", err)
+				results[i] = SingleOrderResult{
+					OrderID:  "",
+					Success:  false,
+					ErrorMsg: err.Error(),
+				}
+				continue // skip dispatch — no event emitted
+			}
+		}
+
 		now := c.Now()
 
 		c.DispatchEvent(&OrderPlacementEvent{
@@ -173,6 +195,8 @@ func (c *Connector) PlaceLimitOrders(orders []LimitOrder) (OrderResult, error) {
 			Timestamp: now,
 		})
 
+		results[i] = SingleOrderResult{OrderID: o.OrderID, Success: true}
+
 		// Log progress for large batches.
 		if i > 0 && i%100 == 0 {
 			slog.Debug("paper: placed orders", "count", i+1, "total", len(orders))
@@ -184,10 +208,6 @@ func (c *Connector) PlaceLimitOrders(orders []LimitOrder) (OrderResult, error) {
 		"is_live", false,
 	)
 
-	results := make([]SingleOrderResult, len(orders))
-	for i, o := range orders {
-		results[i] = SingleOrderResult{OrderID: o.OrderID, Success: true}
-	}
 	return OrderResult{Success: true, Orders: results}, nil
 }
 
@@ -207,6 +227,29 @@ func (c *Connector) PlaceMarketOrder(order MarketOrder) (OrderResult, error) {
 
 	// ── PAPER mode: simulate immediate market buy/sell ──────
 	now := c.Now()
+
+	// Optional pre-placement validation (simulates exchange API rejection)
+	if c.ValidateOrder != nil {
+		if err := c.ValidateOrder(LimitOrder{
+			OrderID:  order.OrderID,
+			AssetID:  order.AssetID,
+			MarketID: order.MarketID,
+			Side:     order.Side,
+			Price:    order.Price,
+			Size:     order.Size,
+		}); err != nil {
+			slog.Debug("paper: market order rejected by ValidateOrder",
+				"id", order.OrderID, "reason", err)
+			return OrderResult{
+				Success: true,
+				Orders: []SingleOrderResult{{
+					OrderID:  "",
+					Success:  false,
+					ErrorMsg: err.Error(),
+				}},
+			}, nil
+		}
+	}
 
 	c.DispatchEvent(&OrderPlacementEvent{
 		BrokerID:  order.OrderID,
@@ -309,7 +352,7 @@ func (c *Connector) Start(ctx context.Context) error {
 	// 	"is_live", c.IsLive,
 	// 	"has_live_exec", c.Live != nil,
 	// )
-	
+
 	return nil
 }
 
