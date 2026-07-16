@@ -2,12 +2,16 @@ package polymarket
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	connector "github.com/algoboy-kevin/go-exchange-connector"
 	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // PolymarketConnector is the full Polymarket exchange connector.
@@ -58,9 +62,48 @@ func New(isLive bool, cfg Config, now func() time.Time) *PolymarketConnector {
 
 	gamma := NewGammaClient(gammaURL)
 
+	// ── CLOB client (LIVE mode) ────────────────────────────
+	clobURL := cfg.ClobURL
+	if clobURL == "" {
+		clobURL = defaultClobURL
+	}
+
+	clob := NewClobClient(clobURL, cfg.APIKey, cfg.Secret, cfg.Passphrase,
+		WithOwnerUUID(cfg.ClobOwnerUUID),
+		WithMakerAddress(cfg.ClobMakerAddress),
+		WithSignerAddress(cfg.ClobSignerAddress),
+	)
+
+	sigType := cfg.ClobSignatureType
+	if sigType == 0 {
+		sigType = 1 // default POLY_PROXY
+	}
+	clob.signatureType = sigType
+
+	// ── EIP-712 signing key ─────────────────────────────────
+	var signingKey *ecdsa.PrivateKey
+	if cfg.ClobSigningKeyHex != "" {
+		hexStr := strings.TrimPrefix(cfg.ClobSigningKeyHex, "0x")
+		keyBytes, err := hex.DecodeString(hexStr)
+		if err != nil {
+			slog.Warn("polymarket: invalid signing key hex, orders will fail", "err", err)
+		} else {
+			key, err := crypto.ToECDSA(keyBytes)
+			if err != nil {
+				slog.Warn("polymarket: invalid signing key, orders will fail", "err", err)
+			} else {
+				signingKey = key
+			}
+		}
+	} else {
+		slog.Warn("polymarket: no signing key configured — set ClobSigningKeyHex for LIVE orders")
+	}
+
 	pc := &PolymarketConnector{
 		Connector: connector.New(isLive, &polymarketLiveExecutor{
-			gamma: gamma,
+			gamma:      gamma,
+			clob:       clob,
+			signingKey: signingKey,
 		}),
 		cfg:   cfg,
 		gamma: gamma,
@@ -122,7 +165,7 @@ func (p *PolymarketConnector) Stop() {
 	if p.user != nil {
 		p.user.Stop()
 	}
-	
+
 	if p.market != nil {
 		p.market.Stop()
 	}
@@ -189,6 +232,25 @@ func (p *PolymarketConnector) GetResolution(marketID string) (*connector.Resolut
 }
 
 // ─────────────────────────────────────────────────────────────
+// EIP-712 signing helpers
+// ─────────────────────────────────────────────────────────────
+
+// signSendOrder signs the Order inside a SendOrder using EIP-712.
+// Uses the executor's signing key. Defaults to non-neg-risk and feeRateBps=0.
+func (e *polymarketLiveExecutor) signSendOrder(so *SendOrder) error {
+	if e.signingKey == nil {
+		return fmt.Errorf("no signing key configured — set ClobSigningKeyHex in Config")
+	}
+
+	// Detect neg-risk from token ID or default to false.
+	// For now, always non-neg-risk. Override per-market once we have market metadata.
+	isNegRisk := false
+	feeRateBps := int64(0)
+
+	return SignAndSetOrder(&so.Order, e.signingKey, isNegRisk, feeRateBps)
+}
+
+// ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
 
@@ -212,23 +274,280 @@ func (p *PolymarketConnector) gammaFetch(id, slug string) (*connector.Market, er
 }
 
 // ─────────────────────────────────────────────────────────────
-// Live executor (stub — real API calls TBD)
+// Live executor — delegates to the CLOB API
 // ─────────────────────────────────────────────────────────────
 
 type polymarketLiveExecutor struct {
-	gamma *GammaClient
+	gamma      *GammaClient
+	clob       *ClobClient
+	signingKey *ecdsa.PrivateKey
 }
 
+// PlaceLimitOrders submits a batch of limit orders to the CLOB API.
+// Orders are batched in groups of 15 (CLOB max).
+//
+// Each order requires:
+//  1. Convert connector.LimitOrder → CLOB Order (price/size to 6-dec fixed-math)
+//  2. EIP-712 sign the Order struct   ← requires go-ethereum (see PROD.md Phase 3)
+//  3. Wrap in SendOrder and POST /orders
 func (e *polymarketLiveExecutor) PlaceLimitOrders(orders []connector.LimitOrder) (connector.OrderResult, error) {
-	return connector.OrderResult{}, fmt.Errorf("polymarket LIVE PlaceLimitOrders not yet implemented")
+	if e.clob == nil {
+		return connector.OrderResult{}, fmt.Errorf("polymarket LIVE: clob client not initialized")
+	}
+
+	if len(orders) == 0 {
+		return connector.OrderResult{Success: true}, nil
+	}
+
+	// Build SendOrder payloads and sign them.
+	sendOrders := make([]SendOrder, 0, len(orders))
+	for _, o := range orders {
+		so, err := buildSendOrder(o, e.clob)
+		if err != nil {
+			return connector.OrderResult{}, fmt.Errorf("build order: %w", err)
+		}
+
+		// Sign the order.
+		if err := e.signSendOrder(so); err != nil {
+			return connector.OrderResult{}, fmt.Errorf("sign order for %s: %w", o.OrderID, err)
+		}
+
+		sendOrders = append(sendOrders, *so)
+	}
+
+	// Post each order individually via /order (V2 single-order endpoint).
+	// Batch /orders may have different semantics in V2 — use /order for now.
+	var allResults []connector.SingleOrderResult
+
+	for _, so := range sendOrders {
+		result, err := e.clob.PostOrder(so)
+		if err != nil {
+			allResults = append(allResults, connector.SingleOrderResult{
+				Success:  false,
+				ErrorMsg: err.Error(),
+			})
+			continue
+		}
+		allResults = append(allResults, connector.SingleOrderResult{
+			OrderID:  result.OrderID,
+			Success:  result.Success,
+			ErrorMsg: result.ErrorMsg,
+		})
+	}
+
+	// Overall success = at least one order succeeded.
+	overallSuccess := false
+	for _, r := range allResults {
+		if r.Success {
+			overallSuccess = true
+			break
+		}
+	}
+
+	return connector.OrderResult{
+		Success: overallSuccess,
+		Orders:  allResults,
+	}, nil
 }
 
+// PlaceMarketOrder submits a FOK (Fill-Or-Kill) market order.
+//
+// Polymarket market orders use a limit-price FOK order:
+//   - BUY:  fills only when price ≤ MarketOrder.Price (slippage protection)
+//     MarketOrder.Size = dollar amount to spend (USDC)
+//   - SELL: fills only when price ≥ MarketOrder.Price (slippage protection)
+//     MarketOrder.Size = number of shares to sell
+//
+// The entire order fills atomically or cancels — no partial fills.
 func (e *polymarketLiveExecutor) PlaceMarketOrder(order connector.MarketOrder) (connector.OrderResult, error) {
-	return connector.OrderResult{}, fmt.Errorf("polymarket LIVE PlaceMarketOrder not yet implemented")
+	if e.clob == nil {
+		return connector.OrderResult{}, fmt.Errorf("polymarket LIVE: clob client not initialized")
+	}
+
+	so, err := buildMarketSendOrder(order, e.clob)
+	if err != nil {
+		return connector.OrderResult{}, fmt.Errorf("build market order: %w", err)
+	}
+
+	// Sign the order.
+	if err := e.signSendOrder(so); err != nil {
+		return connector.OrderResult{}, fmt.Errorf("sign market order: %w", err)
+	}
+
+	result, err := e.clob.PostOrder(*so)
+	if err != nil {
+		return connector.OrderResult{}, fmt.Errorf("post market order: %w", err)
+	}
+
+	return connector.OrderResult{
+		Success: result.Success,
+		Orders: []connector.SingleOrderResult{{
+			OrderID:  result.OrderID,
+			Success:  result.Success,
+			ErrorMsg: result.ErrorMsg,
+		}},
+	}, nil
 }
 
+// CancelOrders cancels multiple orders by their order hashes.
+// Uses DELETE /orders (max 1000 per batch).
 func (e *polymarketLiveExecutor) CancelOrders(orderIDs []string) error {
-	return fmt.Errorf("polymarket LIVE CancelOrders not yet implemented")
+	if e.clob == nil {
+		return fmt.Errorf("polymarket LIVE: clob client not initialized")
+	}
+
+	if len(orderIDs) == 0 {
+		return nil
+	}
+
+	// Batch in chunks of 1000.
+	const batchSize = 1000
+	var finalErr error
+
+	for i := 0; i < len(orderIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(orderIDs) {
+			end = len(orderIDs)
+		}
+		batch := orderIDs[i:end]
+
+		resp, err := e.clob.CancelOrders(batch)
+		if err != nil {
+			finalErr = err
+			slog.Warn("clob: cancel batch failed", "batch_start", i, "err", err)
+			continue
+		}
+
+		// Log any orders that were not cancelled.
+		for id, reason := range resp.NotCanceled {
+			slog.Warn("clob: order not cancelled", "order_id", id, "reason", reason)
+		}
+	}
+
+	return finalErr
+}
+
+// buildSendOrder converts a connector.LimitOrder to a CLOB SendOrder.
+// The resulting Order will have an empty Signature field — it must be filled
+// via EIP-712 signing before submission (see PROD.md Phase 3).
+func buildSendOrder(lo connector.LimitOrder, clob *ClobClient) (*SendOrder, error) {
+	// Convert price and size to 6-decimal fixed-math strings.
+	// Polymarket uses 6 decimals: amount = value * 1_000_000 as string.
+	sizeRaw := int64(lo.Size * 1_000_000)
+	priceRaw := int64(lo.Price * 1_000_000)
+
+	// Amount semantics (matching the official Go SDK's buildLimit):
+	//   BUY:  makerAmount = size * price (USDC spent), takerAmount = size (shares received)
+	//   SELL: makerAmount = size (shares sold),       takerAmount = size * price (USDC received)
+	var makerAmount, takerAmount string
+	switch strings.ToUpper(lo.Side) {
+	case "BUY":
+		makerAmount = fmt.Sprintf("%d", sizeRaw*priceRaw/1_000_000)
+		takerAmount = fmt.Sprintf("%d", sizeRaw)
+	case "SELL":
+		makerAmount = fmt.Sprintf("%d", sizeRaw)
+		takerAmount = fmt.Sprintf("%d", sizeRaw*priceRaw/1_000_000)
+	default:
+		return nil, fmt.Errorf("invalid side: %s", lo.Side)
+	}
+
+	now := time.Now()
+	timestampMs := fmt.Sprintf("%d", now.UnixMilli())
+	// For GTC/FOK/FAK orders, expiration must be "0" per the V2 API.
+	// Only GTD orders use a non-zero expiration.
+	expiration := "0"
+
+	salt := fmt.Sprintf("%d", now.UnixNano()) // use nanosecond timestamp as salt for uniqueness
+
+	order := Order{
+		Maker:         clob.makerAddress,
+		Signer:        clob.signerAddress,
+		TokenID:       lo.AssetID,
+		MakerAmount:   makerAmount,
+		TakerAmount:   takerAmount,
+		Side:          strings.ToUpper(lo.Side),
+		Expiration:    expiration,
+		Timestamp:     timestampMs,
+		Metadata:      "0x0000000000000000000000000000000000000000000000000000000000000000",
+		Builder:       "0x0000000000000000000000000000000000000000000000000000000000000000",
+		Signature:     "",
+		Salt:          salt,
+		SignatureType: clob.signatureType,
+	}
+
+	so := &SendOrder{
+		Order:     order,
+		Owner:     clob.ownerUUID,
+		OrderType: "GTC",
+	}
+
+	return so, nil
+}
+
+// buildMarketSendOrder converts a connector.MarketOrder to a CLOB SendOrder
+// with FOK (Fill-Or-Kill) semantics.
+//
+// Amount semantics (matching Polymarket SDK's createMarketOrder):
+//   - BUY:  order.Size = dollar amount to spend (USDC)
+//     makerAmount = shares bought   = (Size / Price) * 10^6
+//     takerAmount = USDC spent      = Size * 10^6
+//   - SELL: order.Size = number of shares to sell
+//     makerAmount = USDC received   = Size * Price * 10^6
+//     takerAmount = shares sold     = Size * 10^6
+//
+// The Price acts as slippage protection — the order only fills at equal or
+// better price. FOK means the entire order fills atomically or cancels.
+func buildMarketSendOrder(mo connector.MarketOrder, clob *ClobClient) (*SendOrder, error) {
+	priceRaw := int64(mo.Price * 1_000_000)
+
+	var makerAmount, takerAmount string
+	switch strings.ToUpper(mo.Side) {
+	case "BUY":
+		// mo.Size = dollars to spend
+		usdcRaw := int64(mo.Size * 1_000_000)
+		sharesRaw := usdcRaw * 1_000_000 / priceRaw // shares = usdc / price
+		makerAmount = fmt.Sprintf("%d", sharesRaw)
+		takerAmount = fmt.Sprintf("%d", usdcRaw)
+	case "SELL":
+		// mo.Size = number of shares to sell
+		sharesRaw := int64(mo.Size * 1_000_000)
+		usdcRaw := sharesRaw * priceRaw / 1_000_000 // usdc = shares * price
+		makerAmount = fmt.Sprintf("%d", usdcRaw)
+		takerAmount = fmt.Sprintf("%d", sharesRaw)
+	default:
+		return nil, fmt.Errorf("invalid side: %s", mo.Side)
+	}
+
+	now := time.Now()
+	timestampMs := fmt.Sprintf("%d", now.UnixMilli())
+	// For FOK orders, expiration must be "0" per the V2 API.
+	expiration := "0"
+
+	salt := fmt.Sprintf("%d", now.UnixNano())
+
+	order := Order{
+		Maker:         clob.makerAddress,
+		Signer:        clob.signerAddress,
+		TokenID:       mo.AssetID,
+		MakerAmount:   makerAmount,
+		TakerAmount:   takerAmount,
+		Side:          strings.ToUpper(mo.Side),
+		Expiration:    expiration,
+		Timestamp:     timestampMs,
+		Metadata:      "0x0000000000000000000000000000000000000000000000000000000000000000",
+		Builder:       "0x0000000000000000000000000000000000000000000000000000000000000000",
+		Signature:     "",
+		Salt:          salt,
+		SignatureType: clob.signatureType,
+	}
+
+	so := &SendOrder{
+		Order:     order,
+		Owner:     clob.ownerUUID,
+		OrderType: "FOK", // Fill-Or-Kill — atomically fill or cancel
+	}
+
+	return so, nil
 }
 
 func (e *polymarketLiveExecutor) GetMarket(id, slug string) (*connector.Market, error) {

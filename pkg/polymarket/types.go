@@ -179,4 +179,12 @@ type Config struct {
 	PendingFlushMs      int64  `yaml:"pending_flush_ms,omitempty"`
 	DispatcherWorkers   int    `yaml:"dispatcher_workers,omitempty"`
 	LatencyLogEnabled   bool   `yaml:"latency_log_enabled,omitempty"`
+
+	// CLOB API settings (LIVE mode).
+	ClobURL           string `yaml:"clob_url,omitempty"`
+	ClobOwnerUUID     string `yaml:"clob_owner_uuid"`
+	ClobMakerAddress  string `yaml:"clob_maker_address"`
+	ClobSignerAddress string `yaml:"clob_signer_address"`
+	ClobSignatureType int    `yaml:"clob_signature_type,omitempty"`  // 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE, 3=POLY_1271
+	ClobSigningKeyHex string `yaml:"clob_signing_key_hex,omitempty"` // hex-encoded ECDSA private key for EIP-712 signing
 }

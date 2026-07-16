@@ -61,14 +61,22 @@ type LimitOrder struct {
 	Size     float64 `json:"size"`
 }
 
+// MarketOrder describes a FOK (Fill-Or-Kill) market order request.
 //
+// Amount semantics (matching Polymarket's createMarketOrder):
+//   - BUY:  Size = dollar amount to spend (USDC)
+//     The order fills at price ≤ Price (slippage protection)
+//   - SELL: Size = number of shares to sell
+//     The order fills at price ≥ Price (slippage protection)
+//
+// The entire order fills atomically or cancels entirely — no partial fills.
 type MarketOrder struct {
 	OrderID  string  `json:"order_id"`
 	AssetID  string  `json:"asset_id"`
 	MarketID string  `json:"market_id"`
-	Side     string  `json:"side"` // "BUY" or "SELL"
-	Price    float64 `json:"price"` // slippage protection
-	Size     float64 `json:"size"`
+	Side     string  `json:"side"`  // "BUY" or "SELL"
+	Price    float64 `json:"price"` // worst-price limit (slippage protection)
+	Size     float64 `json:"size"`  // BUY=USDC amount, SELL=shares amount
 }
 
 // OrderResult describes the outcome of a batch order operation.
