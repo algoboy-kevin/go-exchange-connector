@@ -55,12 +55,12 @@ const (
 
 // LimitOrder is an exchange-agnostic limit order request.
 type LimitOrder struct {
-	OrderID  string    `json:"order_id"`
-	AssetID  string    `json:"asset_id"`
-	MarketID string    `json:"market_id"`
-	Side     string    `json:"side"` // "BUY" or "SELL"
-	Price    float64   `json:"price"`
-	Size     float64   `json:"size"`
+	OrderID   string    `json:"order_id"`
+	AssetID   string    `json:"asset_id"`
+	MarketID  string    `json:"market_id"`
+	Side      string    `json:"side"` // "BUY" or "SELL"
+	Price     float64   `json:"price"`
+	Size      float64   `json:"size"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"` // zero = GTC, non-zero = GTD
 }
 
@@ -77,9 +77,9 @@ type MarketOrder struct {
 	OrderID   string    `json:"order_id"`
 	AssetID   string    `json:"asset_id"`
 	MarketID  string    `json:"market_id"`
-	Side      string    `json:"side"`      // "BUY" or "SELL"
-	Price     float64   `json:"price"`     // worst-price limit (slippage protection)
-	Size      float64   `json:"size"`      // BUY=USDC amount, SELL=shares amount
+	Side      string    `json:"side"`                 // "BUY" or "SELL"
+	Price     float64   `json:"price"`                // worst-price limit (slippage protection)
+	Size      float64   `json:"size"`                 // BUY=USDC amount, SELL=shares amount
 	ExpiresAt time.Time `json:"expires_at,omitempty"` // zero = no expiry (FOK), non-zero = GTD
 }
 
