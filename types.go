@@ -20,6 +20,8 @@
 // to paper simulation or live executor based on isLive).
 package connector
 
+import "time"
+
 // ─────────────────────────────────────────────────────────────
 // Market types
 // ─────────────────────────────────────────────────────────────
@@ -53,12 +55,13 @@ const (
 
 // LimitOrder is an exchange-agnostic limit order request.
 type LimitOrder struct {
-	OrderID  string  `json:"order_id"`
-	AssetID  string  `json:"asset_id"`
-	MarketID string  `json:"market_id"`
-	Side     string  `json:"side"` // "BUY" or "SELL"
-	Price    float64 `json:"price"`
-	Size     float64 `json:"size"`
+	OrderID  string    `json:"order_id"`
+	AssetID  string    `json:"asset_id"`
+	MarketID string    `json:"market_id"`
+	Side     string    `json:"side"` // "BUY" or "SELL"
+	Price    float64   `json:"price"`
+	Size     float64   `json:"size"`
+	ExpiresAt time.Time `json:"expires_at,omitempty"` // zero = GTC, non-zero = GTD
 }
 
 // MarketOrder describes a FOK (Fill-Or-Kill) market order request.
@@ -71,12 +74,13 @@ type LimitOrder struct {
 //
 // The entire order fills atomically or cancels entirely — no partial fills.
 type MarketOrder struct {
-	OrderID  string  `json:"order_id"`
-	AssetID  string  `json:"asset_id"`
-	MarketID string  `json:"market_id"`
-	Side     string  `json:"side"`  // "BUY" or "SELL"
-	Price    float64 `json:"price"` // worst-price limit (slippage protection)
-	Size     float64 `json:"size"`  // BUY=USDC amount, SELL=shares amount
+	OrderID   string    `json:"order_id"`
+	AssetID   string    `json:"asset_id"`
+	MarketID  string    `json:"market_id"`
+	Side      string    `json:"side"`      // "BUY" or "SELL"
+	Price     float64   `json:"price"`     // worst-price limit (slippage protection)
+	Size      float64   `json:"size"`      // BUY=USDC amount, SELL=shares amount
+	ExpiresAt time.Time `json:"expires_at,omitempty"` // zero = no expiry (FOK), non-zero = GTD
 }
 
 // OrderResult describes the outcome of a batch order operation.

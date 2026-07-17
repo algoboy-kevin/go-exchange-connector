@@ -453,9 +453,17 @@ func buildSendOrder(lo connector.LimitOrder, clob *ClobClient) (*SendOrder, erro
 
 	now := time.Now()
 	timestampMs := fmt.Sprintf("%d", now.UnixMilli())
-	// For GTC/FOK/FAK orders, expiration must be "0" per the V2 API.
-	// Only GTD orders use a non-zero expiration.
-	expiration := "0"
+
+	var orderType string
+	var expiration string
+
+	if !lo.ExpiresAt.IsZero() {
+		expiration = fmt.Sprintf("%d", lo.ExpiresAt.UnixMilli())
+		orderType = "GTD"
+	} else {
+		expiration = "0"
+		orderType = "GTC"
+	}
 
 	salt := fmt.Sprintf("%d", now.UnixNano()) // use nanosecond timestamp as salt for uniqueness
 
@@ -478,7 +486,7 @@ func buildSendOrder(lo connector.LimitOrder, clob *ClobClient) (*SendOrder, erro
 	so := &SendOrder{
 		Order:     order,
 		Owner:     clob.ownerUUID,
-		OrderType: "GTC",
+		OrderType: orderType,
 	}
 
 	return so, nil
@@ -520,8 +528,17 @@ func buildMarketSendOrder(mo connector.MarketOrder, clob *ClobClient) (*SendOrde
 
 	now := time.Now()
 	timestampMs := fmt.Sprintf("%d", now.UnixMilli())
-	// For FOK orders, expiration must be "0" per the V2 API.
-	expiration := "0"
+
+	var orderType string
+	var expiration string
+
+	if !mo.ExpiresAt.IsZero() {
+		expiration = fmt.Sprintf("%d", mo.ExpiresAt.UnixMilli())
+		orderType = "GTD"
+	} else {
+		expiration = "0"
+		orderType = "FOK" // Fill-Or-Kill — atomically fill or cancel
+	}
 
 	salt := fmt.Sprintf("%d", now.UnixNano())
 
@@ -544,7 +561,7 @@ func buildMarketSendOrder(mo connector.MarketOrder, clob *ClobClient) (*SendOrde
 	so := &SendOrder{
 		Order:     order,
 		Owner:     clob.ownerUUID,
-		OrderType: "FOK", // Fill-Or-Kill — atomically fill or cancel
+		OrderType: orderType,
 	}
 
 	return so, nil
