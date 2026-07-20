@@ -308,26 +308,45 @@ func (u *WSPolymarketUserWS) handleTrade(raw json.RawMessage) {
 	}
 
 	ts := utils.SafeParseTimestamp(ev.Timestamp)
-	price := safeParseFloat(ev.Price)
-	size := safeParseFloat(ev.Size)
+	rootPrice := safeParseFloat(ev.Price)
+	rootSize := safeParseFloat(ev.Size)
 
-	// Extract the first maker order ID, if any.
-	var makerID string
-	if len(ev.MakerOrders) > 0 {
-		makerID = ev.MakerOrders[0].OrderID
+	// Emit 1 taker fill (IsMaker=false) using root-level price/size.
+	if rootSize > 0 {
+		u.base.DispatchEvent(&connector.OrderFillEvent{
+			TradeID:   ev.ID,
+			BrokerID:  ev.TakerOrderID,
+			AssetID:   ev.AssetID,
+			Side:      ev.Side,
+			Price:     rootPrice,
+			Size:      rootSize,
+			IsMaker:   false,
+			Timestamp: ts,
+		})
 	}
 
-	u.base.DispatchEvent(&connector.OrderFillEvent{
-		TradeID:   ev.ID,
-		BrokerID:  ev.TakerOrderID,
-		MakerID:   makerID,
-		TakerID:   ev.TakerOrderID,
-		AssetID:   ev.AssetID,
-		Side:      ev.Side,
-		Price:     price,
-		Size:      size,
-		Timestamp: ts,
-	})
+	// Emit N maker fills (IsMaker=true) using each maker order's price/size.
+	for _, mo := range ev.MakerOrders {
+		makerSize := safeParseFloat(mo.MatchedAmount)
+		if makerSize <= 0 {
+			continue
+		}
+		makerPrice := safeParseFloat(mo.Price)
+		if makerPrice <= 0 {
+			makerPrice = rootPrice
+		}
+
+		u.base.DispatchEvent(&connector.OrderFillEvent{
+			TradeID:   ev.ID,
+			BrokerID:  mo.OrderID,
+			AssetID:   mo.AssetID,
+			Side:      ev.Side,
+			Price:     makerPrice,
+			Size:      makerSize,
+			IsMaker:   true,
+			Timestamp: ts,
+		})
+	}
 }
 
 // ─────────────────────────────────────────────────────────────

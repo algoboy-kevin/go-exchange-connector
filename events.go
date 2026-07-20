@@ -104,8 +104,6 @@ type OrderPlacementEvent struct {
 type OrderFillEvent struct {
 	TradeID   string    `json:"trade_id"`
 	BrokerID  string    `json:"broker_id"`
-	MakerID   string    `json:"maker_id,omitempty"`
-	TakerID   string    `json:"taker_id,omitempty"`
 	AssetID   string    `json:"asset_id"`
 	Side      string    `json:"side"`
 	Price     float64   `json:"price"`
