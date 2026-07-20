@@ -497,11 +497,11 @@ func buildSendOrder(lo connector.LimitOrder, clob *ClobClient) (*SendOrder, erro
 //
 // Amount semantics (matching Polymarket SDK's createMarketOrder):
 //   - BUY:  order.Size = dollar amount to spend (USDC)
-//     makerAmount = shares bought   = (Size / Price) * 10^6
-//     takerAmount = USDC spent      = Size * 10^6
+//     makerAmount = USDC spent          = Size * 10^6
+//     takerAmount = shares bought       = (Size / Price) * 10^6
 //   - SELL: order.Size = number of shares to sell
-//     makerAmount = USDC received   = Size * Price * 10^6
-//     takerAmount = shares sold     = Size * 10^6
+//     makerAmount = shares sold         = Size * 10^6
+//     takerAmount = USDC received       = Size * Price * 10^6
 //
 // The Price acts as slippage protection — the order only fills at equal or
 // better price. FOK means the entire order fills atomically or cancels.
@@ -514,14 +514,14 @@ func buildMarketSendOrder(mo connector.MarketOrder, clob *ClobClient) (*SendOrde
 		// mo.Size = dollars to spend
 		usdcRaw := int64(mo.Size * 1_000_000)
 		sharesRaw := usdcRaw * 1_000_000 / priceRaw // shares = usdc / price
-		makerAmount = fmt.Sprintf("%d", sharesRaw)
-		takerAmount = fmt.Sprintf("%d", usdcRaw)
+		makerAmount = fmt.Sprintf("%d", usdcRaw)
+		takerAmount = fmt.Sprintf("%d", sharesRaw)
 	case "SELL":
 		// mo.Size = number of shares to sell
 		sharesRaw := int64(mo.Size * 1_000_000)
 		usdcRaw := sharesRaw * priceRaw / 1_000_000 // usdc = shares * price
-		makerAmount = fmt.Sprintf("%d", usdcRaw)
-		takerAmount = fmt.Sprintf("%d", sharesRaw)
+		makerAmount = fmt.Sprintf("%d", sharesRaw)
+		takerAmount = fmt.Sprintf("%d", usdcRaw)
 	default:
 		return nil, fmt.Errorf("invalid side: %s", mo.Side)
 	}
