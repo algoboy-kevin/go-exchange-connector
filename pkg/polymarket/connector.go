@@ -508,20 +508,26 @@ func buildSendOrder(lo connector.LimitOrder, clob *ClobClient) (*SendOrder, erro
 func buildMarketSendOrder(mo connector.MarketOrder, clob *ClobClient) (*SendOrder, error) {
 	priceRaw := int64(mo.Price * 1_000_000)
 
+	// Polymarket market-order precision constraints (6-dec fixed math):
+	//   makerAmount: max 2 decimal places → truncate last 4 digits
+	//   takerAmount: max 4 decimal places → truncate last 2 digits
+	const makerTrunc = 10000
+	const takerTrunc = 100
+
 	var makerAmount, takerAmount string
 	switch strings.ToUpper(mo.Side) {
 	case "BUY":
 		// mo.Size = dollars to spend
 		usdcRaw := int64(mo.Size * 1_000_000)
 		sharesRaw := usdcRaw * 1_000_000 / priceRaw // shares = usdc / price
-		makerAmount = fmt.Sprintf("%d", usdcRaw)
-		takerAmount = fmt.Sprintf("%d", sharesRaw)
+		makerAmount = fmt.Sprintf("%d", (usdcRaw/makerTrunc)*makerTrunc)
+		takerAmount = fmt.Sprintf("%d", (sharesRaw/takerTrunc)*takerTrunc)
 	case "SELL":
 		// mo.Size = number of shares to sell
 		sharesRaw := int64(mo.Size * 1_000_000)
 		usdcRaw := sharesRaw * priceRaw / 1_000_000 // usdc = shares * price
-		makerAmount = fmt.Sprintf("%d", sharesRaw)
-		takerAmount = fmt.Sprintf("%d", usdcRaw)
+		makerAmount = fmt.Sprintf("%d", (sharesRaw/makerTrunc)*makerTrunc)
+		takerAmount = fmt.Sprintf("%d", (usdcRaw/takerTrunc)*takerTrunc)
 	default:
 		return nil, fmt.Errorf("invalid side: %s", mo.Side)
 	}
