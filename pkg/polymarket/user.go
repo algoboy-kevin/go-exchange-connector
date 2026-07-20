@@ -34,9 +34,6 @@ type WSPolymarketUserWS struct {
 	pendingSubscribeMarketIDs   map[string]struct{}
 	pendingUnsubscribeMarketIDs map[string]struct{}
 
-	seenTradesMu sync.RWMutex
-	seenTrades   map[string]struct{}
-
 	pingCancel context.CancelFunc
 }
 
@@ -59,7 +56,6 @@ func NewWSPolymarketUserWS(base *connector.Connector, auth UserAuth, handlers Us
 		subscribedMarketIDs:         make(map[string]struct{}),
 		pendingSubscribeMarketIDs:   make(map[string]struct{}),
 		pendingUnsubscribeMarketIDs: make(map[string]struct{}),
-		seenTrades:                  make(map[string]struct{}),
 	}
 
 	u.ShouldConnect = func() bool { return true }
@@ -306,16 +302,6 @@ func (u *WSPolymarketUserWS) handleTrade(raw json.RawMessage) {
 		return
 	}
 
-	// Deduplicate: Polymarket sends multiple status updates (MATCHED, MINED,
-	// CONFIRMED) for the same trade — only process the first occurrence.
-	u.seenTradesMu.Lock()
-	if _, seen := u.seenTrades[ev.ID]; seen {
-		u.seenTradesMu.Unlock()
-		return
-	}
-	u.seenTrades[ev.ID] = struct{}{}
-	u.seenTradesMu.Unlock()
-
 	// Forward raw event.
 	if u.handlers.OnTrade != nil {
 		u.handlers.OnTrade([]TradeWSEvent{ev})
@@ -324,6 +310,7 @@ func (u *WSPolymarketUserWS) handleTrade(raw json.RawMessage) {
 	ts := utils.SafeParseTimestamp(ev.Timestamp)
 	rootPrice := safeParseFloat(ev.Price)
 	rootSize := safeParseFloat(ev.Size)
+	status := connector.TradeStatus(ev.Status)
 
 	// Emit 1 taker fill (IsMaker=false) using root-level price/size.
 	if rootSize > 0 {
@@ -335,6 +322,7 @@ func (u *WSPolymarketUserWS) handleTrade(raw json.RawMessage) {
 			Price:     rootPrice,
 			Size:      rootSize,
 			IsMaker:   false,
+			Status:    status,
 			Timestamp: ts,
 		})
 	}
@@ -358,6 +346,7 @@ func (u *WSPolymarketUserWS) handleTrade(raw json.RawMessage) {
 			Price:     makerPrice,
 			Size:      makerSize,
 			IsMaker:   true,
+			Status:    status,
 			Timestamp: ts,
 		})
 	}

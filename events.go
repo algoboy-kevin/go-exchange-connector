@@ -100,20 +100,32 @@ type OrderPlacementEvent struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// TradeStatus represents the on-chain settlement status of a trade.
+type TradeStatus string
+
+const (
+	TradeMatched   TradeStatus = "MATCHED"   // Matched, sent to executor for on-chain submission
+	TradeMined     TradeStatus = "MINED"     // Transaction mined into the blockchain
+	TradeConfirmed TradeStatus = "CONFIRMED" // Trade achieved finality, successful
+	TradeRetrying  TradeStatus = "RETRYING"  // Transaction failed, being retried
+	TradeFailed    TradeStatus = "FAILED"    // Trade failed permanently
+)
+
 // OrderFillEvent is sent when an order is partially or fully filled.
 type OrderFillEvent struct {
-	TradeID   string    `json:"trade_id"`
-	BrokerID  string    `json:"broker_id"`
-	AssetID   string    `json:"asset_id"`
-	Side      string    `json:"side"`
-	Price     float64   `json:"price"`
-	Size      float64   `json:"size"`
-	FeePaid   float64   `json:"fee_paid"`
-	Rebates   float64   `json:"rebates"`
-	IsMaker   bool      `json:"is_maker"`
-	FillZone  string    `json:"fill_zone,omitempty"`
-	Mechanism string    `json:"mechanism,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
+	TradeID   string      `json:"trade_id"`
+	BrokerID  string      `json:"broker_id"`
+	AssetID   string      `json:"asset_id"`
+	Side      string      `json:"side"`
+	Price     float64     `json:"price"`
+	Size      float64     `json:"size"`
+	FeePaid   float64     `json:"fee_paid"`
+	Rebates   float64     `json:"rebates"`
+	IsMaker   bool        `json:"is_maker"`
+	FillZone  string      `json:"fill_zone,omitempty"`
+	Mechanism string      `json:"mechanism,omitempty"`
+	Status    TradeStatus `json:"status,omitempty"`
+	Timestamp time.Time   `json:"timestamp"`
 }
 
 // OrderCancelEvent is sent when the exchange confirms cancellation.

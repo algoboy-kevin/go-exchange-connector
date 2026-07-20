@@ -54,12 +54,12 @@ type config struct {
 	SignerAddress string
 
 	// Test parameters (from flags).
-	Slug        string
-	Outcome     string
-	BuyAmount   float64
-	MaxPrice    float64
-	Verbose     bool
-	Derive      bool
+	Slug      string
+	Outcome   string
+	BuyAmount float64
+	MaxPrice  float64
+	Verbose   bool
+	Derive    bool
 }
 
 func loadConfig() config {
@@ -199,8 +199,8 @@ type fillRecord struct {
 }
 
 type eventCollector struct {
-	fills     []fillRecord
-	fillCh    chan *connector.OrderFillEvent
+	fills  []fillRecord
+	fillCh chan *connector.OrderFillEvent
 }
 
 func newEventCollector() *eventCollector {
@@ -230,17 +230,17 @@ func (ec *eventCollector) dispatcher() func(any) {
 // ─────────────────────────────────────────────────────────────
 
 type testStep struct {
-	Label      string
-	OrderID    string
-	BrokerID   string
-	AssetID    string
-	Side       string
-	Price      float64
-	Size       float64
-	IsMaker    bool
-	Latency    time.Duration
-	Success    bool
-	Error      string
+	Label    string
+	OrderID  string
+	BrokerID string
+	AssetID  string
+	Side     string
+	Price    float64
+	Size     float64
+	IsMaker  bool
+	Latency  time.Duration
+	Success  bool
+	Error    string
 }
 
 func printResults(steps []testStep) {
