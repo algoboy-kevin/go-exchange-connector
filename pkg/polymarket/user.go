@@ -311,9 +311,17 @@ func (u *WSPolymarketUserWS) handleTrade(raw json.RawMessage) {
 	price := safeParseFloat(ev.Price)
 	size := safeParseFloat(ev.Size)
 
+	// Extract the first maker order ID, if any.
+	var makerID string
+	if len(ev.MakerOrders) > 0 {
+		makerID = ev.MakerOrders[0].OrderID
+	}
+
 	u.base.DispatchEvent(&connector.OrderFillEvent{
 		TradeID:   ev.ID,
 		BrokerID:  ev.TakerOrderID,
+		MakerID:   makerID,
+		TakerID:   ev.TakerOrderID,
 		AssetID:   ev.AssetID,
 		Side:      ev.Side,
 		Price:     price,

@@ -116,21 +116,36 @@ type OrderWSEvent struct {
 	OrderType    string `json:"order_type,omitempty"`
 }
 
+// TradeMakerOrder contains details of a maker order within a trade.
+type TradeMakerOrder struct {
+	OrderID       string `json:"order_id"`
+	Owner         string `json:"owner"`
+	MakerAddress  string `json:"maker_address,omitempty"`
+	MatchedAmount string `json:"matched_amount"`
+	Price         string `json:"price"`
+	FeeRateBps    string `json:"fee_rate_bps,omitempty"`
+	AssetID       string `json:"asset_id"`
+	Outcome       string `json:"outcome,omitempty"`
+	Side          string `json:"side,omitempty"`
+}
+
 // TradeWSEvent is a trade match or status change event.
 type TradeWSEvent struct {
-	EventType       string `json:"event_type"` // "trade"
-	Type            string `json:"type"`       // "TRADE"
-	ID              string `json:"id"`
-	TakerOrderID    string `json:"taker_order_id"`
-	Market          string `json:"market"`
-	AssetID         string `json:"asset_id"`
-	Side            string `json:"side"` // "BUY" or "SELL"
-	Size            string `json:"size"`
-	Price           string `json:"price"`
-	Status          string `json:"status"` // "MATCHED", "MINED", "CONFIRMED", etc.
-	Owner           string `json:"owner"`
-	Timestamp       string `json:"timestamp"`
-	TransactionHash string `json:"transaction_hash,omitempty"`
+	EventType       string            `json:"event_type"` // "trade"
+	Type            string            `json:"type"`       // "TRADE"
+	ID              string            `json:"id"`
+	TakerOrderID    string            `json:"taker_order_id"`
+	Market          string            `json:"market"`
+	AssetID         string            `json:"asset_id"`
+	Side            string            `json:"side"` // "BUY" or "SELL"
+	Size            string            `json:"size"`
+	Price           string            `json:"price"`
+	Status          string            `json:"status"` // "MATCHED", "MINED", "CONFIRMED", etc.
+	Owner           string            `json:"owner"`
+	Timestamp       string            `json:"timestamp"`
+	TransactionHash string            `json:"transaction_hash,omitempty"`
+	MakerOrders     []TradeMakerOrder `json:"maker_orders,omitempty"`
+	TraderSide      string            `json:"trader_side,omitempty"` // "TAKER" or "MAKER"
 }
 
 // ─────────────────────────────────────────────────────────────
