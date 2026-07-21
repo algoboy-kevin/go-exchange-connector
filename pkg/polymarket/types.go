@@ -162,6 +162,7 @@ type GammaMarket struct {
 	YesTokenID  string
 	NoTokenID   string
 	TickSize    float64
+	NegRisk     bool    // true if the market uses neg-risk collateral adapter
 	Resolution  *string // "YES", "NO", or nil if unresolved
 }
 
@@ -176,6 +177,7 @@ type RawGammaMarket struct {
 	ClobTokenIDs  string  `json:"clobTokenIds"`  // JSON string: ["<yesId>", "<noId>"]
 	Closed        bool    `json:"closed"`
 	TickSize      float64 `json:"orderPriceMinTickSize"`
+	NegRisk       *bool   `json:"negRisk"` // nullable — some markets omit it
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -202,4 +204,13 @@ type Config struct {
 	ClobSignerAddress string `yaml:"clob_signer_address"`
 	ClobSignatureType int    `yaml:"clob_signature_type,omitempty"`  // 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE, 3=POLY_1271
 	ClobSigningKeyHex string `yaml:"clob_signing_key_hex,omitempty"` // hex-encoded ECDSA private key for EIP-712 signing
+
+	// CTF (Conditional Token Framework) settings for on-chain operations.
+	CTFRPCURL  string `yaml:"ctf_rpc_url,omitempty"`  // Polygon RPC URL (e.g. Alchemy, Infura)
+	CTFChainID int64  `yaml:"ctf_chain_id,omitempty"` // 137 = Polygon mainnet, 80002 = Amoy testnet
+
+	// Relayer settings for gasless on-chain transactions.
+	RelayerAPIKey     string `yaml:"relayer_api_key,omitempty"`         // Relayer API key from polymarket.com/settings
+	RelayerAPIKeyAddr string `yaml:"relayer_api_key_address,omitempty"` // Address that owns the relayer key
+	RelayerURL        string `yaml:"relayer_url,omitempty"`             // Relayer URL (default: https://relayer-v2.polymarket.com)
 }

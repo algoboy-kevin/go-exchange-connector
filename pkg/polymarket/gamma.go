@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/algoboy-kevin/go-exchange-connector"
+	connector "github.com/algoboy-kevin/go-exchange-connector"
 )
 
 const defaultGammaAPIURL = "https://gamma-api.polymarket.com"
@@ -128,6 +128,12 @@ func normalizeGammaMarket(raw *RawGammaMarket) *GammaMarket {
 		resolution = &res
 	}
 
+	// NegRisk defaults to false if the API omits it.
+	negRisk := false
+	if raw.NegRisk != nil {
+		negRisk = *raw.NegRisk
+	}
+
 	return &GammaMarket{
 		ID:          raw.ID,
 		ConditionID: raw.ConditionID,
@@ -137,6 +143,7 @@ func normalizeGammaMarket(raw *RawGammaMarket) *GammaMarket {
 		YesTokenID:  yesID,
 		NoTokenID:   noID,
 		TickSize:    raw.TickSize,
+		NegRisk:     negRisk,
 		Resolution:  resolution,
 	}
 }

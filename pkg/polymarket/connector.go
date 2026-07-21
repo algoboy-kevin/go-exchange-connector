@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"strings"
 	"time"
 
 	connector "github.com/algoboy-kevin/go-exchange-connector"
 	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -229,6 +231,210 @@ func (p *PolymarketConnector) GetResolution(marketID string) (*connector.Resolut
 	}
 	res := connector.Resolution(*gm.Resolution)
 	return &res, nil
+}
+
+// ─────────────────────────────────────────────────────────────
+// CTF (Conditional Token Framework) operations
+// ─────────────────────────────────────────────────────────────
+
+// SplitPosition splits USDC into YES/NO outcome tokens for a market.
+//
+//	slug       — Market slug (e.g. "will-eth-reach-10k-by-2025")
+//	amountUsdc — Amount of USDC to split (e.g. 10 = $10)
+//	useRelayer — true for gasless relayer, false for direct on-chain
+//
+// The private key is read from Config.ClobSigningKeyHex.
+// Direct on-chain requires p.cfg.CTFRPCURL to be set.
+// Relayer mode requires p.cfg.RelayerAPIKey and p.cfg.RelayerAPIKeyAddr.
+func (p *PolymarketConnector) SplitPosition(ctx context.Context, slug string, amountUsdc float64, useRelayer bool) (*SplitPositionResponse, error) {
+	privateKey, err := p.ctfPrivateKey()
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: split: %w", err)
+	}
+
+	market, err := p.gamma.FetchMarketBySlug(slug)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: split: fetch market: %w", err)
+	}
+
+	conditionID := common.HexToHash(market.ConditionID)
+	if conditionID == (common.Hash{}) {
+		return nil, fmt.Errorf("polymarket: split: invalid condition ID: %s", market.ConditionID)
+	}
+
+	collateral := CollateralAddress(p.cfg.CTFChainID)
+	amount := new(big.Int).SetInt64(int64(amountUsdc * 1_000_000))
+	partition := StandardPartition()
+	parentID := common.Hash{}
+
+	req := &SplitPositionRequest{
+		CollateralToken:    collateral,
+		ParentCollectionID: parentID,
+		ConditionID:        conditionID,
+		Partition:          partition,
+		Amount:             amount,
+	}
+
+	if useRelayer {
+		if p.cfg.RelayerAPIKey == "" || p.cfg.RelayerAPIKeyAddr == "" {
+			return nil, fmt.Errorf("polymarket: split: relayer credentials not configured (set RelayerAPIKey and RelayerAPIKeyAddr)")
+		}
+		relayer := NewRelayerClient(p.cfg.RelayerAPIKey, p.cfg.RelayerAPIKeyAddr)
+		return relayer.SplitPositionViaRelayer(ctx, req, privateKey, market.NegRisk)
+	}
+
+	if p.cfg.CTFRPCURL == "" {
+		return nil, fmt.Errorf("polymarket: split: RPC URL not configured (set CTFRPCURL)")
+	}
+	chainID := p.cfg.CTFChainID
+	if chainID == 0 {
+		chainID = PolygonCTFChainID
+	}
+	ctfClient, err := NewCTFClient(p.cfg.CTFRPCURL, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: split: create CTF client: %w", err)
+	}
+	defer ctfClient.Close()
+	return ctfClient.SplitPosition(ctx, req, privateKey)
+}
+
+// MergePositions merges YES/NO outcome tokens back into USDC for a market.
+//
+//	slug       — Market slug (e.g. "will-eth-reach-10k-by-2025")
+//	amountUsdc — Amount of each outcome token to merge (e.g. 5 = $5 of YES + $5 of NO)
+//	useRelayer — true for gasless relayer, false for direct on-chain
+//
+// The private key is read from Config.ClobSigningKeyHex.
+// Direct on-chain requires p.cfg.CTFRPCURL to be set.
+// Relayer mode requires p.cfg.RelayerAPIKey and p.cfg.RelayerAPIKeyAddr.
+func (p *PolymarketConnector) MergePositions(ctx context.Context, slug string, amountUsdc float64, useRelayer bool) (*MergePositionsResponse, error) {
+	privateKey, err := p.ctfPrivateKey()
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: merge: %w", err)
+	}
+
+	market, err := p.gamma.FetchMarketBySlug(slug)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: merge: fetch market: %w", err)
+	}
+
+	conditionID := common.HexToHash(market.ConditionID)
+	if conditionID == (common.Hash{}) {
+		return nil, fmt.Errorf("polymarket: merge: invalid condition ID: %s", market.ConditionID)
+	}
+
+	collateral := CollateralAddress(p.cfg.CTFChainID)
+	amount := new(big.Int).SetInt64(int64(amountUsdc * 1_000_000))
+	partition := StandardPartition()
+	parentID := common.Hash{}
+
+	req := &MergePositionsRequest{
+		CollateralToken:    collateral,
+		ParentCollectionID: parentID,
+		ConditionID:        conditionID,
+		Partition:          partition,
+		Amount:             amount,
+	}
+
+	if useRelayer {
+		if p.cfg.RelayerAPIKey == "" || p.cfg.RelayerAPIKeyAddr == "" {
+			return nil, fmt.Errorf("polymarket: merge: relayer credentials not configured (set RelayerAPIKey and RelayerAPIKeyAddr)")
+		}
+		relayer := NewRelayerClient(p.cfg.RelayerAPIKey, p.cfg.RelayerAPIKeyAddr)
+		return relayer.MergePositionsViaRelayer(ctx, req, privateKey, market.NegRisk)
+	}
+
+	if p.cfg.CTFRPCURL == "" {
+		return nil, fmt.Errorf("polymarket: merge: RPC URL not configured (set CTFRPCURL)")
+	}
+	chainID := p.cfg.CTFChainID
+	if chainID == 0 {
+		chainID = PolygonCTFChainID
+	}
+	ctfClient, err := NewCTFClient(p.cfg.CTFRPCURL, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: merge: create CTF client: %w", err)
+	}
+	defer ctfClient.Close()
+	return ctfClient.MergePositions(ctx, req, privateKey)
+}
+
+// RedeemPositions redeems winning outcome tokens for a resolved market.
+//
+// Always redeems both YES and NO tokens (partition=[1,2]).
+// Unlike split/merge, there is no amount — the full balance of each position
+// token is redeemed.
+//
+//	slug       — Market slug (e.g. "will-eth-reach-10k-by-2025")
+//	useRelayer — true for gasless relayer, false for direct on-chain
+//
+// The private key is read from Config.ClobSigningKeyHex.
+// Direct on-chain requires p.cfg.CTFRPCURL to be set.
+// Relayer mode requires p.cfg.RelayerAPIKey and p.cfg.RelayerAPIKeyAddr.
+func (p *PolymarketConnector) RedeemPositions(ctx context.Context, slug string, useRelayer bool) (*RedeemPositionsResponse, error) {
+	privateKey, err := p.ctfPrivateKey()
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: redeem: %w", err)
+	}
+
+	market, err := p.gamma.FetchMarketBySlug(slug)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: redeem: fetch market: %w", err)
+	}
+
+	conditionID := common.HexToHash(market.ConditionID)
+	if conditionID == (common.Hash{}) {
+		return nil, fmt.Errorf("polymarket: redeem: invalid condition ID: %s", market.ConditionID)
+	}
+
+	collateral := CollateralAddress(p.cfg.CTFChainID)
+	parentID := common.Hash{}
+
+	req := &RedeemPositionsRequest{
+		CollateralToken:    collateral,
+		ParentCollectionID: parentID,
+		ConditionID:        conditionID,
+		Partition:          StandardPartition(), // always redeem both YES and NO
+	}
+
+	if useRelayer {
+		if p.cfg.RelayerAPIKey == "" || p.cfg.RelayerAPIKeyAddr == "" {
+			return nil, fmt.Errorf("polymarket: redeem: relayer credentials not configured (set RelayerAPIKey and RelayerAPIKeyAddr)")
+		}
+		relayer := NewRelayerClient(p.cfg.RelayerAPIKey, p.cfg.RelayerAPIKeyAddr)
+		return relayer.RedeemPositionsViaRelayer(ctx, req, privateKey, market.NegRisk)
+	}
+
+	if p.cfg.CTFRPCURL == "" {
+		return nil, fmt.Errorf("polymarket: redeem: RPC URL not configured (set CTFRPCURL)")
+	}
+	chainID := p.cfg.CTFChainID
+	if chainID == 0 {
+		chainID = PolygonCTFChainID
+	}
+	ctfClient, err := NewCTFClient(p.cfg.CTFRPCURL, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: redeem: create CTF client: %w", err)
+	}
+	defer ctfClient.Close()
+	return ctfClient.RedeemPositions(ctx, req, privateKey)
+}
+
+// ctfPrivateKey parses the CTF private key from ClobSigningKeyHex in Config.
+func (p *PolymarketConnector) ctfPrivateKey() (*ecdsa.PrivateKey, error) {
+	if p.cfg.ClobSigningKeyHex == "" {
+		return nil, fmt.Errorf("ClobSigningKeyHex not set in Config")
+	}
+	hexStr := strings.TrimPrefix(p.cfg.ClobSigningKeyHex, "0x")
+	keyBytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ClobSigningKeyHex: %w", err)
+	}
+	key, err := crypto.ToECDSA(keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ClobSigningKeyHex: %w", err)
+	}
+	return key, nil
 }
 
 // ─────────────────────────────────────────────────────────────

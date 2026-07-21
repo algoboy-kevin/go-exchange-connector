@@ -406,12 +406,3 @@ func (b *BaseWebSocket) safeCallOnError(err error) {
 		}
 	}()
 }
-
-func (b *BaseWebSocket) safeCall(fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("websocket: handler panic", "error", r)
-		}
-	}()
-	fn()
-}
