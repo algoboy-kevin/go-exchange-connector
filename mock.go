@@ -78,19 +78,19 @@ func (m *MockConnector) SetDispatcher(d func(any)) {
 	// No-op — mock doesn't route events.
 }
 
-func (m *MockConnector) SplitPosition(ctx context.Context, marketID string, amountUsdc float64) (*CTFResponse, error) {
+func (m *MockConnector) SplitPosition(ctx context.Context, marketID string, amountUsdc float64) error {
 	slog.Debug("mock: split", "market_id", marketID, "amount", amountUsdc)
-	return &CTFResponse{AmountUSD: amountUsdc}, nil
+	return nil
 }
 
-func (m *MockConnector) MergePositions(ctx context.Context, marketID string, amountUsdc float64) (*CTFResponse, error) {
+func (m *MockConnector) MergePositions(ctx context.Context, marketID string, amountUsdc float64) error {
 	slog.Debug("mock: merge", "market_id", marketID, "amount", amountUsdc)
-	return &CTFResponse{AmountUSD: amountUsdc}, nil
+	return nil
 }
 
-func (m *MockConnector) RedeemPositions(ctx context.Context, marketID string) (*CTFResponse, error) {
+func (m *MockConnector) RedeemPositions(ctx context.Context, marketID string) error {
 	slog.Debug("mock: redeem", "market_id", marketID)
-	return &CTFResponse{}, nil
+	return nil
 }
 
 func (m *MockConnector) Start(ctx context.Context) error {

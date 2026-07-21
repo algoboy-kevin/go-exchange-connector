@@ -137,24 +137,27 @@ type OrderCancelEvent struct {
 
 // OrderMergeEvent is sent when YES+NO tokens are merged into USDC.
 type OrderMergeEvent struct {
-	Success  bool    `json:"success"`
-	MarketID string  `json:"market_id"`
-	Amount   float64 `json:"amount"`
+	Success         bool    `json:"success"`
+	MarketID        string  `json:"market_id"`
+	Amount          float64 `json:"amount"`
+	TransactionHash string  `json:"transaction_hash,omitempty"`
 }
 
 // OrderSplitEvent is sent when USDC is split into YES+NO tokens.
 type OrderSplitEvent struct {
-	Success  bool    `json:"success"`
-	MarketID string  `json:"market_id"`
-	Amount   float64 `json:"amount"`
+	Success         bool    `json:"success"`
+	MarketID        string  `json:"market_id"`
+	Amount          float64 `json:"amount"`
+	TransactionHash string  `json:"transaction_hash,omitempty"`
 }
 
 // OrderRedeemEvent is sent when a resolved position is redeemed.
 type OrderRedeemEvent struct {
-	Success      bool      `json:"success"`
-	AssetID      string    `json:"asset_id"`
-	IsWin        bool      `json:"is_win"`
-	Amount       float64   `json:"amount"`
-	CashReceived float64   `json:"cash_received"`
-	Timestamp    time.Time `json:"timestamp"`
+	Success         bool      `json:"success"`
+	AssetID         string    `json:"asset_id"`
+	IsWin           bool      `json:"is_win"`
+	Amount          float64   `json:"amount"`
+	CashReceived    float64   `json:"cash_received"`
+	TransactionHash string    `json:"transaction_hash,omitempty"`
+	Timestamp       time.Time `json:"timestamp"`
 }

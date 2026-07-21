@@ -242,28 +242,33 @@ func (p *PolymarketConnector) GetResolution(marketID string) (*connector.Resolut
 //	marketID   — Market ID from the Gamma API
 //	amountUsdc — Amount of USDC to split (e.g. 10 = $10)
 //
+// SplitPosition splits USDC into YES/NO outcome tokens for a market.
+//
+// Returns immediately. Dispatches OrderSplitEvent when the on-chain
+// transaction is confirmed (or immediately in paper mode).
+//
 // The private key is read from Config.ClobSigningKeyHex.
 // Uses gasless relayer when RelayerAPIKey + RelayerAPIKeyAddr are configured,
 // otherwise uses direct on-chain (requires CTFRPCURL).
-func (p *PolymarketConnector) SplitPosition(ctx context.Context, marketID string, amountUsdc float64) (*connector.CTFResponse, error) {
+func (p *PolymarketConnector) SplitPosition(ctx context.Context, marketID string, amountUsdc float64) error {
 	if p.Connector.IsPaperMode() {
 		slog.Info("paper: SplitPosition", "market_id", marketID, "amount", amountUsdc)
-		return &connector.CTFResponse{AmountUSD: amountUsdc}, nil
+		return nil
 	}
 
 	privateKey, err := p.ctfPrivateKey()
 	if err != nil {
-		return nil, fmt.Errorf("polymarket: split: %w", err)
+		return fmt.Errorf("polymarket: split: %w", err)
 	}
 
 	market, err := p.gamma.FetchMarketByID(marketID)
 	if err != nil {
-		return nil, fmt.Errorf("polymarket: split: fetch market: %w", err)
+		return fmt.Errorf("polymarket: split: fetch market: %w", err)
 	}
 
 	conditionID := common.HexToHash(market.ConditionID)
 	if conditionID == (common.Hash{}) {
-		return nil, fmt.Errorf("polymarket: split: invalid condition ID: %s", market.ConditionID)
+		return fmt.Errorf("polymarket: split: invalid condition ID: %s", market.ConditionID)
 	}
 
 	collateral := CollateralAddress(p.cfg.CTFChainID)
@@ -281,65 +286,81 @@ func (p *PolymarketConnector) SplitPosition(ctx context.Context, marketID string
 
 	if p.cfg.RelayerAPIKey != "" && p.cfg.RelayerAPIKeyAddr != "" {
 		relayer := NewRelayerClient(p.cfg.RelayerAPIKey, p.cfg.RelayerAPIKeyAddr)
-		resp, err := relayer.SplitPositionViaRelayer(ctx, req, privateKey, market.NegRisk)
-		if err != nil {
-			return nil, err
-		}
-		return &connector.CTFResponse{
-			TransactionHash: resp.TransactionHash.Hex(),
-			AmountUSD:       resp.AmountUSD,
-		}, nil
+		go func() {
+			resp, err := relayer.SplitPositionViaRelayer(ctx, req, privateKey, market.NegRisk)
+			if err != nil {
+				slog.Error("polymarket: split via relayer failed", "market_id", marketID, "err", err)
+				p.DispatchEvent(&connector.OrderSplitEvent{Success: false, MarketID: marketID, Amount: amountUsdc})
+				return
+			}
+			p.DispatchEvent(&connector.OrderSplitEvent{
+				Success:         true,
+				MarketID:        marketID,
+				Amount:          resp.AmountUSD,
+				TransactionHash: resp.TransactionHash.Hex(),
+			})
+		}()
+		return nil
 	}
 
 	if p.cfg.CTFRPCURL == "" {
-		return nil, fmt.Errorf("polymarket: split: neither relayer nor RPC URL configured — set RelayerAPIKey+RelayerAPIKeyAddr or CTFRPCURL")
+		return fmt.Errorf("polymarket: split: neither relayer nor RPC URL configured — set RelayerAPIKey+RelayerAPIKeyAddr or CTFRPCURL")
 	}
 	chainID := p.cfg.CTFChainID
 	if chainID == 0 {
 		chainID = PolygonCTFChainID
 	}
-	ctfClient, err := NewCTFClient(p.cfg.CTFRPCURL, chainID)
-	if err != nil {
-		return nil, fmt.Errorf("polymarket: split: create CTF client: %w", err)
-	}
-	defer ctfClient.Close()
-	resp, err := ctfClient.SplitPosition(ctx, req, privateKey)
-	if err != nil {
-		return nil, err
-	}
-	return &connector.CTFResponse{
-		TransactionHash: resp.TransactionHash.Hex(),
-		AmountUSD:       resp.AmountUSD,
-	}, nil
+	go func() {
+		ctfClient, err := NewCTFClient(p.cfg.CTFRPCURL, chainID)
+		if err != nil {
+			slog.Error("polymarket: split: create CTF client", "err", err)
+			p.DispatchEvent(&connector.OrderSplitEvent{Success: false, MarketID: marketID, Amount: amountUsdc})
+			return
+		}
+		defer ctfClient.Close()
+		resp, err := ctfClient.SplitPosition(ctx, req, privateKey)
+		if err != nil {
+			slog.Error("polymarket: split failed", "market_id", marketID, "err", err)
+			p.DispatchEvent(&connector.OrderSplitEvent{Success: false, MarketID: marketID, Amount: amountUsdc})
+			return
+		}
+		p.DispatchEvent(&connector.OrderSplitEvent{
+			Success:         true,
+			MarketID:        marketID,
+			Amount:          resp.AmountUSD,
+			TransactionHash: resp.TransactionHash.Hex(),
+		})
+	}()
+	return nil
 }
 
 // MergePositions merges YES/NO outcome tokens back into USDC for a market.
 //
-//	marketID   — Market ID from the Gamma API
-//	amountUsdc — Amount of each outcome token to merge (e.g. 5 = $5 of YES + $5 of NO)
+// Returns immediately. Dispatches OrderMergeEvent when the on-chain
+// transaction is confirmed (or immediately in paper mode).
 //
 // The private key is read from Config.ClobSigningKeyHex.
 // Uses gasless relayer when RelayerAPIKey + RelayerAPIKeyAddr are configured,
 // otherwise uses direct on-chain (requires CTFRPCURL).
-func (p *PolymarketConnector) MergePositions(ctx context.Context, marketID string, amountUsdc float64) (*connector.CTFResponse, error) {
+func (p *PolymarketConnector) MergePositions(ctx context.Context, marketID string, amountUsdc float64) error {
 	if p.Connector.IsPaperMode() {
 		slog.Info("paper: MergePositions", "market_id", marketID, "amount", amountUsdc)
-		return &connector.CTFResponse{AmountUSD: amountUsdc}, nil
+		return nil
 	}
 
 	privateKey, err := p.ctfPrivateKey()
 	if err != nil {
-		return nil, fmt.Errorf("polymarket: merge: %w", err)
+		return fmt.Errorf("polymarket: merge: %w", err)
 	}
 
 	market, err := p.gamma.FetchMarketByID(marketID)
 	if err != nil {
-		return nil, fmt.Errorf("polymarket: merge: fetch market: %w", err)
+		return fmt.Errorf("polymarket: merge: fetch market: %w", err)
 	}
 
 	conditionID := common.HexToHash(market.ConditionID)
 	if conditionID == (common.Hash{}) {
-		return nil, fmt.Errorf("polymarket: merge: invalid condition ID: %s", market.ConditionID)
+		return fmt.Errorf("polymarket: merge: invalid condition ID: %s", market.ConditionID)
 	}
 
 	collateral := CollateralAddress(p.cfg.CTFChainID)
@@ -357,68 +378,84 @@ func (p *PolymarketConnector) MergePositions(ctx context.Context, marketID strin
 
 	if p.cfg.RelayerAPIKey != "" && p.cfg.RelayerAPIKeyAddr != "" {
 		relayer := NewRelayerClient(p.cfg.RelayerAPIKey, p.cfg.RelayerAPIKeyAddr)
-		resp, err := relayer.MergePositionsViaRelayer(ctx, req, privateKey, market.NegRisk)
-		if err != nil {
-			return nil, err
-		}
-		return &connector.CTFResponse{
-			TransactionHash: resp.TransactionHash.Hex(),
-			AmountUSD:       resp.AmountUSD,
-		}, nil
+		go func() {
+			resp, err := relayer.MergePositionsViaRelayer(ctx, req, privateKey, market.NegRisk)
+			if err != nil {
+				slog.Error("polymarket: merge via relayer failed", "market_id", marketID, "err", err)
+				p.DispatchEvent(&connector.OrderMergeEvent{Success: false, MarketID: marketID, Amount: amountUsdc})
+				return
+			}
+			p.DispatchEvent(&connector.OrderMergeEvent{
+				Success:         true,
+				MarketID:        marketID,
+				Amount:          resp.AmountUSD,
+				TransactionHash: resp.TransactionHash.Hex(),
+			})
+		}()
+		return nil
 	}
 
 	if p.cfg.CTFRPCURL == "" {
-		return nil, fmt.Errorf("polymarket: merge: neither relayer nor RPC URL configured — set RelayerAPIKey+RelayerAPIKeyAddr or CTFRPCURL")
+		return fmt.Errorf("polymarket: merge: neither relayer nor RPC URL configured — set RelayerAPIKey+RelayerAPIKeyAddr or CTFRPCURL")
 	}
 	chainID := p.cfg.CTFChainID
 	if chainID == 0 {
 		chainID = PolygonCTFChainID
 	}
-	ctfClient, err := NewCTFClient(p.cfg.CTFRPCURL, chainID)
-	if err != nil {
-		return nil, fmt.Errorf("polymarket: merge: create CTF client: %w", err)
-	}
-	defer ctfClient.Close()
-	resp, err := ctfClient.MergePositions(ctx, req, privateKey)
-	if err != nil {
-		return nil, err
-	}
-	return &connector.CTFResponse{
-		TransactionHash: resp.TransactionHash.Hex(),
-		AmountUSD:       resp.AmountUSD,
-	}, nil
+	go func() {
+		ctfClient, err := NewCTFClient(p.cfg.CTFRPCURL, chainID)
+		if err != nil {
+			slog.Error("polymarket: merge: create CTF client", "err", err)
+			p.DispatchEvent(&connector.OrderMergeEvent{Success: false, MarketID: marketID, Amount: amountUsdc})
+			return
+		}
+		defer ctfClient.Close()
+		resp, err := ctfClient.MergePositions(ctx, req, privateKey)
+		if err != nil {
+			slog.Error("polymarket: merge failed", "market_id", marketID, "err", err)
+			p.DispatchEvent(&connector.OrderMergeEvent{Success: false, MarketID: marketID, Amount: amountUsdc})
+			return
+		}
+		p.DispatchEvent(&connector.OrderMergeEvent{
+			Success:         true,
+			MarketID:        marketID,
+			Amount:          resp.AmountUSD,
+			TransactionHash: resp.TransactionHash.Hex(),
+		})
+	}()
+	return nil
 }
 
 // RedeemPositions redeems winning outcome tokens for a resolved market.
 //
 // Always redeems both YES and NO tokens (partition=[1,2]).
-// Unlike split/merge, there is no amount — the full balance of each position
-// token is redeemed.
+// Returns immediately. Dispatches OrderRedeemEvent when the on-chain
+// transaction is confirmed (or immediately in paper mode).
 //
 //	marketID — Market ID from the Gamma API
 //
 // The private key is read from Config.ClobSigningKeyHex.
 // Uses gasless relayer when RelayerAPIKey + RelayerAPIKeyAddr are configured,
 // otherwise uses direct on-chain (requires CTFRPCURL).
-func (p *PolymarketConnector) RedeemPositions(ctx context.Context, marketID string) (*connector.CTFResponse, error) {
+func (p *PolymarketConnector) RedeemPositions(ctx context.Context, marketID string) error {
 	if p.Connector.IsPaperMode() {
 		slog.Info("paper: RedeemPositions", "market_id", marketID)
-		return &connector.CTFResponse{}, nil
+		return nil
 	}
 
 	privateKey, err := p.ctfPrivateKey()
 	if err != nil {
-		return nil, fmt.Errorf("polymarket: redeem: %w", err)
+		return fmt.Errorf("polymarket: redeem: %w", err)
 	}
 
 	market, err := p.gamma.FetchMarketByID(marketID)
 	if err != nil {
-		return nil, fmt.Errorf("polymarket: redeem: fetch market: %w", err)
+		return fmt.Errorf("polymarket: redeem: fetch market: %w", err)
 	}
 
 	conditionID := common.HexToHash(market.ConditionID)
 	if conditionID == (common.Hash{}) {
-		return nil, fmt.Errorf("polymarket: redeem: invalid condition ID: %s", market.ConditionID)
+		return fmt.Errorf("polymarket: redeem: invalid condition ID: %s", market.ConditionID)
 	}
 
 	collateral := CollateralAddress(p.cfg.CTFChainID)
@@ -428,39 +465,53 @@ func (p *PolymarketConnector) RedeemPositions(ctx context.Context, marketID stri
 		CollateralToken:    collateral,
 		ParentCollectionID: parentID,
 		ConditionID:        conditionID,
-		Partition:          StandardPartition(), // always redeem both YES and NO
+		Partition:          StandardPartition(),
 	}
 
 	if p.cfg.RelayerAPIKey != "" && p.cfg.RelayerAPIKeyAddr != "" {
 		relayer := NewRelayerClient(p.cfg.RelayerAPIKey, p.cfg.RelayerAPIKeyAddr)
-		resp, err := relayer.RedeemPositionsViaRelayer(ctx, req, privateKey, market.NegRisk)
-		if err != nil {
-			return nil, err
-		}
-		return &connector.CTFResponse{
-			TransactionHash: resp.TransactionHash.Hex(),
-		}, nil
+		go func() {
+			resp, err := relayer.RedeemPositionsViaRelayer(ctx, req, privateKey, market.NegRisk)
+			if err != nil {
+				slog.Error("polymarket: redeem via relayer failed", "market_id", marketID, "err", err)
+				p.DispatchEvent(&connector.OrderRedeemEvent{Success: false})
+				return
+			}
+			p.DispatchEvent(&connector.OrderRedeemEvent{
+				Success:         true,
+				TransactionHash: resp.TransactionHash.Hex(),
+			})
+		}()
+		return nil
 	}
 
 	if p.cfg.CTFRPCURL == "" {
-		return nil, fmt.Errorf("polymarket: redeem: neither relayer nor RPC URL configured — set RelayerAPIKey+RelayerAPIKeyAddr or CTFRPCURL")
+		return fmt.Errorf("polymarket: redeem: neither relayer nor RPC URL configured — set RelayerAPIKey+RelayerAPIKeyAddr or CTFRPCURL")
 	}
 	chainID := p.cfg.CTFChainID
 	if chainID == 0 {
 		chainID = PolygonCTFChainID
 	}
-	ctfClient, err := NewCTFClient(p.cfg.CTFRPCURL, chainID)
-	if err != nil {
-		return nil, fmt.Errorf("polymarket: redeem: create CTF client: %w", err)
-	}
-	defer ctfClient.Close()
-	resp, err := ctfClient.RedeemPositions(ctx, req, privateKey)
-	if err != nil {
-		return nil, err
-	}
-	return &connector.CTFResponse{
-		TransactionHash: resp.TransactionHash.Hex(),
-	}, nil
+	go func() {
+		ctfClient, err := NewCTFClient(p.cfg.CTFRPCURL, chainID)
+		if err != nil {
+			slog.Error("polymarket: redeem: create CTF client", "err", err)
+			p.DispatchEvent(&connector.OrderRedeemEvent{Success: false})
+			return
+		}
+		defer ctfClient.Close()
+		resp, err := ctfClient.RedeemPositions(ctx, req, privateKey)
+		if err != nil {
+			slog.Error("polymarket: redeem failed", "market_id", marketID, "err", err)
+			p.DispatchEvent(&connector.OrderRedeemEvent{Success: false})
+			return
+		}
+		p.DispatchEvent(&connector.OrderRedeemEvent{
+			Success:         true,
+			TransactionHash: resp.TransactionHash.Hex(),
+		})
+	}()
+	return nil
 }
 
 // ctfPrivateKey parses the CTF private key from ClobSigningKeyHex in Config.
