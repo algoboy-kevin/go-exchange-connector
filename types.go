@@ -104,5 +104,17 @@ type CancelOrder struct {
 	AssetID string `json:"asset_id,omitempty"`
 }
 
+// ─────────────────────────────────────────────────────────────
+// CTF response types
+// ─────────────────────────────────────────────────────────────
+
+// CTFResponse is the generic response for split/merge/redeem operations.
+type CTFResponse struct {
+	// TransactionHash is the on-chain transaction hash (empty in paper mode).
+	TransactionHash string `json:"transaction_hash"`
+	// AmountUSD is the amount of collateral involved (split/merged/redeemed).
+	AmountUSD float64 `json:"amount_usd"`
+}
+
 // ── Events (PriceChangeEvent, BookSnapshotEvent, TradeEvent, etc.)
 // are in events.go — use those for actor dispatch.

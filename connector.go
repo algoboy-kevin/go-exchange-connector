@@ -57,6 +57,24 @@ type ExchangeConnector interface {
 	// to the appropriate actor/manager.
 	SetDispatcher(d func(any))
 
+	// ── CTF (Conditional Token Framework) ───────────────────
+
+	// SplitPosition splits collateral into outcome tokens (e.g. USDC → YES/NO).
+	// In PAPER mode, simulates with a successful mock response.
+	// In LIVE mode, uses on-chain transaction (direct or gasless relayer).
+	SplitPosition(ctx context.Context, marketID string, amountUsdc float64) (*CTFResponse, error)
+
+	// MergePositions merges outcome tokens back into collateral (e.g. YES/NO → USDC).
+	// In PAPER mode, simulates with a successful mock response.
+	// In LIVE mode, uses on-chain transaction.
+	MergePositions(ctx context.Context, marketID string, amountUsdc float64) (*CTFResponse, error)
+
+	// RedeemPositions redeems winning outcome tokens after market resolution.
+	// Redeems full balance of both YES and NO tokens.
+	// In PAPER mode, simulates with a successful mock response.
+	// In LIVE mode, uses on-chain transaction.
+	RedeemPositions(ctx context.Context, marketID string) (*CTFResponse, error)
+
 	// ── Lifecycle ───────────────────────────────────────────
 
 	// Start initialises the connector (connects WebSockets, etc.).

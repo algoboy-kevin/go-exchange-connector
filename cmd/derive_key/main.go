@@ -79,7 +79,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("\n✅ Success! Add these to your .env:\n")
+	fmt.Println("\n✅ Success! Add these to your .env:")
 	fmt.Printf("POLYMARKET_KEY=\"%s\"\n", creds.APIKey)
 	fmt.Printf("POLYMARKET_SECRET=\"%s\"\n", creds.Secret)
 	fmt.Printf("POLYMARKET_PASSPHRASE=\"%s\"\n", creds.Passphrase)
