@@ -694,18 +694,26 @@ func (e *polymarketLiveExecutor) PlaceMarketOrder(order connector.MarketOrder) (
 
 // CancelOrders cancels multiple orders by their order hashes.
 // Uses DELETE /orders (max 1000 per batch).
-func (e *polymarketLiveExecutor) CancelOrders(orderIDs []string) error {
+// Returns per-order results from the API.
+func (e *polymarketLiveExecutor) CancelOrders(orderIDs []string) (*connector.CancelOrdersResult, error) {
 	if e.clob == nil {
-		return fmt.Errorf("polymarket LIVE: clob client not initialized")
+		return nil, fmt.Errorf("polymarket LIVE: clob client not initialized")
 	}
 
 	if len(orderIDs) == 0 {
-		return nil
+		return &connector.CancelOrdersResult{
+			Canceled:    nil,
+			NotCanceled: make(map[string]string),
+		}, nil
 	}
 
 	// Batch in chunks of 1000.
 	const batchSize = 1000
-	var finalErr error
+
+	result := &connector.CancelOrdersResult{
+		Canceled:    nil,
+		NotCanceled: make(map[string]string),
+	}
 
 	for i := 0; i < len(orderIDs); i += batchSize {
 		end := i + batchSize
@@ -716,18 +724,21 @@ func (e *polymarketLiveExecutor) CancelOrders(orderIDs []string) error {
 
 		resp, err := e.clob.CancelOrders(batch)
 		if err != nil {
-			finalErr = err
+			// Transport failure — mark all remaining as not_canceled
+			for _, id := range batch {
+				result.NotCanceled[id] = err.Error()
+			}
 			slog.Warn("clob: cancel batch failed", "batch_start", i, "err", err)
 			continue
 		}
 
-		// Log any orders that were not cancelled.
+		result.Canceled = append(result.Canceled, resp.Canceled...)
 		for id, reason := range resp.NotCanceled {
-			slog.Warn("clob: order not cancelled", "order_id", id, "reason", reason)
+			result.NotCanceled[id] = reason
 		}
 	}
 
-	return finalErr
+	return result, nil
 }
 
 // buildSendOrder converts a connector.LimitOrder to a CLOB SendOrder.

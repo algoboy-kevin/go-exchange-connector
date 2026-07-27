@@ -573,7 +573,7 @@ func main() {
 	// ── 5. Cancel the order ─────────────────────────────────
 	fmt.Printf("\n🗑️  Cancelling order %s...\n", orderID)
 	tCancel := time.Now()
-	err = conn.CancelOrders([]string{orderID})
+	_, err = conn.CancelOrders([]string{orderID})
 	latCancel := time.Since(tCancel)
 
 	if err != nil {

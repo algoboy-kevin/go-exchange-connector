@@ -104,5 +104,12 @@ type CancelOrder struct {
 	AssetID string `json:"asset_id,omitempty"`
 }
 
+// CancelOrdersResult describes the outcome of a batch cancel request,
+// matching the Polymarket DELETE /orders response format.
+type CancelOrdersResult struct {
+	Canceled    []string          // successfully canceled order IDs
+	NotCanceled map[string]string // orderID → reason (e.g. "Order already matched")
+}
+
 // ── Events (PriceChangeEvent, BookSnapshotEvent, TradeEvent, etc.)
 // are in events.go — use those for actor dispatch.

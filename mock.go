@@ -47,11 +47,16 @@ func (m *MockConnector) PlaceMarketOrder(order MarketOrder) (OrderResult, error)
 	}, nil
 }
 
-func (m *MockConnector) CancelOrders(orderIDs []string) error {
+func (m *MockConnector) CancelOrders(orderIDs []string) (*CancelOrdersResult, error) {
+	result := &CancelOrdersResult{
+		Canceled:    make([]string, len(orderIDs)),
+		NotCanceled: make(map[string]string),
+	}
+	copy(result.Canceled, orderIDs)
 	for _, id := range orderIDs {
 		slog.Debug("mock: cancelled order", "id", id)
 	}
-	return nil
+	return result, nil
 }
 
 func (m *MockConnector) GetMarket(id, slug string) (*Market, error) {
