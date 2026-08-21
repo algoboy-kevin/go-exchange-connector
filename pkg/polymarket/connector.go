@@ -76,6 +76,13 @@ func New(isLive bool, cfg Config, now func() time.Time) *PolymarketConnector {
 		WithSignerAddress(cfg.ClobSignerAddress),
 	)
 
+	// ── Crypto price client (public API, all modes) ────────
+	cryptoURL := cfg.CryptoPriceURL
+	if cryptoURL == "" {
+		cryptoURL = defaultCryptoPriceAPIURL
+	}
+	cryptoPrice := NewCryptoPriceClient(cryptoURL)
+
 	sigType := cfg.ClobSignatureType
 	if sigType == 0 {
 		sigType = 1 // default POLY_PROXY
@@ -105,6 +112,7 @@ func New(isLive bool, cfg Config, now func() time.Time) *PolymarketConnector {
 		Connector: connector.New(isLive, &polymarketLiveExecutor{
 			gamma:      gamma,
 			clob:       clob,
+			crypto:     cryptoPrice,
 			signingKey: signingKey,
 		}),
 		cfg:   cfg,
@@ -231,6 +239,18 @@ func (p *PolymarketConnector) GetResolution(marketID string) (*connector.Resolut
 	}
 	res := connector.Resolution(*gm.Resolution)
 	return &res, nil
+}
+
+// GetCryptoPrice fetches the open/close price for a crypto market window.
+//
+// The request can reference a market (MarketID/Slug) — the window is then
+// derived from the market's Gamma end date — or carry an explicit window
+// (EventStartTime/EndDate). Symbol and Variant are always required.
+func (p *PolymarketConnector) GetCryptoPrice(req connector.CryptoPriceRequest) (*connector.CryptoPrice, error) {
+	if p.Connector.Live != nil {
+		return p.Connector.Live.GetCryptoPrice(req)
+	}
+	return nil, fmt.Errorf("not implemented")
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -583,6 +603,7 @@ func (p *PolymarketConnector) gammaFetch(id, slug string) (*connector.Market, er
 type polymarketLiveExecutor struct {
 	gamma      *GammaClient
 	clob       *ClobClient
+	crypto     *CryptoPriceClient
 	signingKey *ecdsa.PrivateKey
 }
 
@@ -912,4 +933,46 @@ func (e *polymarketLiveExecutor) GetResolution(marketID string) (*connector.Reso
 	}
 	res := connector.Resolution(*gm.Resolution)
 	return &res, nil
+}
+
+// GetCryptoPrice fetches the open/close price for a crypto market window.
+//
+// If the request's EndDate is zero and a MarketID/Slug is set, the window is
+// derived from the market's Gamma end date (via WindowFromMarket). If only
+// EndDate is set, EventStartTime is derived from the variant duration.
+func (e *polymarketLiveExecutor) GetCryptoPrice(req connector.CryptoPriceRequest) (*connector.CryptoPrice, error) {
+	if e.crypto == nil {
+		return nil, fmt.Errorf("polymarket LIVE: crypto price client not initialized")
+	}
+
+	// Resolve the window from the market when it isn't given explicitly.
+	if req.EndDate.IsZero() && (req.MarketID != "" || req.Slug != "") {
+		var gm *GammaMarket
+		var err error
+		if req.MarketID != "" {
+			gm, err = e.gamma.FetchMarketByID(req.MarketID)
+		} else {
+			gm, err = e.gamma.FetchMarketBySlug(req.Slug)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("crypto-price: resolve market: %w", err)
+		}
+		start, end, err := WindowFromMarket(gm, req.Variant)
+		if err != nil {
+			return nil, err
+		}
+		req.EventStartTime = start
+		req.EndDate = end
+	}
+
+	// Fall back to deriving the start from the end when only end is given.
+	if req.EventStartTime.IsZero() && !req.EndDate.IsZero() {
+		dur, err := variantDuration(req.Variant)
+		if err != nil {
+			return nil, err
+		}
+		req.EventStartTime = req.EndDate.Add(-dur)
+	}
+
+	return e.crypto.Fetch(req)
 }

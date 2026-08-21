@@ -67,6 +67,16 @@ func (m *MockConnector) GetResolution(marketID string) (*Resolution, error) {
 	return nil, nil
 }
 
+func (m *MockConnector) GetCryptoPrice(req CryptoPriceRequest) (*CryptoPrice, error) {
+	slog.Debug("mock: crypto price", "symbol", req.Symbol, "variant", req.Variant)
+	return &CryptoPrice{
+		OpenPrice:  0,
+		Timestamp:  0,
+		Completed:  false,
+		Incomplete: true,
+	}, nil
+}
+
 func (m *MockConnector) Subscribe(assetIDs []string) {
 	slog.Debug("mock: subscribed", "assets", assetIDs)
 }

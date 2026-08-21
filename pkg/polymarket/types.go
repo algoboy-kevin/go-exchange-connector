@@ -14,6 +14,8 @@
 //	conn.Subscribe([]string{"asset_id_1", "asset_id_2"})
 package polymarket
 
+import "time"
+
 // ─────────────────────────────────────────────────────────────
 // Polymarket WebSocket event types
 // ─────────────────────────────────────────────────────────────
@@ -162,8 +164,10 @@ type GammaMarket struct {
 	YesTokenID  string
 	NoTokenID   string
 	TickSize    float64
-	NegRisk     bool    // true if the market uses neg-risk collateral adapter
-	Resolution  *string // "YES", "NO", or nil if unresolved
+	NegRisk     bool      // true if the market uses neg-risk collateral adapter
+	Resolution  *string   // "YES", "NO", or nil if unresolved
+	StartDate   time.Time // market start (used for crypto window derivation)
+	EndDate     time.Time // market resolution/end time (used for crypto window derivation)
 }
 
 // RawGammaMarket is the raw JSON shape from the Gamma API.
@@ -178,6 +182,8 @@ type RawGammaMarket struct {
 	Closed        bool    `json:"closed"`
 	TickSize      float64 `json:"orderPriceMinTickSize"`
 	NegRisk       *bool   `json:"negRisk"` // nullable — some markets omit it
+	StartDate     string  `json:"startDate"`
+	EndDate       string  `json:"endDate"`
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -190,6 +196,7 @@ type Config struct {
 	Secret              string `yaml:"api_secret"`
 	Passphrase          string `yaml:"api_passphrase"`
 	GammaAPIURL         string `yaml:"gamma_api_url,omitempty"`
+	CryptoPriceURL      string `yaml:"crypto_price_url,omitempty"` // default: https://polymarket.com
 	MarketWSURL         string `yaml:"market_ws_url,omitempty"`
 	UserWSURL           string `yaml:"user_ws_url,omitempty"`
 	ReconnectIntervalMs int64  `yaml:"reconnect_interval_ms,omitempty"`

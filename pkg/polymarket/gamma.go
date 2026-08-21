@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	connector "github.com/algoboy-kevin/go-exchange-connector"
 )
@@ -110,6 +111,9 @@ func normalizeGammaMarket(raw *RawGammaMarket) *GammaMarket {
 		outcomes = []string{"Yes", "No"}
 	}
 
+	startDate := parseGammaTime(raw.StartDate)
+	endDate := parseGammaTime(raw.EndDate)
+
 	var tokenIDs []string
 	if raw.ClobTokenIDs != "" {
 		_ = json.Unmarshal([]byte(raw.ClobTokenIDs), &tokenIDs)
@@ -145,7 +149,24 @@ func normalizeGammaMarket(raw *RawGammaMarket) *GammaMarket {
 		TickSize:    raw.TickSize,
 		NegRisk:     negRisk,
 		Resolution:  resolution,
+		StartDate:   startDate,
+		EndDate:     endDate,
 	}
+}
+
+// parseGammaTime parses a Gamma API timestamp (RFC3339, e.g.
+// "2026-08-21T11:40:00Z" or "2026-04-27T21:55:14.576Z"). Returns the zero
+// time on empty or unparseable input.
+func parseGammaTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		slog.Debug("gamma: unparseable timestamp", "value", s, "err", err)
+		return time.Time{}
+	}
+	return t
 }
 
 func resolveFromOutcomePrices(outcomePrices string) string {

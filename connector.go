@@ -42,6 +42,11 @@ type ExchangeConnector interface {
 	// GetResolution checks if a market has resolved, returning the outcome.
 	GetResolution(marketID string) (*Resolution, error)
 
+	// GetCryptoPrice fetches the open/close price for a crypto market window.
+	// When the request references a market (MarketID/Slug), the window is
+	// derived from the market's Gamma end date.
+	GetCryptoPrice(req CryptoPriceRequest) (*CryptoPrice, error)
+
 	// ── Subscriptions ───────────────────────────────────────
 
 	// Subscribe starts receiving market data for the given asset IDs.
@@ -93,6 +98,7 @@ type LiveExecutor interface {
 	CancelOrders(orderIDs []string) (*CancelOrdersResult, error)
 	GetMarket(id, slug string) (*Market, error)
 	GetResolution(marketID string) (*Resolution, error)
+	GetCryptoPrice(req CryptoPriceRequest) (*CryptoPrice, error)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -310,6 +316,15 @@ func (c *Connector) GetMarket(id, slug string) (*Market, error) {
 func (c *Connector) GetResolution(marketID string) (*Resolution, error) {
 	if c.Live != nil {
 		return c.Live.GetResolution(marketID)
+	}
+	return nil, fmt.Errorf("not implemented")
+}
+
+// GetCryptoPrice fetches crypto open/close price data for a market window.
+// Delegates to LiveExecutor if set.
+func (c *Connector) GetCryptoPrice(req CryptoPriceRequest) (*CryptoPrice, error) {
+	if c.Live != nil {
+		return c.Live.GetCryptoPrice(req)
 	}
 	return nil, fmt.Errorf("not implemented")
 }
