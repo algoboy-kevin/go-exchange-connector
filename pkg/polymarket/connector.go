@@ -1058,7 +1058,7 @@ func (e *polymarketLiveExecutor) GetCryptoPrice(req connector.CryptoPriceRequest
 			gm, err = e.gamma.FetchMarketBySlug(req.Slug)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("crypto-price: resolve market: %w", err)
+			return nil, fmt.Errorf("price-history: resolve market: %w", err)
 		}
 		start, end, err := WindowFromMarket(gm, req.Variant)
 		if err != nil {

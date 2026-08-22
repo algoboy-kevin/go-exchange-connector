@@ -6,7 +6,7 @@ import "time"
 // Crypto price types
 // ─────────────────────────────────────────────────────────────
 
-// CryptoPriceRequest describes a request to Polymarket's crypto-price API
+// CryptoPriceRequest describes a request to Polymarket's price-history API
 // for a crypto market's open/close price over a window.
 //
 // A request can specify the window explicitly (EventStartTime + EndDate), or
@@ -46,7 +46,7 @@ type CryptoPriceRequest struct {
 	TWAPLookbackSeconds int
 }
 
-// CryptoPrice is the response from Polymarket's crypto-price API for a single
+// CryptoPrice is the response from Polymarket's price-history API for a single
 // window.
 type CryptoPrice struct {
 	// OpenPrice is the price at the start of the window.
@@ -58,7 +58,8 @@ type CryptoPrice struct {
 	// window's close price when this is nil.
 	ClosePrice *float64 `json:"closePrice"`
 
-	// Timestamp is the API response timestamp in ms since epoch.
+	// Timestamp is the timestamp of the most recent data point in the window
+	// (ms since epoch).
 	Timestamp int64 `json:"timestamp"`
 
 	// Completed is true once the window has settled.
@@ -67,6 +68,7 @@ type CryptoPrice struct {
 	// Incomplete is true while the window is still forming.
 	Incomplete bool `json:"incomplete"`
 
-	// Cached indicates the result came from the API cache.
+	// Cached indicates the result came from the API cache. The price-history
+	// API does not report this, so it is always false.
 	Cached bool `json:"cached"`
 }

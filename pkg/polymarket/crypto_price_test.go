@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,10 +63,21 @@ func TestWindowFromMarket(t *testing.T) {
 }
 
 func TestCryptoPriceClientFetch(t *testing.T) {
-	const responseBody = `{"openPrice":76578.37804472372,"closePrice":null,"timestamp":1787312179781,"completed":false,"incomplete":true,"cached":true}`
+	// Completed window: the last point's timestamp reaches the window's endDate
+	// (2026-08-21T11:40:00Z = 1787312400000 ms).
+	const responseBody = `[
+		{"timestamp":1787312100000,"value":76578.37804472372},
+		{"timestamp":1787312160000,"value":76581.0},
+		{"timestamp":1787312220000,"value":76583.5},
+		{"timestamp":1787312280000,"value":76585.2},
+		{"timestamp":1787312340000,"value":76588.0},
+		{"timestamp":1787312400000,"value":76590.5}
+	]`
 
+	var gotPath string
 	var gotQuery url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
 		gotQuery = r.URL.Query()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(responseBody))
@@ -88,6 +100,11 @@ func TestCryptoPriceClientFetch(t *testing.T) {
 		t.Fatalf("Fetch: %v", err)
 	}
 
+	// Endpoint hit by the client.
+	if gotPath != "/api/crypto/price-history" {
+		t.Errorf("path = %q, want /api/crypto/price-history", gotPath)
+	}
+
 	// Query params sent to the API.
 	if got := gotQuery.Get("symbol"); got != "BTC" {
 		t.Errorf("symbol = %q, want BTC", got)
@@ -108,18 +125,79 @@ func TestCryptoPriceClientFetch(t *testing.T) {
 		t.Errorf("twapLookbackSeconds = %q, want 60", got)
 	}
 
-	// Parsed response.
+	// Parsed response: open = first point, close = last point (window settled).
+	if price.OpenPrice != 76578.37804472372 {
+		t.Errorf("OpenPrice = %v, want 76578.37804472372", price.OpenPrice)
+	}
+	if price.ClosePrice == nil || *price.ClosePrice != 76590.5 {
+		t.Errorf("ClosePrice = %v, want 76590.5", price.ClosePrice)
+	}
+	if price.Timestamp != 1787312400000 {
+		t.Errorf("Timestamp = %d, want 1787312400000", price.Timestamp)
+	}
+	if !price.Completed || price.Incomplete || price.Cached {
+		t.Errorf("flags = completed:%v incomplete:%v cached:%v, want true/false/false",
+			price.Completed, price.Incomplete, price.Cached)
+	}
+}
+
+func TestCryptoPriceClientFetchEmptyResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	client := NewCryptoPriceClient(srv.URL)
+	req := connector.CryptoPriceRequest{
+		Symbol:         "BTC",
+		Variant:        "fiveminute",
+		EventStartTime: mustTime(t, "2026-08-21T11:35:00Z"),
+		EndDate:        mustTime(t, "2026-08-21T11:40:00Z"),
+	}
+
+	if _, err := client.Fetch(req); err == nil {
+		t.Fatal("expected error for empty response")
+	} else if !strings.Contains(err.Error(), "empty response") {
+		t.Errorf("error = %q, want it to mention empty response", err)
+	}
+}
+
+func TestCryptoPriceClientFetchFormingWindow(t *testing.T) {
+	// Forming window: only the open point is available yet (its timestamp is
+	// before endDate), so ClosePrice must be nil and Incomplete true.
+	const responseBody = `[{"timestamp":1787312100000,"value":76578.37804472372}]`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responseBody))
+	}))
+	defer srv.Close()
+
+	client := NewCryptoPriceClient(srv.URL)
+	req := connector.CryptoPriceRequest{
+		Symbol:         "BTC",
+		Variant:        "fiveminute",
+		EventStartTime: mustTime(t, "2026-08-21T11:35:00Z"),
+		EndDate:        mustTime(t, "2026-08-21T11:40:00Z"),
+	}
+
+	price, err := client.Fetch(req)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
 	if price.OpenPrice != 76578.37804472372 {
 		t.Errorf("OpenPrice = %v, want 76578.37804472372", price.OpenPrice)
 	}
 	if price.ClosePrice != nil {
 		t.Errorf("ClosePrice = %v, want nil", *price.ClosePrice)
 	}
-	if price.Timestamp != 1787312179781 {
-		t.Errorf("Timestamp = %d, want 1787312179781", price.Timestamp)
+	if price.Timestamp != 1787312100000 {
+		t.Errorf("Timestamp = %d, want 1787312100000", price.Timestamp)
 	}
-	if price.Completed || !price.Incomplete || !price.Cached {
-		t.Errorf("flags = completed:%v incomplete:%v cached:%v, want false/true/true",
+	if price.Completed || !price.Incomplete || price.Cached {
+		t.Errorf("flags = completed:%v incomplete:%v cached:%v, want false/true/false",
 			price.Completed, price.Incomplete, price.Cached)
 	}
 }
