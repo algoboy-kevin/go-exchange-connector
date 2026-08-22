@@ -81,18 +81,18 @@ engine := NewTradingEngine(mock)
 
 ### RTDS real-time reference prices (Polymarket)
 
-Stream real-time reference prices via the RTDS WebSocket. Three sources are
-supported, with events dispatched as `connector.CryptoPriceEvent` (Binance &
-Chainlink crypto), `connector.EquityPriceEvent` (Pyth equity/forex/commodities),
-and `connector.PriceSnapshotEvent` (historical ~2-min snapshot on subscribe).
-Symbol matching is case-insensitive.
+Stream real-time reference prices via the RTDS WebSocket. Supported sources
+dispatch as `connector.CryptoPriceEvent` (Binance, Chainlink spot, and Chainlink
+TWAP), `connector.EquityPriceEvent` (Pyth equity/forex/commodities), and
+`connector.PriceSnapshotEvent` (historical ~2-min snapshot on subscribe, spot
+feeds only). Symbol matching is case-insensitive.
 
 ```go
 conn := polymarket.New(false, polymarket.Config{})
 conn.SetDispatcher(func(ev any) {
     switch e := ev.(type) {
     case *connector.CryptoPriceEvent:
-        fmt.Printf("%s(%s) = %s\n", e.Symbol, e.Source, e.Price)
+        fmt.Printf("%s(%s) = %s win=%ds\n", e.Symbol, e.Source, e.Price, e.WindowSeconds)
     case *connector.EquityPriceEvent:
         fmt.Printf("equity %s = %s\n", e.Symbol, e.Price)
     case *connector.PriceSnapshotEvent:
@@ -106,6 +106,9 @@ defer conn.Stop()
 conn.SubscribeCryptoPrices(ctx, []string{"btcusdt", "ethusdt"})
 // Chainlink crypto feeds (e.g. eth/usd, btc/usd).
 conn.SubscribeChainlinkPrices(ctx, []string{"eth/usd", "btc/usd"})
+// Chainlink-computed TWAP prices over a 30s or 60s lookback window
+// (e.g. btc/usd twap-60s). No snapshot — starts with the next update.
+conn.SubscribeChainlinkTWAP(ctx, 60, []string{"btc/usd"})
 // Equity / forex / commodities via Pyth (e.g. AAPL, EURUSD).
 conn.SubscribeEquityPrices(ctx, []string{"AAPL", "TSLA"})
 ```
@@ -115,7 +118,11 @@ Notes:
   do not reliably deliver data), so it's subscribed unfiltered and filtered
   locally.
 - Chainlink `full_accuracy_value` is a raw integer scaled by 10¹⁸ — the
-  numeric `value` is used for Chainlink prices.
+  numeric `value` is used for Chainlink prices. TWAP `value` is an exact
+  decimal string derived from Chainlink's E18 fixed-point price; keep it as a
+  string.
+- Chainlink TWAP sends no snapshot: subscriptions start with the next update
+  and there is no replay after a disconnect.
 - Equity streams may require access/market-hours; updates mark
   `IsCarriedForward` when the market is closed.
 

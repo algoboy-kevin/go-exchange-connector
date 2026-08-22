@@ -269,6 +269,23 @@ func (p *PolymarketConnector) UnsubscribeChainlinkPrices(ctx context.Context, fe
 	}
 }
 
+// SubscribeChainlinkTWAP subscribes to Chainlink-computed TWAP prices for the
+// given feeds (e.g. "btc/usd") over the given lookback window (30 or 60
+// seconds). Updates are dispatched as connector.CryptoPriceEvent with Source
+// "chainlink_twap" and WindowSeconds set. This topic sends no snapshot.
+func (p *PolymarketConnector) SubscribeChainlinkTWAP(ctx context.Context, windowSeconds int, feeds []string) {
+	if p.rtds != nil {
+		p.rtds.SubscribeChainlinkTWAP(ctx, windowSeconds, feeds)
+	}
+}
+
+// UnsubscribeChainlinkTWAP removes feeds from the Chainlink TWAP stream.
+func (p *PolymarketConnector) UnsubscribeChainlinkTWAP(ctx context.Context, windowSeconds int, feeds []string) {
+	if p.rtds != nil {
+		p.rtds.UnsubscribeChainlinkTWAP(ctx, windowSeconds, feeds)
+	}
+}
+
 // SubscribeEquityPrices subscribes to real-time equity/ETF/forex/commodity
 // prices (Pyth) for the given symbols (e.g. "AAPL", "EURUSD"). Updates are
 // dispatched as connector.EquityPriceEvent, and the initial historical

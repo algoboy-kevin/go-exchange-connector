@@ -1,8 +1,8 @@
 // Command test_rtds validates the Polymarket RTDS real-time price streams.
 //
 // It connects to the RTDS WebSocket (wss://ws-live-data.polymarket.com) and
-// subscribes to Binance crypto, Chainlink crypto, and/or equity (Pyth) prices,
-// printing each event dispatched by the connector.
+// subscribes to Binance crypto, Chainlink crypto, Chainlink TWAP, and/or
+// equity (Pyth) prices, printing each event dispatched by the connector.
 //
 // Usage:
 //
@@ -11,6 +11,9 @@
 //
 //	# Add Chainlink feeds and equity symbols:
 //	go run ./cmd/test_rtds/ -symbols btcusdt -chainlink eth/usd,btc/usd -equity AAPL,TSLA -duration 15s
+//
+//	# Chainlink TWAP (btc/usd, 60s window):
+//	go run ./cmd/test_rtds/ -twap btc/usd -twap-window 60 -duration 15s
 package main
 
 import (
@@ -39,6 +42,8 @@ func splitList(s string) []string {
 func main() {
 	symbolsFlag := flag.String("symbols", "btcusdt", "Comma-separated Binance symbols (e.g. btcusdt,ethusdt)")
 	chainlinkFlag := flag.String("chainlink", "", "Comma-separated Chainlink feeds (e.g. eth/usd,btc/usd)")
+	twapFlag := flag.String("twap", "", "Comma-separated Chainlink TWAP feeds (e.g. btc/usd,eth/usd)")
+	twapWindowFlag := flag.Int("twap-window", 60, "Chainlink TWAP lookback window in seconds (30 or 60)")
 	equityFlag := flag.String("equity", "", "Comma-separated equity symbols (e.g. AAPL,TSLA)")
 	durationFlag := flag.Duration("duration", 15*time.Second, "How long to stream")
 	verbose := flag.Bool("verbose", false, "Enable debug logging")
@@ -50,8 +55,9 @@ func main() {
 
 	symbols := splitList(*symbolsFlag)
 	chainlink := splitList(*chainlinkFlag)
+	twap := splitList(*twapFlag)
 	equity := splitList(*equityFlag)
-	if len(symbols) == 0 && len(chainlink) == 0 && len(equity) == 0 {
+	if len(symbols) == 0 && len(chainlink) == 0 && len(twap) == 0 && len(equity) == 0 {
 		fmt.Fprintln(os.Stderr, "❌ at least one symbol/feed required")
 		os.Exit(1)
 	}
@@ -62,7 +68,11 @@ func main() {
 	conn.SetDispatcher(func(ev any) {
 		switch e := ev.(type) {
 		case *connector.CryptoPriceEvent:
-			fmt.Printf("[RTDS] %s(%s) price=%s ts=%s\n", e.Symbol, e.Source, e.Price, e.Timestamp.Format(time.RFC3339Nano))
+			win := ""
+			if e.WindowSeconds > 0 {
+				win = fmt.Sprintf(" win=%ds", e.WindowSeconds)
+			}
+			fmt.Printf("[RTDS] %s(%s) price=%s ts=%s%s\n", e.Symbol, e.Source, e.Price, e.Timestamp.Format(time.RFC3339Nano), win)
 		case *connector.EquityPriceEvent:
 			fwd := ""
 			if e.IsCarriedForward {
@@ -91,10 +101,13 @@ func main() {
 	if len(chainlink) > 0 {
 		conn.SubscribeChainlinkPrices(ctx, chainlink)
 	}
+	if len(twap) > 0 {
+		conn.SubscribeChainlinkTWAP(ctx, *twapWindowFlag, twap)
+	}
 	if len(equity) > 0 {
 		conn.SubscribeEquityPrices(ctx, equity)
 	}
-	fmt.Printf("🟢 subscribed: binance=%v chainlink=%v equity=%v (streaming for %s)\n", symbols, chainlink, equity, *durationFlag)
+	fmt.Printf("🟢 subscribed: binance=%v chainlink=%v twap=%v win=%ds equity=%v (streaming for %s)\n", symbols, chainlink, twap, *twapWindowFlag, equity, *durationFlag)
 
 	// Wait for the dispatcher to deliver events until ctx expires.
 	<-ctx.Done()

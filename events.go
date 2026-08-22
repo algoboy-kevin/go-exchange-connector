@@ -71,14 +71,16 @@ type TickChangeEvent struct {
 
 // CryptoPriceEvent is a real-time crypto asset price update from Polymarket's
 // RTDS stream. Source distinguishes the feed: "binance" (symbols like
-// "btcusdt") or "chainlink" (symbols like "eth/usd").
+// "btcusdt"), "chainlink" (symbols like "eth/usd"), or "chainlink_twap"
+// (Chainlink-computed TWAP prices).
 type CryptoPriceEvent struct {
-	SeqID      int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
-	ReceivedAt time.Time `json:"received_at"` // local arrival timestamp
-	Symbol     string    `json:"symbol"`      // e.g. "btcusdt" or "eth/usd"
-	Price      string    `json:"price"`       // decimal string (RTDS "value")
-	Timestamp  time.Time `json:"timestamp"`   // exchange timestamp
-	Source     string    `json:"source"`      // "binance" or "chainlink"
+	SeqID         int64     `json:"seq_id"`                   // monotonic sequence for ordered DES replay
+	ReceivedAt    time.Time `json:"received_at"`              // local arrival timestamp
+	Symbol        string    `json:"symbol"`                   // e.g. "btcusdt" or "eth/usd"
+	Price         string    `json:"price"`                    // decimal string (RTDS "value")
+	Timestamp     time.Time `json:"timestamp"`                // exchange timestamp
+	Source        string    `json:"source"`                   // "binance", "chainlink", or "chainlink_twap"
+	WindowSeconds int       `json:"window_seconds,omitempty"` // TWAP lookback window (chainlink_twap only)
 }
 
 // EquityPriceEvent is a real-time equity/ETF/forex/commodity reference price

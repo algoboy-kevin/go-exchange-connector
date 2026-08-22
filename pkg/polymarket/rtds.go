@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,15 @@ const (
 	rtdsCryptoPriceTopic    = "crypto_prices"           // Binance crypto feed
 	rtdsChainlinkPriceTopic = "crypto_prices_chainlink" // Chainlink crypto feed
 	rtdsEquityPriceTopic    = "equity_prices"           // Pyth equity/forex/commodity feed
+
+	// Chainlink TWAP: the SDK-level topic is prices.crypto.chainlink.twap, but
+	// the wire uses one distinct topic per window. State is keyed on the
+	// SDK-level topic + window (see subsKey); incoming events carry the wire
+	// topic. Subscribing is broadcast within a window — symbols are filtered
+	// locally.
+	rtdsChainlinkTWAPTopic   = "prices.crypto.chainlink.twap"
+	rtdsChainlinkTWAP30Topic = "crypto_prices_twap_thirty"
+	rtdsChainlinkTWAP60Topic = "crypto_prices_twap_sixty"
 
 	rtdsActionSubscribe   = "subscribe"
 	rtdsActionUnsubscribe = "unsubscribe"
@@ -56,12 +66,35 @@ type WSPolymarketRTDS struct {
 }
 
 // rtdsTopicState holds the locally-subscribed symbols for one RTDS topic.
+// windowSeconds is non-zero only for the Chainlink TWAP topic, where the state
+// is keyed per window (see subsKey) so 30s and 60s subscriptions coexist.
 type rtdsTopicState struct {
-	symbols map[string]struct{}
+	windowSeconds int
+	symbols       map[string]struct{}
 }
 
-func newRtdsTopicState() *rtdsTopicState {
-	return &rtdsTopicState{symbols: make(map[string]struct{})}
+func newRtdsTopicState(windowSeconds int) *rtdsTopicState {
+	return &rtdsTopicState{windowSeconds: windowSeconds, symbols: make(map[string]struct{})}
+}
+
+// subsKey returns the subscription-state key for a topic. The Chainlink TWAP
+// topic is disambiguated by window (e.g. "prices.crypto.chainlink.twap|60");
+// all other topics use the bare topic name.
+func subsKey(topic string, windowSeconds int) string {
+	if windowSeconds > 0 {
+		return fmt.Sprintf("%s|%d", topic, windowSeconds)
+	}
+	return topic
+}
+
+// splitSubsKey is the inverse of subsKey.
+func splitSubsKey(key string) (topic string, windowSeconds int) {
+	if i := strings.LastIndex(key, "|"); i >= 0 {
+		topic = key[:i]
+		windowSeconds, _ = strconv.Atoi(key[i+1:])
+		return topic, windowSeconds
+	}
+	return key, 0
 }
 
 // NewWSPolymarketRTDS creates a new RTDS WebSocket manager.
@@ -177,6 +210,33 @@ func (r *WSPolymarketRTDS) UnsubscribeChainlinkPrices(ctx context.Context, feeds
 	r.sendEntries(ctx, rtdsActionUnsubscribe, chainlinkEntries(removed))
 }
 
+// SubscribeChainlinkTWAP subscribes to Chainlink-computed TWAP prices for the
+// given feeds (e.g. "btc/usd", "eth/usd") over the given lookback window (30
+// or 60 seconds). Matching is case-insensitive.
+//
+// Note: this topic sends NO snapshot — subscriptions start with the next
+// published update, so there is no replay after a disconnect.
+func (r *WSPolymarketRTDS) SubscribeChainlinkTWAP(ctx context.Context, windowSeconds int, symbols []string) {
+	first, added := r.addSymbolsWindowed(subsKey(rtdsChainlinkTWAPTopic, windowSeconds), windowSeconds, symbols)
+	if len(added) == 0 || !first {
+		return
+	}
+	// The wire topic encodes the window and delivers every symbol — the
+	// server-side subscription is per window, not per symbol.
+	r.sendEntries(ctx, rtdsActionSubscribe, chainlinkTWAPEntries(windowSeconds))
+}
+
+// UnsubscribeChainlinkTWAP removes the given feeds from the Chainlink TWAP
+// stream. The server-side (broadcast) subscription is cancelled once the last
+// symbol for that window is removed.
+func (r *WSPolymarketRTDS) UnsubscribeChainlinkTWAP(ctx context.Context, windowSeconds int, symbols []string) {
+	last, removed := r.removeSymbols(subsKey(rtdsChainlinkTWAPTopic, windowSeconds), symbols)
+	if len(removed) == 0 || !last {
+		return
+	}
+	r.sendEntries(ctx, rtdsActionUnsubscribe, chainlinkTWAPEntries(windowSeconds))
+}
+
 // SubscribeEquityPrices subscribes to real-time equity/ETF/forex/commodity
 // prices (Pyth) for the given symbols (e.g. "AAPL", "TSLA", "EURUSD").
 // Matching is case-insensitive.
@@ -205,15 +265,26 @@ func normalizeRTDSSymbol(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
-// addSymbols adds symbols to a topic's local filter. Returns whether this was
-// the first symbol (0 → >0 transition) and which symbols were newly added.
+// addSymbols adds symbols to a topic's local filter (window 0). Returns
+// whether this was the first symbol (0 → >0 transition) and which symbols were
+// newly added.
 func (r *WSPolymarketRTDS) addSymbols(topic string, symbols []string) (first bool, added []string) {
+	return r.addSymbolsWindowed(topic, 0, symbols)
+}
+
+// addSymbolsWindowed adds symbols to a topic's local filter, recording the TWAP
+// window (0 for non-TWAP topics). key is the composite subscription key (see
+// subsKey). Returns whether this was the first symbol (0 → >0 transition) and
+// which symbols were newly added.
+func (r *WSPolymarketRTDS) addSymbolsWindowed(key string, windowSeconds int, symbols []string) (first bool, added []string) {
 	r.subsMu.Lock()
 	defer r.subsMu.Unlock()
-	st := r.subs[topic]
+	st := r.subs[key]
 	if st == nil {
-		st = newRtdsTopicState()
-		r.subs[topic] = st
+		st = newRtdsTopicState(windowSeconds)
+		r.subs[key] = st
+	} else {
+		st.windowSeconds = windowSeconds
 	}
 	wasEmpty := len(st.symbols) == 0
 	for _, s := range symbols {
@@ -308,6 +379,41 @@ func chainlinkEntries(feeds []string) []rtdsSubscription {
 	return filteredEntries(rtdsChainlinkPriceTopic, feeds)
 }
 
+// chainlinkTWAPEntries returns a single broadcast subscription entry for the
+// given TWAP window. The wire topic encodes the window (30s or 60s); the server
+// delivers every symbol on that window, so symbols are narrowed locally.
+func chainlinkTWAPEntries(windowSeconds int) []rtdsSubscription {
+	wire := twapWireTopic(windowSeconds)
+	if wire == "" {
+		return nil
+	}
+	return []rtdsSubscription{{Topic: wire, MsgType: "update"}}
+}
+
+// twapWireTopic maps a TWAP window to its wire topic (empty for unsupported
+// windows).
+func twapWireTopic(windowSeconds int) string {
+	switch windowSeconds {
+	case 30:
+		return rtdsChainlinkTWAP30Topic
+	case 60:
+		return rtdsChainlinkTWAP60Topic
+	}
+	return ""
+}
+
+// twapWindow returns the TWAP window encoded in a wire topic (0 if not a TWAP
+// wire topic).
+func twapWindow(topic string) int {
+	switch topic {
+	case rtdsChainlinkTWAP30Topic:
+		return 30
+	case rtdsChainlinkTWAP60Topic:
+		return 60
+	}
+	return 0
+}
+
 // equityEntries returns one subscription entry per symbol, each filtered by a
 // JSON string {"symbol":"<symbol>"}.
 func equityEntries(symbols []string) []rtdsSubscription {
@@ -367,16 +473,30 @@ func (r *WSPolymarketRTDS) allEntries() []rtdsSubscription {
 	r.subsMu.RLock()
 	defer r.subsMu.RUnlock()
 
-	var entries []rtdsSubscription
+	keys := make([]string, 0, len(r.subs))
+	for k := range r.subs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 
-	if st, ok := r.subs[rtdsCryptoPriceTopic]; ok && len(st.symbols) > 0 {
-		entries = append(entries, binanceEntries()...)
-	}
-	if st, ok := r.subs[rtdsChainlinkPriceTopic]; ok && len(st.symbols) > 0 {
-		entries = append(entries, chainlinkEntries(sortedSymbols(st.symbols))...)
-	}
-	if st, ok := r.subs[rtdsEquityPriceTopic]; ok && len(st.symbols) > 0 {
-		entries = append(entries, equityEntries(sortedSymbols(st.symbols))...)
+	var entries []rtdsSubscription
+	for _, key := range keys {
+		st := r.subs[key]
+		if len(st.symbols) == 0 {
+			continue
+		}
+		topic, window := splitSubsKey(key)
+		syms := sortedSymbols(st.symbols)
+		switch topic {
+		case rtdsCryptoPriceTopic:
+			entries = append(entries, binanceEntries()...)
+		case rtdsChainlinkTWAPTopic:
+			entries = append(entries, chainlinkTWAPEntries(window)...)
+		case rtdsChainlinkPriceTopic:
+			entries = append(entries, chainlinkEntries(syms)...)
+		case rtdsEquityPriceTopic:
+			entries = append(entries, equityEntries(syms)...)
+		}
 	}
 	return entries
 }
@@ -450,6 +570,8 @@ func (r *WSPolymarketRTDS) processMessage(data []byte) {
 		}
 	case rtdsChainlinkPriceTopic:
 		r.handleCryptoPrice(msg, "chainlink", rtdsChainlinkPriceTopic)
+	case rtdsChainlinkTWAP30Topic, rtdsChainlinkTWAP60Topic:
+		r.handleChainlinkTWAP(msg)
 	case rtdsEquityPriceTopic:
 		switch msg.MsgType {
 		case "update":
@@ -482,6 +604,36 @@ func (r *WSPolymarketRTDS) handleCryptoPrice(msg rtdsMessage, source, topic stri
 		Price:      rtdsPriceValue(payload.rtdsPricePayload, preferFullAccuracy),
 		Timestamp:  rtdsEventTime(payload.Timestamp, msg.Timestamp),
 		Source:     source,
+	})
+}
+
+// handleChainlinkTWAP dispatches a Chainlink TWAP update. This topic sends NO
+// historical snapshot — the first event is the next published TWAP. The wire
+// topic encodes the window; value is an exact decimal string derived from
+// Chainlink's E18 fixed-point price and the payload timestamp is the Chainlink
+// observation time.
+func (r *WSPolymarketRTDS) handleChainlinkTWAP(msg rtdsMessage) {
+	window := twapWindow(msg.Topic)
+	if window == 0 {
+		return
+	}
+	var payload rtdsChainlinkTWAPPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		slog.Warn("rtds: failed to parse chainlink twap payload", "err", err)
+		return
+	}
+	if !r.isSubscribed(subsKey(rtdsChainlinkTWAPTopic, window), payload.Symbol) {
+		return
+	}
+
+	r.base.DispatchEvent(&connector.CryptoPriceEvent{
+		SeqID:         r.base.NextSeqID(),
+		ReceivedAt:    r.base.Now(),
+		Symbol:        payload.Symbol,
+		Price:         rtdsPriceValue(payload.rtdsPricePayload, false),
+		Timestamp:     rtdsEventTime(payload.Timestamp, msg.Timestamp),
+		Source:        "chainlink_twap",
+		WindowSeconds: window,
 	})
 }
 
@@ -550,8 +702,8 @@ func rtdsEventTime(payloadTS, envelopeTS int64) time.Time {
 
 // rtdsSubscription describes a single RTDS subscription (topic + type).
 // Filters carries the topic-specific filter value: nil for the binance
-// broadcast feed, or a JSON string like {"symbol":"eth/usd"} for
-// chainlink/equity.
+// broadcast feed, a JSON string like {"symbol":"eth/usd"} for
+// chainlink/equity, or WindowSeconds+Symbols for the Chainlink TWAP topic.
 type rtdsSubscription struct {
 	Topic   string `json:"topic"`
 	MsgType string `json:"type"`
@@ -583,6 +735,15 @@ type rtdsPricePayload struct {
 // rtdsCryptoPricePayload is the payload of a crypto_prices update.
 type rtdsCryptoPricePayload struct {
 	rtdsPricePayload
+}
+
+// rtdsChainlinkTWAPPayload is the wire payload for a Chainlink TWAP update.
+// value is an exact decimal string; timestamp is the Chainlink observation
+// time. The window is also carried on the wire as window_s (informational — the
+// window is already encoded in the wire topic).
+type rtdsChainlinkTWAPPayload struct {
+	rtdsPricePayload
+	WindowSeconds int `json:"window_s,omitempty"`
 }
 
 // rtdsEquityPricePayload is the payload of an equity_prices update.

@@ -52,6 +52,15 @@ func TestRTDSSubscriptionJSONShape(t *testing.T) {
 	if string(data) != want {
 		t.Errorf("equity JSON mismatch:\n got  %s\n want %s", data, want)
 	}
+
+	// Chainlink TWAP: one broadcast entry per window; the wire topic encodes
+	// the window (no filters/window/symbols fields on the wire).
+	req = rtdsSubscriptionRequest{Action: rtdsActionSubscribe, Subscriptions: chainlinkTWAPEntries(60)}
+	data, _ = json.Marshal(req)
+	want = `{"action":"subscribe","subscriptions":[{"topic":"crypto_prices_twap_sixty","type":"update"}]}`
+	if string(data) != want {
+		t.Errorf("chainlink twap JSON mismatch:\n got  %s\n want %s", data, want)
+	}
 }
 
 // newTestRTDSClient builds an RTDS client over a real connector base and
@@ -132,6 +141,85 @@ func TestRTDSProcessChainlinkSnapshot(t *testing.T) {
 	}
 	if ev.Points[0].Timestamp != 1787378858000 || ev.Points[0].Value != 2431.19 {
 		t.Errorf("bad first point: %+v", ev.Points[0])
+	}
+}
+
+func TestRTDSProcessChainlinkTWAP(t *testing.T) {
+	r, got := newTestRTDSClient(t)
+	r.SubscribeChainlinkTWAP(context.Background(), 60, []string{"btc/usd"})
+
+	// Incoming events carry the per-window wire topic and window_s in the
+	// payload.
+	raw := `{"topic":"crypto_prices_twap_sixty","type":"update","timestamp":1787378918006,"payload":{"symbol":"btc/usd","timestamp":1787378917000,"value":"72913.515000000000000000","window_s":60}}`
+	r.processMessage([]byte(raw))
+
+	if len(*got) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(*got))
+	}
+	ev, ok := (*got)[0].(*connector.CryptoPriceEvent)
+	if !ok {
+		t.Fatalf("expected *CryptoPriceEvent, got %T", (*got)[0])
+	}
+	if ev.Symbol != "btc/usd" || ev.Source != "chainlink_twap" || ev.WindowSeconds != 60 {
+		t.Errorf("got symbol=%q source=%q window=%d", ev.Symbol, ev.Source, ev.WindowSeconds)
+	}
+	// value is an exact decimal string, not converted to a float.
+	if ev.Price != "72913.515000000000000000" {
+		t.Errorf("Price = %q, want exact decimal string", ev.Price)
+	}
+	if !ev.Timestamp.Equal(time.UnixMilli(1787378917000)) {
+		t.Errorf("Timestamp = %v, want payload observation time", ev.Timestamp)
+	}
+}
+
+func TestRTDSProcessChainlinkTWAP30(t *testing.T) {
+	r, got := newTestRTDSClient(t)
+	r.SubscribeChainlinkTWAP(context.Background(), 30, []string{"eth/usd"})
+
+	raw := `{"topic":"crypto_prices_twap_thirty","type":"update","timestamp":1,"payload":{"symbol":"eth/usd","value":"3000.5","window_s":30}}`
+	r.processMessage([]byte(raw))
+
+	if len(*got) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(*got))
+	}
+	ev := (*got)[0].(*connector.CryptoPriceEvent)
+	if ev.WindowSeconds != 30 || ev.Source != "chainlink_twap" {
+		t.Errorf("got window=%d source=%q", ev.WindowSeconds, ev.Source)
+	}
+}
+
+func TestRTDSChainlinkTWAPWindowIsolation(t *testing.T) {
+	r, got := newTestRTDSClient(t)
+	r.SubscribeChainlinkTWAP(context.Background(), 60, []string{"btc/usd"})
+
+	// A 30s-window update (different wire topic) is not subscribed → no event.
+	raw := `{"topic":"crypto_prices_twap_thirty","type":"update","timestamp":1,"payload":{"symbol":"btc/usd","value":"1.5","window_s":30}}`
+	r.processMessage([]byte(raw))
+
+	if len(*got) != 0 {
+		t.Fatalf("expected 0 events (window isolation), got %d", len(*got))
+	}
+}
+
+func TestRTDSChainlinkTWAPEntries(t *testing.T) {
+	// 60s window → crypto_prices_twap_sixty, type update (broadcast, no
+	// window/symbols fields on the wire).
+	entries := chainlinkTWAPEntries(60)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	e := entries[0]
+	if e.Topic != rtdsChainlinkTWAP60Topic || e.MsgType != "update" || e.Filters != nil {
+		t.Errorf("bad 60s entry: %+v", e)
+	}
+	// 30s window → crypto_prices_twap_thirty.
+	entries = chainlinkTWAPEntries(30)
+	if len(entries) != 1 || entries[0].Topic != rtdsChainlinkTWAP30Topic || entries[0].MsgType != "update" {
+		t.Errorf("bad 30s entry: %+v", entries)
+	}
+	// Unsupported window → nil.
+	if got := chainlinkTWAPEntries(45); got != nil {
+		t.Errorf("expected nil for unsupported window, got %v", got)
 	}
 }
 
