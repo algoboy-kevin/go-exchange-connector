@@ -13,6 +13,9 @@ go-exchange-connector/
 ├── go.mod
 ├── README.md
 └── pkg/
+    ├── binance/
+    │   ├── binance.go  # WSBinance — spot + perpetual market data streams
+    │   └── types.go    # MarketType, stream names, WS frame types
     └── websocket/
         ├── types.go    # ConnectionStatus, WSOptions, WSocketError, PanicError
         └── websocket.go# BaseWebSocket — reconnect, ping/pong, status tracking
@@ -115,6 +118,52 @@ Notes:
   numeric `value` is used for Chainlink prices.
 - Equity streams may require access/market-hours; updates mark
   `IsCarriedForward` when the market is closed.
+
+### Binance market data streams (spot + perpetual)
+
+Stream live market data directly from Binance — spot (`stream.binance.com`)
+and USDⓈ-M perpetual futures (`fstream.binance.com`). Four streams supported,
+with events dispatched as `connector.BinanceBookTickerEvent` (best bid/ask),
+`connector.BinanceAggTradeEvent` (trades), `connector.BinanceDepthEvent` (full
+order book, maintained locally), and `connector.BinanceKlineEvent` (OHLCV).
+Symbol matching is case-insensitive.
+
+```go
+base := connector.New(false, nil)
+bn := binance.New(base)
+bn.SetDispatcher(func(ev any) {
+    switch e := ev.(type) {
+    case *connector.BinanceBookTickerEvent:
+        fmt.Printf("%s(%s) bid=%s ask=%s\n", e.Symbol, e.Market, e.BestBidPrice, e.BestAskPrice)
+    case *connector.BinanceAggTradeEvent:
+        fmt.Printf("%s(%s) trade %s @ %s\n", e.Symbol, e.Market, e.Quantity, e.Price)
+    case *connector.BinanceDepthEvent:
+        fmt.Printf("%s(%s) book bids=%d asks=%d\n", e.Symbol, e.Market, len(e.Bids), len(e.Asks))
+    case *connector.BinanceKlineEvent:
+        fmt.Printf("%s(%s) %s close=%s\n", e.Symbol, e.Market, e.Interval, e.Close)
+    }
+})
+bn.Start(ctx)
+defer bn.Stop()
+
+// bookTicker + trades on spot, depth + klines on perpetual:
+bn.SubscribeBookTicker(ctx, binance.MarketSpot, []string{"btcusdt", "ethusdt"})
+bn.SubscribeTrades(ctx, binance.MarketSpot, []string{"btcusdt"})
+bn.SubscribeDepth(ctx, binance.MarketPerp, []string{"btcusdt"})
+bn.SubscribeKlines(ctx, binance.MarketPerp, []string{"btcusdt"}, "1m")
+```
+
+Notes:
+- `MarketSpot` and `MarketPerp` are the two supported markets; both connect on
+  `Start` and use message-based `SUBSCRIBE`/`UNSUBSCRIBE` frames (raw `/ws`
+  endpoint), re-sent on every reconnect.
+- Depth books are seeded from a REST snapshot (`limit=1000`) on each connect
+  and updated from the `@depth@100ms` diff stream. Books re-snapshot on
+  detected gaps. `BinanceDepthEvent.Bids` are sorted descending (best first),
+  `Asks` ascending.
+- Spot `bookTicker` frames carry no event-type field — the manager detects
+  them by shape; the dispatched event carries payload casing (e.g. `BTCUSDT`).
+- Smoke test: `go run ./cmd/test_binance -spot btcusdt -perp btcusdt -trades -depth -kline 1m -duration 12s`.
 
 ## Architecture
 

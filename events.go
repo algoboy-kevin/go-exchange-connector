@@ -111,6 +111,77 @@ type PriceSnapshotEvent struct {
 	Timestamp  time.Time            `json:"timestamp"` // stream timestamp
 }
 
+// ── Binance stream events ──────────────────────────────────
+
+// Binance market streams (pkg/binance) dispatch these typed events. Market is
+// "spot" (spot) or "perp" (USDⓈ-M perpetual futures); Symbol carries the
+// payload casing (e.g. "BTCUSDT").
+
+// BinanceBookTickerEvent is a real-time best bid/ask update from Binance's
+// bookTicker stream (spot + perpetual).
+type BinanceBookTickerEvent struct {
+	SeqID        int64     `json:"seq_id"`         // monotonic sequence for ordered DES replay
+	ReceivedAt   time.Time `json:"received_at"`    // local arrival timestamp
+	Symbol       string    `json:"symbol"`         // e.g. "BTCUSDT"
+	Market       string    `json:"market"`         // "spot" or "perp"
+	UpdateID     int64     `json:"update_id"`      // bookTicker update id
+	BestBidPrice string    `json:"best_bid_price"` // decimal string
+	BestBidQty   string    `json:"best_bid_qty"`   // decimal string
+	BestAskPrice string    `json:"best_ask_price"` // decimal string
+	BestAskQty   string    `json:"best_ask_qty"`   // decimal string
+	Timestamp    time.Time `json:"timestamp"`      // exchange event time (zero if absent)
+}
+
+// BinanceAggTradeEvent is an aggregated trade from Binance's aggTrade stream
+// (spot + perpetual).
+type BinanceAggTradeEvent struct {
+	SeqID        int64     `json:"seq_id"`         // monotonic sequence for ordered DES replay
+	ReceivedAt   time.Time `json:"received_at"`    // local arrival timestamp
+	Symbol       string    `json:"symbol"`         // e.g. "BTCUSDT"
+	Market       string    `json:"market"`         // "spot" or "perp"
+	TradeID      int64     `json:"trade_id"`       // aggregate trade id
+	Price        string    `json:"price"`          // decimal string
+	Quantity     string    `json:"quantity"`       // decimal string
+	FirstTradeID int64     `json:"first_trade_id"` // first constituent trade id
+	LastTradeID  int64     `json:"last_trade_id"`  // last constituent trade id
+	IsBuyerMaker bool      `json:"is_buyer_maker"` // buyer was the maker
+	Timestamp    time.Time `json:"timestamp"`      // exchange trade time
+}
+
+// BinanceDepthEvent is a full order book snapshot for one symbol, maintained
+// locally from Binance's diff-depth stream (@depth@100ms) seeded by a REST
+// snapshot. Bids are sorted descending (best first), asks ascending.
+type BinanceDepthEvent struct {
+	SeqID        int64     `json:"seq_id"`         // monotonic sequence for ordered DES replay
+	ReceivedAt   time.Time `json:"received_at"`    // local arrival timestamp
+	Symbol       string    `json:"symbol"`         // e.g. "BTCUSDT"
+	Market       string    `json:"market"`         // "spot" or "perp"
+	LastUpdateID int64     `json:"last_update_id"` // book's final update id
+	Bids         []Level   `json:"bids"`           // best (highest price) first
+	Asks         []Level   `json:"asks"`           // best (lowest price) first
+	Timestamp    time.Time `json:"timestamp"`      // exchange event time (zero if absent)
+}
+
+// BinanceKlineEvent is an OHLCV candle from Binance's kline stream (spot +
+// perpetual). IsFinal marks a closed candle.
+type BinanceKlineEvent struct {
+	SeqID       int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
+	ReceivedAt  time.Time `json:"received_at"` // local arrival timestamp
+	Symbol      string    `json:"symbol"`      // e.g. "BTCUSDT"
+	Market      string    `json:"market"`      // "spot" or "perp"
+	Interval    string    `json:"interval"`    // e.g. "1m", "15m", "1h"
+	Open        string    `json:"open"`
+	High        string    `json:"high"`
+	Low         string    `json:"low"`
+	Close       string    `json:"close"`
+	Volume      string    `json:"volume"`
+	QuoteVolume string    `json:"quote_volume"`
+	IsFinal     bool      `json:"is_final"`
+	OpenTime    time.Time `json:"open_time"`
+	CloseTime   time.Time `json:"close_time"`
+	Timestamp   time.Time `json:"timestamp"` // exchange event time
+}
+
 // MarketResolvedEvent notifies that a prediction market has been resolved.
 type MarketResolvedEvent struct {
 	SeqID          int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
