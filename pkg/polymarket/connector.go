@@ -47,6 +47,7 @@ type PolymarketConnector struct {
 	gamma  *GammaClient
 	market *WSPolymarketMarket
 	user   *WSPolymarketUserWS
+	rtds   *WSPolymarketRTDS
 }
 
 // New creates a new PolymarketConnector.
@@ -108,15 +109,18 @@ func New(isLive bool, cfg Config, now func() time.Time) *PolymarketConnector {
 		slog.Warn("polymarket: no signing key configured — set ClobSigningKeyHex for LIVE orders")
 	}
 
+	base := connector.New(isLive, &polymarketLiveExecutor{
+		gamma:      gamma,
+		clob:       clob,
+		crypto:     cryptoPrice,
+		signingKey: signingKey,
+	})
+
 	pc := &PolymarketConnector{
-		Connector: connector.New(isLive, &polymarketLiveExecutor{
-			gamma:      gamma,
-			clob:       clob,
-			crypto:     cryptoPrice,
-			signingKey: signingKey,
-		}),
-		cfg:   cfg,
-		gamma: gamma,
+		Connector: base,
+		cfg:       cfg,
+		gamma:     gamma,
+		rtds:      NewWSPolymarketRTDS(base),
 	}
 
 	if now != nil {
@@ -142,6 +146,15 @@ func (p *PolymarketConnector) Start(ctx context.Context) error {
 		return err
 	}
 
+	// ── RTDS WS (all modes) — crypto asset price stream ────
+	rtdsURL := p.cfg.RTDSURL
+	if rtdsURL == "" {
+		rtdsURL = rtdsWSSURL
+	}
+	if err := p.rtds.Start(ctx, rtdsURL, p.cfg.ReconnectIntervalMs); err != nil {
+		slog.Warn("polymarket: RTDS failed to start (continuing)", "err", err)
+	}
+
 	// ── User WS (LIVE mode only) ────────────────────────────
 	if p.IsLive && p.cfg.APIKey != "" && p.cfg.Secret != "" && p.cfg.Passphrase != "" {
 		userURL := p.cfg.UserWSURL
@@ -164,6 +177,7 @@ func (p *PolymarketConnector) Start(ctx context.Context) error {
 	slog.Info("polymarket: connector started",
 		"is_live", p.IsLive,
 		"market_ws", true,
+		"rtds_ws", p.rtds != nil,
 		"user_ws", p.user != nil,
 	)
 
@@ -172,6 +186,10 @@ func (p *PolymarketConnector) Start(ctx context.Context) error {
 
 // Stop shuts down all WebSocket connections gracefully.
 func (p *PolymarketConnector) Stop() {
+	if p.rtds != nil {
+		p.rtds.Stop()
+	}
+
 	if p.user != nil {
 		p.user.Stop()
 	}
@@ -213,6 +231,74 @@ func (p *PolymarketConnector) Subscribe(assetIDs []string) {
 func (p *PolymarketConnector) Unsubscribe(assetIDs []string) {
 	if p.market != nil {
 		p.market.Unsubscribe(context.Background(), assetIDs)
+	}
+}
+
+// ── RTDS (real-time reference price streams) ────────────────
+
+// SubscribeCryptoPrices subscribes to real-time Binance crypto price updates
+// for the given symbols (e.g. "BTCUSDT", "ethusdt"). Updates are dispatched as
+// connector.CryptoPriceEvent with Source "binance".
+func (p *PolymarketConnector) SubscribeCryptoPrices(ctx context.Context, symbols []string) {
+	if p.rtds != nil {
+		p.rtds.SubscribeCryptoPrices(ctx, symbols)
+	}
+}
+
+// UnsubscribeCryptoPrices removes symbols from the Binance crypto price stream.
+func (p *PolymarketConnector) UnsubscribeCryptoPrices(ctx context.Context, symbols []string) {
+	if p.rtds != nil {
+		p.rtds.UnsubscribeCryptoPrices(ctx, symbols)
+	}
+}
+
+// SubscribeChainlinkPrices subscribes to real-time Chainlink crypto price
+// updates for the given feeds (e.g. "eth/usd", "btc/usd"). Updates are
+// dispatched as connector.CryptoPriceEvent with Source "chainlink", and the
+// initial historical snapshot as connector.PriceSnapshotEvent.
+func (p *PolymarketConnector) SubscribeChainlinkPrices(ctx context.Context, feeds []string) {
+	if p.rtds != nil {
+		p.rtds.SubscribeChainlinkPrices(ctx, feeds)
+	}
+}
+
+// UnsubscribeChainlinkPrices removes feeds from the Chainlink price stream.
+func (p *PolymarketConnector) UnsubscribeChainlinkPrices(ctx context.Context, feeds []string) {
+	if p.rtds != nil {
+		p.rtds.UnsubscribeChainlinkPrices(ctx, feeds)
+	}
+}
+
+// SubscribeEquityPrices subscribes to real-time equity/ETF/forex/commodity
+// prices (Pyth) for the given symbols (e.g. "AAPL", "EURUSD"). Updates are
+// dispatched as connector.EquityPriceEvent, and the initial historical
+// snapshot as connector.PriceSnapshotEvent.
+func (p *PolymarketConnector) SubscribeEquityPrices(ctx context.Context, symbols []string) {
+	if p.rtds != nil {
+		p.rtds.SubscribeEquityPrices(ctx, symbols)
+	}
+}
+
+// UnsubscribeEquityPrices removes symbols from the equity price stream.
+func (p *PolymarketConnector) UnsubscribeEquityPrices(ctx context.Context, symbols []string) {
+	if p.rtds != nil {
+		p.rtds.UnsubscribeEquityPrices(ctx, symbols)
+	}
+}
+
+// RTDSStatus returns the current RTDS WebSocket connection status.
+func (p *PolymarketConnector) RTDSStatus() ws.ConnectionStatus {
+	if p.rtds == nil {
+		return ws.StatusDisconnected
+	}
+	return p.rtds.Status()
+}
+
+// SetOnRTDSStatusChange registers a callback that fires whenever the RTDS
+// WebSocket connection status changes. Must be called before Start.
+func (p *PolymarketConnector) SetOnRTDSStatusChange(fn func(ws.ConnectionStatus)) {
+	if p.rtds != nil {
+		p.rtds.SetOnStatusChange(fn)
 	}
 }
 

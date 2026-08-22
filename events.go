@@ -67,6 +67,50 @@ type TickChangeEvent struct {
 	Timestamp   time.Time `json:"timestamp"`
 }
 
+// ── RTDS (Real-Time Data Service) events ────────────────────
+
+// CryptoPriceEvent is a real-time crypto asset price update from Polymarket's
+// RTDS stream. Source distinguishes the feed: "binance" (symbols like
+// "btcusdt") or "chainlink" (symbols like "eth/usd").
+type CryptoPriceEvent struct {
+	SeqID      int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
+	ReceivedAt time.Time `json:"received_at"` // local arrival timestamp
+	Symbol     string    `json:"symbol"`      // e.g. "btcusdt" or "eth/usd"
+	Price      string    `json:"price"`       // decimal string (RTDS "value")
+	Timestamp  time.Time `json:"timestamp"`   // exchange timestamp
+	Source     string    `json:"source"`      // "binance" or "chainlink"
+}
+
+// EquityPriceEvent is a real-time equity/ETF/forex/commodity reference price
+// update from the RTDS equity (Pyth) stream, e.g. symbol "aapl".
+type EquityPriceEvent struct {
+	SeqID            int64     `json:"seq_id"`                       // monotonic sequence for ordered DES replay
+	ReceivedAt       time.Time `json:"received_at"`                  // local arrival timestamp
+	Symbol           string    `json:"symbol"`                       // e.g. "aapl"
+	Price            string    `json:"price"`                        // decimal string (full_accuracy_value preferred)
+	Timestamp        time.Time `json:"timestamp"`                    // exchange timestamp
+	IsCarriedForward bool      `json:"is_carried_forward,omitempty"` // true when market closed / value carried forward
+}
+
+// PriceSnapshotPoint is a single historical price point in a subscribe
+// snapshot (used to seed local state before live updates).
+type PriceSnapshotPoint struct {
+	Timestamp int64   `json:"timestamp"` // ms since epoch
+	Value     float64 `json:"value"`
+}
+
+// PriceSnapshotEvent carries the historical snapshot that the RTDS stream
+// sends immediately after subscribing to a chainlink or equity symbol (the
+// preceding ~2 minutes of price data).
+type PriceSnapshotEvent struct {
+	SeqID      int64                `json:"seq_id"`      // monotonic sequence for ordered DES replay
+	ReceivedAt time.Time            `json:"received_at"` // local arrival timestamp
+	Source     string               `json:"source"`      // "chainlink" or "equity"
+	Symbol     string               `json:"symbol"`
+	Points     []PriceSnapshotPoint `json:"points"`
+	Timestamp  time.Time            `json:"timestamp"` // stream timestamp
+}
+
 // MarketResolvedEvent notifies that a prediction market has been resolved.
 type MarketResolvedEvent struct {
 	SeqID          int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay

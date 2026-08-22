@@ -76,6 +76,46 @@ mock.OnEvent = func(ev any) {
 engine := NewTradingEngine(mock)
 ```
 
+### RTDS real-time reference prices (Polymarket)
+
+Stream real-time reference prices via the RTDS WebSocket. Three sources are
+supported, with events dispatched as `connector.CryptoPriceEvent` (Binance &
+Chainlink crypto), `connector.EquityPriceEvent` (Pyth equity/forex/commodities),
+and `connector.PriceSnapshotEvent` (historical ~2-min snapshot on subscribe).
+Symbol matching is case-insensitive.
+
+```go
+conn := polymarket.New(false, polymarket.Config{})
+conn.SetDispatcher(func(ev any) {
+    switch e := ev.(type) {
+    case *connector.CryptoPriceEvent:
+        fmt.Printf("%s(%s) = %s\n", e.Symbol, e.Source, e.Price)
+    case *connector.EquityPriceEvent:
+        fmt.Printf("equity %s = %s\n", e.Symbol, e.Price)
+    case *connector.PriceSnapshotEvent:
+        fmt.Printf("%s snapshot %s: %d points\n", e.Source, e.Symbol, len(e.Points))
+    }
+})
+conn.Start(ctx)
+defer conn.Stop()
+
+// Binance crypto (e.g. btcusdt) — broadcast feed, filtered locally.
+conn.SubscribeCryptoPrices(ctx, []string{"btcusdt", "ethusdt"})
+// Chainlink crypto feeds (e.g. eth/usd, btc/usd).
+conn.SubscribeChainlinkPrices(ctx, []string{"eth/usd", "btc/usd"})
+// Equity / forex / commodities via Pyth (e.g. AAPL, EURUSD).
+conn.SubscribeEquityPrices(ctx, []string{"AAPL", "TSLA"})
+```
+
+Notes:
+- The binance `crypto_prices` topic is a broadcast feed (server-side filters
+  do not reliably deliver data), so it's subscribed unfiltered and filtered
+  locally.
+- Chainlink `full_accuracy_value` is a raw integer scaled by 10¹⁸ — the
+  numeric `value` is used for Chainlink prices.
+- Equity streams may require access/market-hours; updates mark
+  `IsCarriedForward` when the market is closed.
+
 ## Architecture
 
 ### ExchangeConnector interface
@@ -86,6 +126,7 @@ type ExchangeConnector interface {
     CancelOrders(orderIDs []string) error
     GetMarket(id, slug string) (*Market, error)
     GetResolution(marketID string) (*Resolution, error)
+    GetCryptoPrice(req CryptoPriceRequest) (*CryptoPrice, error)
     Subscribe(assetIDs []string)
     Unsubscribe(assetIDs []string)
     SetOnEvent(cb func(any))

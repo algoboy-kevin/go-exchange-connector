@@ -197,6 +197,7 @@ type Config struct {
 	Passphrase          string `yaml:"api_passphrase"`
 	GammaAPIURL         string `yaml:"gamma_api_url,omitempty"`
 	CryptoPriceURL      string `yaml:"crypto_price_url,omitempty"` // default: https://polymarket.com
+	RTDSURL             string `yaml:"rtds_url,omitempty"`         // default: wss://ws-live-data.polymarket.com
 	MarketWSURL         string `yaml:"market_ws_url,omitempty"`
 	UserWSURL           string `yaml:"user_ws_url,omitempty"`
 	ReconnectIntervalMs int64  `yaml:"reconnect_interval_ms,omitempty"`
