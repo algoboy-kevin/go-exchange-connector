@@ -817,7 +817,9 @@ func (b *WSBinance) snapshotDepthBook(ctx context.Context, mkt MarketType, symbo
 	bk.mu.Lock()
 	defer bk.mu.Unlock()
 
-	url := fmt.Sprintf("%s%s?symbol=%s&limit=1000", mkt.restURL(), depthRESTPath(mkt), strings.ToUpper(symbol))
+	// limit=50 keeps the REST snapshot small (lower weight + smaller payload),
+	// which eases rate-limit pressure; deeper levels still arrive via diffs.
+	url := fmt.Sprintf("%s%s?symbol=%s&limit=50", mkt.restURL(), depthRESTPath(mkt), strings.ToUpper(symbol))
 	resp, err := b.http.Get(url)
 	if err != nil {
 		return fmt.Errorf("binance %s depth snapshot %s: %w", mkt, symbol, err)

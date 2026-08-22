@@ -81,6 +81,9 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 	if opts.ReconnectInterval <= 0 {
 		opts.ReconnectInterval = 2000 // 2s default
 	}
+	if opts.ReconnectMaxInterval <= 0 {
+		opts.ReconnectMaxInterval = 30000 // 30s default
+	}
 	if opts.ConnectionTimeout <= 0 {
 		opts.ConnectionTimeout = 5000 // 5s default
 	}
@@ -287,21 +290,24 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 // ─────────────────────────────────────────────────────────────
 
 func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
-	reconnTicker := time.NewTicker(time.Duration(b.opts.ReconnectInterval) * time.Millisecond)
-	defer func() {
-		reconnTicker.Stop()
-		close(b.done)
-	}()
+	defer close(b.done)
+
+	baseDelay := time.Duration(b.opts.ReconnectInterval) * time.Millisecond
+	maxDelay := time.Duration(b.opts.ReconnectMaxInterval) * time.Millisecond
+	delay := baseDelay
 
 	for {
+		// Wait the current backoff delay before (re)connecting. While
+		// connected this idles at the base interval and keeps the backoff
+		// reset, so the next disconnect starts fresh from ReconnectInterval.
 		select {
 		case <-ctx.Done():
 			return
-		case <-reconnTicker.C:
+		case <-time.After(delay):
 		}
 
-		// If already connected, skip this tick.
 		if b.Status() == StatusConnected {
+			delay = baseDelay
 			continue
 		}
 
@@ -309,15 +315,26 @@ func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
 			continue
 		}
 
-		slog.Debug("websocket: reconnecting", "url", b.url)
+		slog.Debug("websocket: reconnecting", "url", b.url, "delay", delay.String())
 		if err := b.dialSync(ctx); err != nil {
-			slog.Warn("websocket: reconnection failed", "error", err)
+			delay = nextBackoff(delay, maxDelay)
+			slog.Warn("websocket: reconnection failed", "error", err, "next_backoff", delay.String())
 			continue
 		}
 
-		// Successful reconnection — restart the read loop.
+		// Successful reconnection — restart the read loop and reset backoff.
+		delay = baseDelay
 		go b.readLoop(ctx)
 	}
+}
+
+// nextBackoff returns the next reconnect delay: d doubled, capped at max.
+func nextBackoff(d, max time.Duration) time.Duration {
+	d *= 2
+	if d > max {
+		return max
+	}
+	return d
 }
 
 // ─────────────────────────────────────────────────────────────

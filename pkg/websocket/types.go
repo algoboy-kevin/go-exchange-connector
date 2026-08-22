@@ -38,6 +38,12 @@ type WSOptions struct {
 	// Default: 5s.
 	ReconnectInterval int64 `json:"reconnect_interval_ms,omitempty"`
 
+	// ReconnectMaxInterval caps the exponential reconnect backoff in
+	// milliseconds. After each consecutive failed reconnect the interval is
+	// doubled, up to this maximum; a successful connection resets it to
+	// ReconnectInterval. Default: 30s.
+	ReconnectMaxInterval int64 `json:"reconnect_max_interval_ms,omitempty"`
+
 	// ConnectionTimeout is how long to wait for the initial dial to succeed.
 	// Default: 30s.
 	ConnectionTimeout int64 `json:"connection_timeout_ms,omitempty"`
@@ -50,9 +56,10 @@ type WSOptions struct {
 // DefaultWSOptions returns sensible defaults for a production WebSocket connection.
 func DefaultWSOptions() WSOptions {
 	return WSOptions{
-		ReconnectInterval: 5000,  // 5s
-		ConnectionTimeout: 30000, // 30s
-		PingInterval:      20000, // 20s
+		ReconnectInterval:    5000,  // 5s
+		ReconnectMaxInterval: 30000, // 30s
+		ConnectionTimeout:    30000, // 30s
+		PingInterval:         20000, // 20s
 	}
 }
 
