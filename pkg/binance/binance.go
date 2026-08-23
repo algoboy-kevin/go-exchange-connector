@@ -667,7 +667,7 @@ func (b *WSBinance) handleAggTrade(c *binanceConn, data []byte) {
 		slog.Info("binance: aggTrade dropped, not subscribed", "market", c.mkt, "symbol", ev.Symbol, "stream", streamFor(symbol, streamAggTrade))
 		return
 	}
-	slog.Info("binance: dispatching aggTrade", "market", c.mkt, "symbol", ev.Symbol)
+
 	b.base.DispatchEvent(&connector.BinanceAggTradeEvent{
 		SeqID:        b.base.NextSeqID(),
 		ReceivedAt:   b.base.Now(),
