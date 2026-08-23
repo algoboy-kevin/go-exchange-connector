@@ -552,7 +552,6 @@ func (b *WSBinance) processMessage(c *binanceConn, data []byte) {
 		return
 	}
 
-	slog.Info("binance: got message", "market", c.mkt, "e", jsonString(raw["e"]))
 	switch jsonString(raw["e"]) {
 	case "bookTicker":
 		b.handleBookTicker(c, data)
