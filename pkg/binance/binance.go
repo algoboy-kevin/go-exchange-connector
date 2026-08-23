@@ -21,7 +21,14 @@ import (
 
 const (
 	spotWSSURL = "wss://stream.binance.com:9443/ws"
-	perpWSSURL = "wss://fstream.binance.com/ws"
+
+	// Binance split the USDⓈ-M futures market streams across two endpoints:
+	// market streams (aggTrade, kline) moved to /market/ws, public streams
+	// (bookTicker, depth) to /public/ws. The legacy /ws + /stream endpoints
+	// still push bookTicker/depth but ack @aggTrade subscriptions while
+	// delivering nothing — so perp uses two connections (see streamClass).
+	perpMarketWSSURL = "wss://fstream.binance.com/market/ws"
+	perpPublicWSSURL = "wss://fstream.binance.com/public/ws"
 
 	spotRESTURL = "https://api.binance.com"
 	perpRESTURL = "https://fapi.binance.com"
@@ -43,12 +50,35 @@ const (
 // It mirrors the WSPolymarketRTDS pattern: subscriptions are re-sent on every
 // (re)connect via OnConnect, parsed events are dispatched through the
 // connector, and connection is deferred until there is something to stream.
+// streamClass groups streams onto a single WS connection. Spot keeps one
+// connection; futures use two because Binance moved market streams
+// (trades/klines) and public streams (bookTicker/depth) to different
+// endpoints (/market/* and /public/* respectively).
+type streamClass string
+
+const (
+	classSpot   streamClass = "spot"   // spot: all streams on /ws
+	classMarket streamClass = "market" // perp: aggTrade + kline on /market/ws
+	classPublic streamClass = "public" // perp: bookTicker + depth on /public/ws
+)
+
+// streamClassOf maps a stream name to the connection that carries it.
+func streamClassOf(mkt MarketType, stream string) streamClass {
+	if mkt == MarketSpot {
+		return classSpot
+	}
+	if strings.HasSuffix(stream, "@bookTicker") || strings.HasSuffix(stream, "@depth@100ms") {
+		return classPublic
+	}
+	return classMarket
+}
+
 type WSBinance struct {
 	base   *connector.Connector
 	http   *http.Client
 	rootCx context.Context
 
-	conns map[MarketType]*binanceConn
+	conns map[MarketType]map[streamClass]*binanceConn
 
 	booksMu sync.Mutex
 	books   map[MarketType]map[string]*binanceBook
@@ -56,10 +86,11 @@ type WSBinance struct {
 	onStatusChange func(MarketType, ws.ConnectionStatus)
 }
 
-// binanceConn is one market's WebSocket connection plus its local stream
+// binanceConn is one class's WebSocket connection plus its local stream
 // registry and event queue.
 type binanceConn struct {
-	mkt MarketType
+	mkt   MarketType
+	class streamClass
 	*ws.BaseWebSocket
 
 	owner *WSBinance
@@ -72,22 +103,39 @@ type binanceConn struct {
 	dispatchCancel context.CancelFunc
 }
 
+// wsURL returns the WebSocket endpoint for this connection's market/class.
+func (c *binanceConn) wsURL() string {
+	if c.mkt == MarketSpot {
+		return spotWSSURL
+	}
+	if c.class == classMarket {
+		return perpMarketWSSURL
+	}
+	return perpPublicWSSURL
+}
+
 // New creates a Binance stream manager over a connector base.
 func New(base *connector.Connector) *WSBinance {
 	b := &WSBinance{
 		base:  base,
 		http:  &http.Client{Timeout: 10 * time.Second},
-		conns: make(map[MarketType]*binanceConn, 2),
+		conns: make(map[MarketType]map[streamClass]*binanceConn, 2),
 		books: make(map[MarketType]map[string]*binanceBook, 2),
 	}
-	b.conns[MarketSpot] = newBinanceConn(b, MarketSpot)
-	b.conns[MarketPerp] = newBinanceConn(b, MarketPerp)
+	b.conns[MarketSpot] = map[streamClass]*binanceConn{
+		classSpot: newBinanceConn(b, MarketSpot, classSpot),
+	}
+	b.conns[MarketPerp] = map[streamClass]*binanceConn{
+		classMarket: newBinanceConn(b, MarketPerp, classMarket),
+		classPublic: newBinanceConn(b, MarketPerp, classPublic),
+	}
 	return b
 }
 
-func newBinanceConn(owner *WSBinance, mkt MarketType) *binanceConn {
+func newBinanceConn(owner *WSBinance, mkt MarketType, class streamClass) *binanceConn {
 	c := &binanceConn{
 		mkt:           mkt,
+		class:         class,
 		BaseWebSocket: &ws.BaseWebSocket{},
 		owner:         owner,
 		streams:       make(map[string]struct{}),
@@ -103,7 +151,7 @@ func newBinanceConn(owner *WSBinance, mkt MarketType) *binanceConn {
 	c.OnMessage = c.onMessage
 	c.OnDisconnect = c.onDisconnect
 	c.OnError = func(err error) {
-		slog.Warn("binance: ws error", "market", mkt, "err", err)
+		slog.Warn("binance: ws error", "market", mkt, "class", class, "err", err)
 	}
 	return c
 }
@@ -127,10 +175,12 @@ func (b *WSBinance) SetDispatcher(d func(any)) {
 func (b *WSBinance) Start(ctx context.Context, reconnectIntervalMs int64) error {
 	b.rootCx = ctx
 
-	for _, c := range b.conns {
-		dispatchCtx, cancel := context.WithCancel(ctx)
-		c.dispatchCancel = cancel
-		go b.eventDispatcher(dispatchCtx, c)
+	for _, byClass := range b.conns {
+		for _, c := range byClass {
+			dispatchCtx, cancel := context.WithCancel(ctx)
+			c.dispatchCancel = cancel
+			go b.eventDispatcher(dispatchCtx, c)
+		}
 	}
 
 	opts := ws.DefaultWSOptions()
@@ -142,8 +192,10 @@ func (b *WSBinance) Start(ctx context.Context, reconnectIntervalMs int64) error 
 	}
 
 	for _, mkt := range []MarketType{MarketSpot, MarketPerp} {
-		if err := b.conns[mkt].Connect(ctx, mkt.wsURL(), opts); err != nil {
-			return fmt.Errorf("binance %s: %w", mkt, err)
+		for _, c := range b.conns[mkt] {
+			if err := c.Connect(ctx, c.wsURL(), opts); err != nil {
+				return fmt.Errorf("binance %s %s: %w", mkt, c.class, err)
+			}
 		}
 	}
 	return nil
@@ -151,12 +203,14 @@ func (b *WSBinance) Start(ctx context.Context, reconnectIntervalMs int64) error 
 
 // Stop shuts down both connections, stops the dispatchers, and clears state.
 func (b *WSBinance) Stop() {
-	for _, c := range b.conns {
-		if c.dispatchCancel != nil {
-			c.dispatchCancel()
+	for _, byClass := range b.conns {
+		for _, c := range byClass {
+			if c.dispatchCancel != nil {
+				c.dispatchCancel()
+			}
+			c.Close()
+			c.clearStreams()
 		}
-		c.Close()
-		c.clearStreams()
 	}
 	b.clearBooks()
 }
@@ -191,7 +245,10 @@ func (b *WSBinance) UnsubscribeTrades(ctx context.Context, mkt MarketType, symbo
 // updated with @depth@100ms diff events.
 func (b *WSBinance) SubscribeDepth(ctx context.Context, mkt MarketType, symbols []string) {
 	streams := buildStreams(symbols, streamDepth)
-	c := b.conn(mkt)
+	if len(streams) == 0 {
+		return
+	}
+	c := b.connFor(mkt, streamClassOf(mkt, streams[0]))
 	if c == nil {
 		return
 	}
@@ -208,7 +265,10 @@ func (b *WSBinance) SubscribeDepth(ctx context.Context, mkt MarketType, symbols 
 // given symbols.
 func (b *WSBinance) UnsubscribeDepth(ctx context.Context, mkt MarketType, symbols []string) {
 	streams := buildStreams(symbols, streamDepth)
-	c := b.conn(mkt)
+	if len(streams) == 0 {
+		return
+	}
+	c := b.connFor(mkt, streamClassOf(mkt, streams[0]))
 	if c == nil {
 		return
 	}
@@ -251,34 +311,51 @@ func (b *WSBinance) UnsubscribeKlines(ctx context.Context, mkt MarketType, symbo
 	b.unsubscribe(ctx, mkt, streams)
 }
 
+// subscribe adds streams to their class's connection and sends a SUBSCRIBE
+// frame if any were newly added. Streams are routed to the right connection
+// by stream class (spot single conn; perp market/public split).
 func (b *WSBinance) subscribe(ctx context.Context, mkt MarketType, streams []string) {
-	c := b.conn(mkt)
-	if c == nil {
-		return
-	}
-	_, added := c.addStreams(streams)
-	if len(added) > 0 {
-		c.send(ctx, binanceMethodSubscribe, added)
+	for class, group := range groupStreams(mkt, streams) {
+		c := b.connFor(mkt, class)
+		if c == nil {
+			continue
+		}
+		_, added := c.addStreams(group)
+		if len(added) > 0 {
+			c.send(ctx, binanceMethodSubscribe, added)
+		}
 	}
 }
 
 func (b *WSBinance) unsubscribe(ctx context.Context, mkt MarketType, streams []string) {
-	c := b.conn(mkt)
-	if c == nil {
-		return
-	}
-	_, removed := c.removeStreams(streams)
-	if len(removed) > 0 {
-		c.send(ctx, binanceMethodUnsubscribe, removed)
+	for class, group := range groupStreams(mkt, streams) {
+		c := b.connFor(mkt, class)
+		if c == nil {
+			continue
+		}
+		_, removed := c.removeStreams(group)
+		if len(removed) > 0 {
+			c.send(ctx, binanceMethodUnsubscribe, removed)
+		}
 	}
 }
 
-func (b *WSBinance) conn(mkt MarketType) *binanceConn {
+// groupStreams buckets stream names by the connection that carries them.
+func groupStreams(mkt MarketType, streams []string) map[streamClass][]string {
+	groups := make(map[streamClass][]string)
+	for _, s := range streams {
+		class := streamClassOf(mkt, s)
+		groups[class] = append(groups[class], s)
+	}
+	return groups
+}
+
+func (b *WSBinance) connFor(mkt MarketType, class streamClass) *binanceConn {
 	if !mkt.valid() {
 		slog.Warn("binance: invalid market type", "market", mkt)
 		return nil
 	}
-	return b.conns[mkt]
+	return b.conns[mkt][class]
 }
 
 func buildStreams(symbols []string, st streamType) []string {
@@ -358,6 +435,7 @@ func (c *binanceConn) send(ctx context.Context, method string, streams []string)
 	}
 	conn := c.Conn()
 	if conn == nil {
+		slog.Info("binance: send DROPPED (conn nil)", "market", c.mkt, "method", method, "streams", streams)
 		return
 	}
 	if err := c.writeSubscribe(ctx, conn, method, streams); err != nil {
@@ -366,6 +444,7 @@ func (c *binanceConn) send(ctx context.Context, method string, streams []string)
 }
 
 func (c *binanceConn) writeSubscribe(ctx context.Context, conn *coderws.Conn, method string, streams []string) error {
+	slog.Info("binance: writeSubscribe", "market", c.mkt, "method", method, "streams", streams)
 	req := binanceSubRequest{Method: method, Params: streams, ID: c.nextID.Add(1)}
 	data, err := json.Marshal(req)
 	if err != nil {
@@ -385,15 +464,21 @@ func (c *binanceConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 
 	// Re-send every active subscription.
 	if streams := c.allStreams(); len(streams) > 0 {
+		slog.Info("binance: onConnect re-sending", "market", c.mkt, "streams", streams)
 		if err := c.writeSubscribe(ctx, conn, binanceMethodSubscribe, streams); err != nil {
 			return err
 		}
+	} else {
+		slog.Info("binance: onConnect no streams", "market", c.mkt)
 	}
 
-	// Seed depth books from REST snapshots. Failures are logged, not fatal —
-	// bookTicker/trade/kline streams keep working.
-	if err := c.owner.snapshotDepthBooks(ctx, c.mkt); err != nil {
-		slog.Warn("binance: depth snapshot failed", "market", c.mkt, "err", err)
+	// Seed depth books from REST snapshots on the connection that carries
+	// the depth stream (spot single conn; perp public conn). Failures are
+	// logged, not fatal — bookTicker/trade/kline streams keep working.
+	if c.class == classSpot || c.class == classPublic {
+		if err := c.owner.snapshotDepthBooks(ctx, c.mkt); err != nil {
+			slog.Warn("binance: depth snapshot failed", "market", c.mkt, "err", err)
+		}
 	}
 	return nil
 }
@@ -467,6 +552,7 @@ func (b *WSBinance) processMessage(c *binanceConn, data []byte) {
 		return
 	}
 
+	slog.Info("binance: got message", "market", c.mkt, "e", jsonString(raw["e"]))
 	switch jsonString(raw["e"]) {
 	case "bookTicker":
 		b.handleBookTicker(c, data)
@@ -579,8 +665,10 @@ func (b *WSBinance) handleAggTrade(c *binanceConn, data []byte) {
 	}
 	symbol := normalizeSymbol(ev.Symbol)
 	if !c.isSubscribed(streamFor(symbol, streamAggTrade)) {
+		slog.Info("binance: aggTrade dropped, not subscribed", "market", c.mkt, "symbol", ev.Symbol, "stream", streamFor(symbol, streamAggTrade))
 		return
 	}
+	slog.Info("binance: dispatching aggTrade", "market", c.mkt, "symbol", ev.Symbol)
 	b.base.DispatchEvent(&connector.BinanceAggTradeEvent{
 		SeqID:        b.base.NextSeqID(),
 		ReceivedAt:   b.base.Now(),
@@ -791,7 +879,14 @@ type binanceDepthSnapshot struct {
 // symbol on a market. Used on (re)connect.
 func (b *WSBinance) snapshotDepthBooks(ctx context.Context, mkt MarketType) error {
 	var symbols []string
-	c := b.conns[mkt]
+	class := classSpot
+	if mkt != MarketSpot {
+		class = classPublic
+	}
+	c := b.connFor(mkt, class)
+	if c == nil {
+		return nil
+	}
 	c.mu.RLock()
 	for s := range c.streams {
 		if strings.HasSuffix(s, "@depth@100ms") {

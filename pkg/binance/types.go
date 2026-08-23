@@ -15,22 +15,17 @@ const (
 	// MarketSpot is the Binance spot market (wss://stream.binance.com:9443).
 	MarketSpot MarketType = "spot"
 	// MarketPerp is the Binance USDⓈ-M perpetual futures market
-	// (wss://fstream.binance.com).
+	// (wss://fstream.binance.com). Futures market streams are split across
+	// two endpoints — /market/ws (aggTrade, kline) and /public/ws
+	// (bookTicker, depth) — each on its own connection (see streamClass in
+	// binance.go). The legacy /ws + /stream endpoints ack @aggTrade
+	// subscriptions but deliver nothing.
 	MarketPerp MarketType = "perp"
 )
 
 // valid reports whether m is a known market type.
 func (m MarketType) valid() bool {
 	return m == MarketSpot || m == MarketPerp
-}
-
-// wsURL returns the raw WebSocket endpoint for the market (message-based
-// subscribe/unsubscribe via SUBSCRIBE frames).
-func (m MarketType) wsURL() string {
-	if m == MarketPerp {
-		return perpWSSURL
-	}
-	return spotWSSURL
 }
 
 // restURL returns the REST base URL used for order-book snapshots.
