@@ -52,6 +52,8 @@ type WSPolymarketMarket struct {
 	latencyTracker    latencyTracker
 	latencyCancel     context.CancelFunc
 	latencyLogEnabled bool
+
+	writeMu sync.Mutex // serializes WS writes (onConnect + flushPending)
 }
 
 // SetOnStatusChange registers a callback that fires whenever the WebSocket
@@ -154,10 +156,15 @@ func (pm *WSPolymarketMarket) Stop() {
 	pm.clearSubscriptions()
 }
 
-// Subscribe queues asset IDs and triggers a reconnect so the full
-// updated subscription list is sent via the initial handshake.
-// Polymarket's market channel does not reliably support incremental
-// subscribe operations — a full re-subscribe on reconnect avoids issues.
+// Subscribe queues asset IDs for subscription and pushes the change to the
+// server over the live connection — no reconnect needed. Additions are sent
+// as incremental operation:"subscribe" frames. The handshake form
+// {assets_ids,type,custom_feature_enabled} is NOT valid once a connection is
+// established — re-sending it gets a plain-text "INVALID OPERATION" (verified
+// live 2026-08-24) — so add/remove must use the operation frames. This
+// replaces the old forced-reconnect approach, which produced a "constant 3
+// disconnects per market" during rotation (each costing ~1s of market data +
+// a fresh chance to hit a real disconnect).
 func (pm *WSPolymarketMarket) Subscribe(ctx context.Context, assetIDs []string) {
 	pm.subMu.Lock()
 	pm.pendingMu.Lock()
@@ -168,28 +175,24 @@ func (pm *WSPolymarketMarket) Subscribe(ctx context.Context, assetIDs []string) 
 		}
 		pm.pendingSubscribeIDs[id] = struct{}{}
 	}
-	needsReconnect := len(pm.pendingSubscribeIDs) > 0
 	pm.pendingMu.Unlock()
 	pm.subMu.Unlock()
 
-	if needsReconnect {
-		pm.Disconnect()
-	}
+	pm.flushPending(ctx)
 }
 
-// Unsubscribe queues asset IDs for removal and triggers a reconnect.
+// Unsubscribe queues asset IDs for removal and pushes the change over the
+// live connection as an incremental operation:"unsubscribe" frame — verified
+// to stop the stream (2026-08-24) — no reconnect needed.
 func (pm *WSPolymarketMarket) Unsubscribe(ctx context.Context, assetIDs []string) {
 	pm.pendingMu.Lock()
 	for _, id := range assetIDs {
 		delete(pm.pendingSubscribeIDs, id)
 		pm.pendingUnsubscribeIDs[id] = struct{}{}
 	}
-	needsReconnect := len(pm.pendingUnsubscribeIDs) > 0
 	pm.pendingMu.Unlock()
 
-	if needsReconnect {
-		pm.Disconnect()
-	}
+	pm.flushPending(ctx)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -208,86 +211,83 @@ func (pm *WSPolymarketMarket) flushLoop(ctx context.Context) {
 }
 
 func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
-	pm.pendingMu.Lock()
-	subIDs := pm.pendingSubscribeIDs
-	unsubIDs := pm.pendingUnsubscribeIDs
-	pm.pendingSubscribeIDs = make(map[string]struct{})
-	pm.pendingUnsubscribeIDs = make(map[string]struct{})
-	pm.pendingMu.Unlock()
-
 	conn := pm.Conn()
 	if conn == nil {
-		pm.pendingMu.Lock()
-		for id := range subIDs {
-			pm.pendingSubscribeIDs[id] = struct{}{}
-		}
-		for id := range unsubIDs {
-			pm.pendingUnsubscribeIDs[id] = struct{}{}
-		}
-		pm.pendingMu.Unlock()
+		// Not connected — the pending set is applied by onConnect on the next
+		// reconnect.
 		return
 	}
 
-	flushUnsub := func(ids []string) {
-		msg := unsubscribeMessage{Operation: "unsubscribe", AssetsIDs: ids}
-		data, marshalErr := json.Marshal(msg)
-		if marshalErr != nil {
-			slog.Warn("market WS: failed to marshal unsubscribe", "err", marshalErr)
-			return
-		}
-		if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
-			slog.Warn("market WS: failed to send unsubscribe", "err", err)
-			pm.pendingMu.Lock()
-			for _, id := range ids {
-				pm.pendingUnsubscribeIDs[id] = struct{}{}
-			}
-			pm.pendingMu.Unlock()
-			return
-		}
-		pm.subMu.Lock()
-		for _, id := range ids {
-			delete(pm.subscribedAssetIDs, id)
-		}
-		pm.subMu.Unlock()
-	}
-
-	flushSub := func(ids []string) {
-		msg := subscribeMessage{Operation: "subscribe", AssetsIDs: ids}
-		data, marshalErr := json.Marshal(msg)
-		if marshalErr != nil {
-			slog.Warn("market WS: failed to marshal subscribe", "err", marshalErr)
-			return
-		}
-		if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
-			slog.Warn("market WS: failed to send subscribe", "err", err)
-			pm.pendingMu.Lock()
-			for _, id := range ids {
-				pm.pendingSubscribeIDs[id] = struct{}{}
-			}
-			pm.pendingMu.Unlock()
-			return
-		}
-		pm.subMu.Lock()
-		for _, id := range ids {
+	pm.subMu.Lock()
+	pm.pendingMu.Lock()
+	// Compute the diff against the currently-subscribed set and apply it
+	// locally, so the server only ever receives the changed assets.
+	var toAdd, toRemove []string
+	for id := range pm.pendingSubscribeIDs {
+		if _, ok := pm.subscribedAssetIDs[id]; !ok {
 			pm.subscribedAssetIDs[id] = struct{}{}
+			toAdd = append(toAdd, id)
 		}
-		pm.subMu.Unlock()
+	}
+	for id := range pm.pendingUnsubscribeIDs {
+		if _, ok := pm.subscribedAssetIDs[id]; ok {
+			delete(pm.subscribedAssetIDs, id)
+			toRemove = append(toRemove, id)
+		}
+	}
+	pm.pendingSubscribeIDs = make(map[string]struct{})
+	pm.pendingUnsubscribeIDs = make(map[string]struct{})
+	changed := len(toAdd) > 0 || len(toRemove) > 0
+	pm.pendingMu.Unlock()
+	pm.subMu.Unlock()
+
+	if !changed {
+		return
 	}
 
-	if len(unsubIDs) > 0 {
-		ids := make([]string, 0, len(unsubIDs))
-		for id := range unsubIDs {
-			ids = append(ids, id)
+	// Send the incremental operation frames over the live connection. The
+	// market channel REJECTS the handshake form {assets_ids,type,...} when it
+	// is re-sent over an established connection (plain-text "INVALID
+	// OPERATION", verified live 2026-08-24) — add/remove must use the
+	// operation frames. This avoids a reconnect on every market rotation.
+	var firstErr error
+	pm.writeMu.Lock()
+	defer pm.writeMu.Unlock()
+	if len(toAdd) > 0 {
+		if err := writeOp(ctx, conn, "subscribe", toAdd); err != nil && firstErr == nil {
+			firstErr = err
 		}
-		flushUnsub(ids)
 	}
-	if len(subIDs) > 0 {
-		ids := make([]string, 0, len(subIDs))
-		for id := range subIDs {
-			ids = append(ids, id)
+	if len(toRemove) > 0 {
+		if err := writeOp(ctx, conn, "unsubscribe", toRemove); err != nil && firstErr == nil {
+			firstErr = err
 		}
-		flushSub(ids)
 	}
+	if firstErr != nil {
+		slog.Warn("market WS: failed to send subscription update", "err", firstErr)
+		// Re-queue so the next flush (or reconnect, via onDisconnect) retries.
+		pm.pendingMu.Lock()
+		for _, id := range toAdd {
+			pm.pendingSubscribeIDs[id] = struct{}{}
+		}
+		for _, id := range toRemove {
+			pm.pendingUnsubscribeIDs[id] = struct{}{}
+		}
+		pm.pendingMu.Unlock()
+	}
+}
+
+// writeOp sends a single incremental subscribe/unsubscribe frame.
+func writeOp(ctx context.Context, conn *coderws.Conn, operation string, ids []string) error {
+	msg := struct {
+		Operation string   `json:"operation"`
+		AssetsIDs []string `json:"assets_ids"`
+	}{Operation: operation, AssetsIDs: ids}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	return conn.Write(ctx, coderws.MessageText, data)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -330,6 +330,8 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn)
 	if err != nil {
 		return err
 	}
+	pm.writeMu.Lock()
+	defer pm.writeMu.Unlock()
 	return conn.Write(ctx, coderws.MessageText, data)
 }
 
@@ -612,12 +614,25 @@ func (pm *WSPolymarketMarket) eventDispatcher(ctx context.Context) {
 
 // processMessage parses a raw WebSocket message and dispatches typed events.
 // Runs off the read-loop goroutine — safe to block on DispatchEvent.
+// truncateBytes returns a log-safe prefix of a raw message so protocol
+// anomalies (e.g. a plain-text server error) are visible in the log without
+// dumping large or binary frames.
+func truncateBytes(b []byte) string {
+	const max = 200
+	if len(b) <= max {
+		return string(b)
+	}
+	return string(b[:max]) + "..."
+}
+
 func (pm *WSPolymarketMarket) processMessage(data []byte) {
 	var raw []json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		var single json.RawMessage
 		if err2 := json.Unmarshal(data, &single); err2 != nil {
-			slog.Warn("market WS: failed to parse message", "err", err2)
+			slog.Warn("market WS: failed to parse message",
+				"err", err2,
+				"raw", truncateBytes(data))
 			return
 		}
 		raw = []json.RawMessage{single}
@@ -663,14 +678,4 @@ type subscriptionMessage struct {
 	AssetsIDs            []string `json:"assets_ids"`
 	Type                 string   `json:"type"`
 	CustomFeatureEnabled bool     `json:"custom_feature_enabled"`
-}
-
-type subscribeMessage struct {
-	Operation string   `json:"operation"`
-	AssetsIDs []string `json:"assets_ids"`
-}
-
-type unsubscribeMessage struct {
-	Operation string   `json:"operation"`
-	AssetsIDs []string `json:"assets_ids"`
 }
