@@ -198,6 +198,13 @@ func (b *BaseWebSocket) dialSync(ctx context.Context) error {
 	b.mu.Unlock()
 	b.setStatus(StatusConnected)
 
+	// Apply the configured message read limit before the read loop starts.
+	// coder/websocket's default (32KB) is too small for some exchange
+	// payloads and would force-close the connection with StatusMessageTooBig.
+	if b.opts.ReadLimit != 0 {
+		conn.SetReadLimit(b.opts.ReadLimit)
+	}
+
 	// Start keepalive pings.
 	b.startPingLoop(ctx, conn)
 

@@ -185,6 +185,10 @@ func (b *WSBinance) Start(ctx context.Context, reconnectIntervalMs int64) error 
 
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — Binance drops idle connections
+	// Depth diff frames (@depth@100ms) on liquid symbols routinely exceed
+	// coder/websocket's 32KB default read limit, which force-closes the
+	// connection with StatusMessageTooBig ("read limited at 32769 bytes").
+	opts.ReadLimit = 1 << 20 // 1 MiB per message
 	if reconnectIntervalMs > 0 {
 		opts.ReconnectInterval = reconnectIntervalMs
 	} else {

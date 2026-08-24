@@ -51,6 +51,13 @@ type WSOptions struct {
 	// PingInterval is how often to send a WebSocket-level ping keepalive.
 	// If zero, coder/websocket's default of 30s is used.
 	PingInterval int64 `json:"ping_interval_ms,omitempty"`
+
+	// ReadLimit is the max number of bytes to read for a single message.
+	// If zero, coder/websocket's default of 32768 bytes applies. Set to -1
+	// to disable the limit entirely. Raise this for exchanges that send
+	// large frames (e.g. Binance @depth@100ms diffs), which exceed 32KB and
+	// force-close the connection with StatusMessageTooBig.
+	ReadLimit int64 `json:"read_limit_bytes,omitempty"`
 }
 
 // DefaultWSOptions returns sensible defaults for a production WebSocket connection.
