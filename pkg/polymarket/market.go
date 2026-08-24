@@ -129,6 +129,10 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — server drops idle connections
+	// The market channel is event-driven (price_change / last_trade_price
+	// only) and can legitimately be quiet for >5s between updates, so it
+	// doesn't inherit the tight 5s streaming default for DataStaleTimeout.
+	opts.DataStaleTimeout = 30000
 	if reconnectIntervalMs > 0 {
 		opts.ReconnectInterval = reconnectIntervalMs
 	} else {
@@ -156,15 +160,14 @@ func (pm *WSPolymarketMarket) Stop() {
 	pm.clearSubscriptions()
 }
 
-// Subscribe queues asset IDs for subscription and pushes the change to the
-// server over the live connection — no reconnect needed. Additions are sent
-// as incremental operation:"subscribe" frames. The handshake form
-// {assets_ids,type,custom_feature_enabled} is NOT valid once a connection is
-// established — re-sending it gets a plain-text "INVALID OPERATION" (verified
-// live 2026-08-24) — so add/remove must use the operation frames. This
-// replaces the old forced-reconnect approach, which produced a "constant 3
-// disconnects per market" during rotation (each costing ~1s of market data +
-// a fresh chance to hit a real disconnect).
+// Subscribe queues asset IDs for subscription and pushes the full updated
+// asset set to the server over the live connection — no reconnect needed.
+// The market channel honors the handshake form {assets_ids, type,
+// custom_feature_enabled} as a full REPLACEMENT of the subscription set over
+// an established connection (verified live 2026-08-24). This replaces the old
+// forced-reconnect approach, which produced a "constant 3 disconnects per
+// market" during rotation (each costing ~1s of market data + a fresh chance
+// to hit a real disconnect).
 func (pm *WSPolymarketMarket) Subscribe(ctx context.Context, assetIDs []string) {
 	pm.subMu.Lock()
 	pm.pendingMu.Lock()
@@ -181,9 +184,10 @@ func (pm *WSPolymarketMarket) Subscribe(ctx context.Context, assetIDs []string) 
 	pm.flushPending(ctx)
 }
 
-// Unsubscribe queues asset IDs for removal and pushes the change over the
-// live connection as an incremental operation:"unsubscribe" frame — verified
-// to stop the stream (2026-08-24) — no reconnect needed.
+// Unsubscribe queues asset IDs for removal and pushes the full updated asset
+// set over the live connection. The incremental operation:"unsubscribe" frame
+// is NOT honored by the market channel (verified live 2026-08-24), so removal
+// relies on the full-set replace in flushPending.
 func (pm *WSPolymarketMarket) Unsubscribe(ctx context.Context, assetIDs []string) {
 	pm.pendingMu.Lock()
 	for _, id := range assetIDs {

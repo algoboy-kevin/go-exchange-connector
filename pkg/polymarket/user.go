@@ -77,6 +77,10 @@ func NewWSPolymarketUserWS(base *connector.Connector, auth UserAuth, handlers Us
 func (u *WSPolymarketUserWS) Start(ctx context.Context, wsURL string) error {
 	opts := ws.DefaultWSOptions()
 	opts.ReconnectInterval = defaultUserReconnectIntervalMs
+	// The user WS is event-driven (order/fill updates only) and can
+	// legitimately be quiet for >5s, so it doesn't inherit the tight 5s
+	// streaming default for DataStaleTimeout.
+	opts.DataStaleTimeout = 30000
 
 	// Start ping loop.
 	pingCtx, pingCancel := context.WithCancel(ctx)

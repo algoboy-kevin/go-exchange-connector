@@ -66,6 +66,12 @@ type BaseWebSocket struct {
 	status ConnectionStatus
 	cancel context.CancelFunc // cancels the entire WS goroutine tree
 	done   chan struct{}      // closed when all goroutines exit
+
+	// lastDataAt is the wall-clock time of the last DATA message received,
+	// used by the data-staleness watchdog. Empty text heartbeat frames are
+	// ignored so a server that only delivers keepalives is still caught.
+	lastDataMu sync.RWMutex
+	lastDataAt time.Time
 }
 
 // Connect establishes the WebSocket connection and starts the read loop and
@@ -87,6 +93,16 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 	if opts.ConnectionTimeout <= 0 {
 		opts.ConnectionTimeout = 5000 // 5s default
 	}
+	// PongTimeout is derived from the EFFECTIVE PingInterval (RTDS overrides
+	// it after taking the defaults), so a silent/half-open socket is declared
+	// unresponsive within ~one missed ping + one pong wait. If PingInterval is
+	// 0 the ping loop is disabled and PongTimeout is irrelevant.
+	if opts.PongTimeout <= 0 {
+		opts.PongTimeout = 2 * opts.PingInterval
+	}
+	if opts.DataStaleTimeout <= 0 {
+		opts.DataStaleTimeout = 5000 // 5s default
+	}
 	b.opts = opts
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -98,9 +114,16 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 		return err
 	}
 
-	// Start the read loop and reconnection watcher.
+	// Initialize the data-staleness clock so a freshly-connected socket isn't
+	// instantly considered stale (lastData() starts at the zero time, which
+	// would make time.Since(lastData) effectively infinite). Data messages
+	// refresh it; if none arrive within DataStaleTimeout the watchdog fires.
+	b.setLastData(time.Now())
+
+	// Start the read loop, reconnection watcher, and data-staleness watchdog.
 	go b.readLoop(ctx)
 	go b.reconnLoop(ctx)
+	go b.dataStaleWatchdog(ctx)
 
 	slog.Info("websocket: connected", "url", url)
 	return nil
@@ -128,12 +151,20 @@ func (b *BaseWebSocket) Close() {
 // Unlike Close(), this does not permanently terminate the WebSocket.
 func (b *BaseWebSocket) Disconnect() {
 	b.mu.Lock()
-	if b.conn != nil {
-		b.conn.Close(coderws.StatusGoingAway, "reconnect")
-		b.conn = nil
-	}
+	conn := b.conn
+	b.conn = nil
 	b.status = StatusDisconnected
 	b.mu.Unlock()
+
+	if conn != nil {
+		// CloseNow, not Close: coder/websocket's Close performs a close
+		// handshake and blocks up to ~10s waiting for the peer's close frame.
+		// Against a silent/half-open peer that would stall OnDisconnect and
+		// the reconnLoop — exactly the failure this self-heal is recovering
+		// from. CloseNow drops the connection immediately, unblocking the
+		// read loop.
+		conn.CloseNow()
+	}
 
 	// Fire OnDisconnect so subscriptions get re-queued.
 	b.safeCallOnDisconnect(nil)
@@ -303,6 +334,12 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 				}
 			}()
 		}
+		// Record data arrival for the staleness watchdog. Empty frames (some
+		// servers send empty text heartbeats, e.g. RTDS) are skipped so a
+		// socket that only delivers keepalives is still treated as stale.
+		if len(msg) > 0 {
+			b.setLastData(time.Now())
+		}
 	}
 }
 
@@ -383,9 +420,22 @@ func (b *BaseWebSocket) startPingLoop(ctx context.Context, conn *coderws.Conn) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := conn.Ping(ctx); err != nil {
-					// Connection died — ping loop exits naturally.
-					// A new one will start after reconnection.
+				// Per-ping deadline: coder/websocket's Ping waits on its ctx for
+				// a pong. Without a deadline this blocks forever on a dead/
+				// half-open socket, so the connection would never reconnect.
+				pingCtx, cancel := context.WithTimeout(ctx, time.Duration(b.opts.PongTimeout)*time.Millisecond)
+				err := conn.Ping(pingCtx)
+				cancel()
+				if err != nil {
+					// Peer didn't pong in time — unresponsive. Only act if this
+					// is still the ACTIVE connection: a stale loop left over from
+					// a pre-reconnect socket must not kill a newer connection
+					// installed by a concurrent dialSync (mirror the readLoop
+					// guard).
+					if b.Conn() == conn {
+						slog.Warn("websocket: pong timeout, forcing reconnect", "err", err)
+						b.Disconnect() // closes conn, fires OnDisconnect, reconnLoop redials
+					}
 					return
 				}
 			}
@@ -443,4 +493,48 @@ func (b *BaseWebSocket) safeCallOnError(err error) {
 			b.OnError(err)
 		}
 	}()
+}
+
+func (b *BaseWebSocket) setLastData(t time.Time) {
+	b.lastDataMu.Lock()
+	b.lastDataAt = t
+	b.lastDataMu.Unlock()
+}
+
+func (b *BaseWebSocket) lastData() time.Time {
+	b.lastDataMu.RLock()
+	defer b.lastDataMu.RUnlock()
+	return b.lastDataAt
+}
+
+// dataStaleWatchdog force-reconnects if no DATA message arrives within
+// opts.DataStaleTimeout, even while control frames (pings/pongs) still flow.
+// Guards against a server that keeps the socket alive but silently drops our
+// subscription. Exits when the root context is cancelled (shutdown).
+func (b *BaseWebSocket) dataStaleWatchdog(ctx context.Context) {
+	interval := time.Duration(b.opts.PingInterval) * time.Millisecond
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	timeout := time.Duration(b.opts.DataStaleTimeout) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if b.Status() != StatusConnected {
+				continue
+			}
+			if since := time.Since(b.lastData()); since >= timeout {
+				slog.Warn("websocket: no data, forcing reconnect", "age", since.String())
+				b.Disconnect()
+			}
+		}
+	}
 }

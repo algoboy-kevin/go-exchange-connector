@@ -52,6 +52,21 @@ type WSOptions struct {
 	// If zero, coder/websocket's default of 30s is used.
 	PingInterval int64 `json:"ping_interval_ms,omitempty"`
 
+	// PongTimeout is how long to wait for a pong after sending a ping before
+	// declaring the connection unresponsive and forcing a reconnect. A silent,
+	// half-open socket delivers no pong; without this the ping loop blocks
+	// forever (it waits on the root context) and a hung connection never
+	// reconnects. If zero, defaults to 2 * PingInterval at Connect time.
+	PongTimeout int64 `json:"pong_timeout_ms,omitempty"`
+
+	// DataStaleTimeout is how long without receiving any DATA message before
+	// the connection is declared stale and force-reconnected, even while
+	// control frames (pings/pongs) still flow. Catches a server that keeps the
+	// socket alive but silently drops our subscription. Empty heartbeat frames
+	// do not count as data. If zero, defaults to 5s at Connect time. Pick a
+	// value safely above the feed's expected cadence.
+	DataStaleTimeout int64 `json:"data_stale_timeout_ms,omitempty"`
+
 	// ReadLimit is the max number of bytes to read for a single message.
 	// If zero, coder/websocket's default of 32768 bytes applies. Set to -1
 	// to disable the limit entirely. Raise this for exchanges that send
