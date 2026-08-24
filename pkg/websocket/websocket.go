@@ -243,37 +243,51 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 	}
 	defer cleanup()
 
+	// Single choke point: every read-loop exit reports the disconnect via
+	// OnDisconnect — clean close, EOF, or unexpected error — except a
+	// deliberate shutdown (context cancelled via Close()) and stale loops
+	// (a newer connection already replaced us). This guarantees the
+	// exchange-level onDisconnect hook (status-change event, disconnect log,
+	// subscription re-queue) always fires when the connection drops.
+	var exitErr error
+	var shutdown bool
+	defer func() {
+		if shutdown {
+			return // deliberate Close() — no disconnect event
+		}
+		b.mu.RLock()
+		connIsCurrent := b.conn == conn
+		alreadyDisconnected := b.status == StatusDisconnected
+		b.mu.RUnlock()
+		if connIsCurrent && !alreadyDisconnected {
+			b.safeCallOnDisconnect(exitErr)
+		}
+	}()
+
 	for {
 		_, msg, err := conn.Read(ctx)
 		if err != nil {
 			// Context cancelled — clean shutdown requested via Close().
 			if ctx.Err() != nil {
+				shutdown = true
 				return
 			}
 
-			// Log close frame details.
+			// Log close frame details. 1001 (GoingAway) is sent by some
+			// exchanges (e.g. Polymarket's market WS) to close idle connections
+			// with no active subscriptions — expected and self-healed by the
+			// reconnLoop, so keep it quiet. Other codes are worth a Warn.
 			if code := coderws.CloseStatus(err); code != -1 {
-				slog.Warn("websocket: server closed connection",
-					"code", code, "reason", err.Error())
+				if code == coderws.StatusGoingAway {
+					slog.Debug("websocket: server closed connection (going away)",
+						"code", code, "reason", err.Error())
+				} else {
+					slog.Warn("websocket: server closed connection",
+						"code", code, "reason", err.Error())
+				}
 			}
 
-			// Check whether this readLoop is still the active one.
-			// If a reconnection already happened (b.conn was replaced),
-			// this goroutine is stale — exit without firing OnDisconnect
-			// to avoid wiping subscriptions on the active connection.
-			b.mu.RLock()
-			connIsCurrent := b.conn == conn
-			alreadyDisconnected := b.status == StatusDisconnected
-			b.mu.RUnlock()
-
-			if !connIsCurrent {
-				// Stale readLoop — a newer connection replaced us.
-				return
-			}
-
-			if !alreadyDisconnected {
-				b.safeCallOnDisconnect(err)
-			}
+			exitErr = err
 			return
 		}
 

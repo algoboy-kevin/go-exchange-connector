@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	connector "github.com/algoboy-kevin/go-exchange-connector"
@@ -62,6 +63,13 @@ type WSPolymarketRTDS struct {
 	eventCh          chan []byte
 	dispatcherCancel context.CancelFunc
 
+	// dispatcherWorkers is how many eventDispatcher goroutines drain eventCh.
+	// Multiple readers on the same channel are safe; each message is handled
+	// by exactly one worker. Default 4 — a single worker can be starved of
+	// CPU under load and silently fall behind.
+	dispatcherWorkers int
+	connectAttempts   atomic.Int64
+
 	onStatusChange func(ws.ConnectionStatus)
 }
 
@@ -100,10 +108,11 @@ func splitSubsKey(key string) (topic string, windowSeconds int) {
 // NewWSPolymarketRTDS creates a new RTDS WebSocket manager.
 func NewWSPolymarketRTDS(base *connector.Connector) *WSPolymarketRTDS {
 	r := &WSPolymarketRTDS{
-		BaseWebSocket: &ws.BaseWebSocket{},
-		base:          base,
-		subs:          make(map[string]*rtdsTopicState),
-		eventCh:       make(chan []byte, 8192),
+		BaseWebSocket:     &ws.BaseWebSocket{},
+		base:              base,
+		subs:              make(map[string]*rtdsTopicState),
+		eventCh:           make(chan []byte, 8192),
+		dispatcherWorkers: 4,
 	}
 
 	r.ShouldConnect = func() bool {
@@ -133,13 +142,25 @@ func (r *WSPolymarketRTDS) SetOnStatusChange(fn func(ws.ConnectionStatus)) {
 	r.onStatusChange = fn
 }
 
+// SetDispatcherWorkers configures how many eventDispatcher goroutines run.
+// Multiple readers on the same eventCh are safe; each message is handled by
+// exactly one worker. If n < 1 it is clamped to 1.
+func (r *WSPolymarketRTDS) SetDispatcherWorkers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	r.dispatcherWorkers = n
+}
+
 // Start sets up the event dispatcher and starts the (deferred) WebSocket
 // connection. The actual connection is made once the first subscription is
 // queued.
 func (r *WSPolymarketRTDS) Start(ctx context.Context, wsURL string, reconnectIntervalMs int64) error {
 	dispatchCtx, dispatchCancel := context.WithCancel(ctx)
 	r.dispatcherCancel = dispatchCancel
-	go r.eventDispatcher(dispatchCtx)
+	for i := 0; i < r.dispatcherWorkers; i++ {
+		go r.eventDispatcher(dispatchCtx)
+	}
 
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — server drops idle connections
@@ -450,6 +471,11 @@ func symbolFilterJSON(symbol string) string {
 // ─────────────────────────────────────────────────────────────
 
 func (r *WSPolymarketRTDS) onConnect(ctx context.Context, conn *coderws.Conn) error {
+	// attempt 1 = initial connect; >1 = reconnect after a drop. Makes the
+	// reconnect path observable (collector's feed-health monitor keys off it).
+	attempt := r.connectAttempts.Add(1)
+	slog.Info("rtds: connected", "attempt", attempt)
+
 	if r.onStatusChange != nil {
 		r.onStatusChange(ws.StatusConnected)
 	}

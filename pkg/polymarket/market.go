@@ -43,7 +43,9 @@ type WSPolymarketMarket struct {
 	dispatcherCancel  context.CancelFunc
 	dispatcherWorkers int
 
-	eventCount atomic.Int64
+	eventCount  atomic.Int64
+	dropped     atomic.Int64 // total dropped messages (eventCh full)
+	lastDropLog atomic.Int64 // unix ms of last rate-limited drop warning
 
 	onStatusChange func(ws.ConnectionStatus)
 
@@ -73,7 +75,7 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 		pendingSubscribeIDs:   make(map[string]struct{}),
 		pendingUnsubscribeIDs: make(map[string]struct{}),
 		pendingFlushInterval:  time.Duration(flushMs) * time.Millisecond,
-		eventCh:               make(chan []byte, 8192),
+		eventCh:               make(chan []byte, 16384),
 	}
 
 	pm.ShouldConnect = func() bool {
@@ -362,7 +364,14 @@ func (pm *WSPolymarketMarket) onMessage(ctx context.Context, data []byte) error 
 	case pm.eventCh <- data:
 		return nil
 	default:
-		slog.Warn("market WS: dropping message, event channel full")
+		// Queue full — the "slow consumer" precursor. Track a total and
+		// rate-limit the warning so a sustained overload doesn't spam logs.
+		pm.dropped.Add(1)
+		if now := time.Now().UnixMilli(); now-pm.lastDropLog.Load() >= 5000 {
+			pm.lastDropLog.Store(now)
+			slog.Warn("market WS: queue full, dropping messages",
+				"dropped_total", pm.dropped.Load())
+		}
 		return nil
 	}
 }
