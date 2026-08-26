@@ -133,6 +133,16 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 	// only) and can legitimately be quiet for >5s between updates, so it
 	// doesn't inherit the tight 5s streaming default for DataStaleTimeout.
 	opts.DataStaleTimeout = 30000
+	// …and even 30s is wrong for markets that simply have no trades: the
+	// channel emits price_change only when a market actually trades, so an
+	// illiquid btc-updown-5m window produces zero data for its whole 5m life
+	// (verified live 2026-08-26: an active market with a 0.5/0.51 quote had 0
+	// trades → 0 price_change events → the 30s staleness watchdog force-
+	// reconnected every 30s forever, and a clean reconnect + handshake still
+	// delivered nothing because the market wasn't trading). The ping/pong
+	// watchdog still catches genuinely dead sockets, so disable the staleness
+	// watchdog here.
+	opts.DisableDataStaleWatchdog = true
 	if reconnectIntervalMs > 0 {
 		opts.ReconnectInterval = reconnectIntervalMs
 	} else {

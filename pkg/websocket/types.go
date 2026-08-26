@@ -67,6 +67,16 @@ type WSOptions struct {
 	// value safely above the feed's expected cadence.
 	DataStaleTimeout int64 `json:"data_stale_timeout_ms,omitempty"`
 
+	// DisableDataStaleWatchdog turns off the data-staleness watchdog entirely.
+	// Use for event-driven channels where markets can legitimately be silent
+	// for extended periods (e.g. Polymarket's market channel emits price_change
+	// only when a market actually trades — a quiet, illiquid market produces no
+	// data for minutes, which the staleness watchdog would otherwise misread as
+	// a dead connection and force-reconnect every DataStaleTimeout, forever).
+	// Connection liveness is still guaranteed by the ping/pong watchdog, so a
+	// genuinely dead socket is still caught and reconnected.
+	DisableDataStaleWatchdog bool `json:"disable_data_stale_watchdog,omitempty"`
+
 	// ReadLimit is the max number of bytes to read for a single message.
 	// If zero, coder/websocket's default of 32768 bytes applies. Set to -1
 	// to disable the limit entirely. Raise this for exchanges that send

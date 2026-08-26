@@ -512,6 +512,14 @@ func (b *BaseWebSocket) lastData() time.Time {
 // Guards against a server that keeps the socket alive but silently drops our
 // subscription. Exits when the root context is cancelled (shutdown).
 func (b *BaseWebSocket) dataStaleWatchdog(ctx context.Context) {
+	// Event-driven channels can be legitimately silent (e.g. a market with no
+	// trades produces no price_change events). The ping/pong watchdog already
+	// catches genuinely dead sockets, so the staleness watchdog is only a
+	// heuristic for streaming feeds with a regular cadence — skip it entirely
+	// when the caller opts out.
+	if b.opts.DisableDataStaleWatchdog {
+		return
+	}
 	interval := time.Duration(b.opts.PingInterval) * time.Millisecond
 	if interval <= 0 {
 		interval = 15 * time.Second
