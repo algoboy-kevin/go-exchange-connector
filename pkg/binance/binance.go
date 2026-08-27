@@ -45,6 +45,8 @@ const (
 //   - aggTrade   — aggregated trades
 //   - depth      — full order book, maintained locally from the diff-depth
 //     stream (@depth@100ms) seeded by a REST snapshot
+//   - partial depth — top-N order-book snapshots (@depth20@100ms), a passive
+//     push from Binance with no local book state
 //   - kline      — OHLCV candles
 //
 // It mirrors the WSPolymarketRTDS pattern: subscriptions are re-sent on every
@@ -67,10 +69,27 @@ func streamClassOf(mkt MarketType, stream string) streamClass {
 	if mkt == MarketSpot {
 		return classSpot
 	}
-	if strings.HasSuffix(stream, "@bookTicker") || strings.HasSuffix(stream, "@depth@100ms") {
+	if strings.HasSuffix(stream, "@bookTicker") ||
+		strings.HasSuffix(stream, "@depth@100ms") ||
+		isPartialDepthStream(stream) {
 		return classPublic
 	}
 	return classMarket
+}
+
+// isPartialDepthStream reports whether s is a partial book depth stream
+// (e.g. "btcusdt@depth20@100ms"), as opposed to the diff-depth stream
+// ("btcusdt@depth@100ms"). Partial streams have "@depth<digits>@…".
+func isPartialDepthStream(s string) bool {
+	idx := strings.Index(s, "@depth")
+	if idx < 0 {
+		return false
+	}
+	after := s[idx+len("@depth"):]
+	if after == "" {
+		return false
+	}
+	return after[0] >= '0' && after[0] <= '9'
 }
 
 type WSBinance struct {
@@ -290,7 +309,36 @@ func (b *WSBinance) UnsubscribeDepth(ctx context.Context, mkt MarketType, symbol
 	}
 }
 
-// SubscribeKlines streams OHLCV candles for the given symbols at the given
+// SubscribePartialDepth streams top-N order-book snapshots for the given
+// symbols at the given update speed. levels must be one of Binance's
+// supported partial depth levels (5, 10 or 20); speed is "100ms", "500ms"
+// or "1000ms". Unlike SubscribeDepth, partial depth is a passive snapshot
+// pushed by Binance — no REST seeding and no locally-maintained book, so
+// memory cost is negligible (top-N only).
+func (b *WSBinance) SubscribePartialDepth(ctx context.Context, mkt MarketType, symbols []string, levels int, speed string) {
+	streams := make([]string, 0, len(symbols))
+	for _, s := range symbols {
+		if s = normalizeSymbol(s); s == "" {
+			continue
+		}
+		streams = append(streams, partialDepthStream(s, levels, speed))
+	}
+	b.subscribe(ctx, mkt, streams)
+}
+
+// UnsubscribePartialDepth stops the partial book depth stream for the given
+// symbols.
+func (b *WSBinance) UnsubscribePartialDepth(ctx context.Context, mkt MarketType, symbols []string, levels int, speed string) {
+	streams := make([]string, 0, len(symbols))
+	for _, s := range symbols {
+		if s = normalizeSymbol(s); s == "" {
+			continue
+		}
+		streams = append(streams, partialDepthStream(s, levels, speed))
+	}
+	b.unsubscribe(ctx, mkt, streams)
+}
+
 // interval (e.g. "1m", "15m", "1h"). Matching is case-insensitive.
 func (b *WSBinance) SubscribeKlines(ctx context.Context, mkt MarketType, symbols []string, interval string) {
 	streams := make([]string, 0, len(symbols))
@@ -418,6 +466,19 @@ func (c *binanceConn) isSubscribed(stream string) bool {
 	defer c.mu.RUnlock()
 	_, ok := c.streams[stream]
 	return ok
+}
+
+// subscribedPartialDepth returns the partial-depth stream name subscribed
+// for symbol (e.g. "btcusdt@depth20@100ms"), or "" if none.
+func (c *binanceConn) subscribedPartialDepth(symbol string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for s := range c.streams {
+		if strings.HasPrefix(s, symbol+"@depth") && isPartialDepthStream(s) {
+			return s
+		}
+	}
+	return ""
 }
 
 func (c *binanceConn) allStreams() []string {
@@ -766,6 +827,13 @@ func (b *WSBinance) handleDepth(c *binanceConn, data []byte) {
 		return
 	}
 	symbol := normalizeSymbol(upd.Symbol)
+
+	// Partial book depth frames (e.g. @depth20@100ms) are full top-N
+	// snapshots — dispatch directly, no local book / REST seeding.
+	if c.subscribedPartialDepth(symbol) != "" {
+		b.handlePartialDepth(c, &upd, symbol)
+		return
+	}
 	if !c.isSubscribed(streamFor(symbol, streamDepth)) {
 		return
 	}
@@ -810,6 +878,25 @@ func (b *WSBinance) handleDepth(c *binanceConn, data []byte) {
 		LastUpdateID: lastID,
 		Bids:         bids,
 		Asks:         asks,
+		Timestamp:    binanceEventTime(upd.EventTime, 0, b.base.Now()),
+	})
+}
+
+// handlePartialDepth dispatches a partial book depth snapshot. The payload
+// carries only the top-N levels, already sorted by Binance.
+func (b *WSBinance) handlePartialDepth(c *binanceConn, upd *binanceDepthUpdate, symbol string) {
+	bids := make(map[string]string)
+	asks := make(map[string]string)
+	applyLevels(bids, parseBinanceLevels(upd.BidsRaw))
+	applyLevels(asks, parseBinanceLevels(upd.AsksRaw))
+	b.base.DispatchEvent(&connector.BinanceDepthEvent{
+		SeqID:        b.base.NextSeqID(),
+		ReceivedAt:   b.base.Now(),
+		Symbol:       upd.Symbol,
+		Market:       string(c.mkt),
+		LastUpdateID: upd.FinalUpdateID,
+		Bids:         bookLevels(bids, false),
+		Asks:         bookLevels(asks, true),
 		Timestamp:    binanceEventTime(upd.EventTime, 0, b.base.Now()),
 	})
 }

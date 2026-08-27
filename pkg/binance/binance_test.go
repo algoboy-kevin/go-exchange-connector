@@ -38,6 +38,53 @@ func TestStreamNames(t *testing.T) {
 	}
 }
 
+func TestPartialDepthStream(t *testing.T) {
+	cases := map[string]string{
+		partialDepthStream("btcusdt", 20, "100ms"): "btcusdt@depth20@100ms",
+		partialDepthStream("btcusdt", 5, "1000ms"): "btcusdt@depth5@1000ms",
+		partialDepthStream("ethusdt", 10, "500ms"): "ethusdt@depth10@500ms",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Errorf("partialDepthStream = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestIsPartialDepthStream(t *testing.T) {
+	cases := map[string]bool{
+		"btcusdt@depth20@100ms": true,
+		"btcusdt@depth5@1000ms": true,
+		"btcusdt@depth@100ms":   false, // diff depth
+		"btcusdt@bookTicker":    false,
+		"btcusdt@aggTrade":      false,
+		"btcusdt@depth":         false,
+		"btcusdt@depth20":       true, // digit after @depth marks a partial stream
+		"btcusdt@kline_1m":      false,
+		"":                      false,
+	}
+	for in, want := range cases {
+		if got := isPartialDepthStream(in); got != want {
+			t.Errorf("isPartialDepthStream(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestStreamClassOfPartialDepth(t *testing.T) {
+	if got := streamClassOf(MarketPerp, "btcusdt@depth20@100ms"); got != classPublic {
+		t.Errorf("perp partial depth class = %q, want %q", got, classPublic)
+	}
+	if got := streamClassOf(MarketPerp, "btcusdt@depth@100ms"); got != classPublic {
+		t.Errorf("perp diff depth class = %q, want %q", got, classPublic)
+	}
+	if got := streamClassOf(MarketPerp, "btcusdt@aggTrade"); got != classMarket {
+		t.Errorf("perp aggTrade class = %q, want %q", got, classMarket)
+	}
+	if got := streamClassOf(MarketSpot, "btcusdt@depth20@100ms"); got != classSpot {
+		t.Errorf("spot partial depth class = %q, want %q", got, classSpot)
+	}
+}
+
 func TestBinanceSubscribeJSONShape(t *testing.T) {
 	req := binanceSubRequest{Method: binanceMethodSubscribe, Params: []string{"btcusdt@bookTicker", "btcusdt@aggTrade"}, ID: 7}
 	data, err := json.Marshal(req)
@@ -244,5 +291,54 @@ func TestBinanceDepthStaleUpdateIgnored(t *testing.T) {
 
 	if len(*got) != 0 {
 		t.Fatalf("expected no event for stale update, got %d", len(*got))
+	}
+}
+
+func TestBinanceHandlePartialDepth(t *testing.T) {
+	b, got := newTestBinance(t)
+	b.SubscribePartialDepth(context.Background(), MarketPerp, []string{"btcusdt"}, 20, "100ms")
+
+	// Partial depth frames carry "e":"depthUpdate" and a top-N snapshot
+	// (plus pu, which the parser ignores) — no local book involvement.
+	raw := `{"e":"depthUpdate","E":1628843331742,"s":"BTCUSDT","U":157,"u":157,"pu":157,"b":[["46000.00","1.500"],["45999.50","0.200"]],"a":[["46001.00","2.000"],["46001.50","0.100"]]}`
+	b.processMessage(b.connFor(MarketPerp, classPublic), []byte(raw))
+
+	if len(*got) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(*got))
+	}
+	ev, ok := (*got)[0].(*connector.BinanceDepthEvent)
+	if !ok {
+		t.Fatalf("expected *BinanceDepthEvent, got %T", (*got)[0])
+	}
+	if ev.Symbol != "BTCUSDT" || ev.Market != "perp" || ev.LastUpdateID != 157 {
+		t.Errorf("bad partial depth event: %+v", ev)
+	}
+	// Bids sorted descending (best first), asks ascending (best first).
+	if len(ev.Bids) != 2 || ev.Bids[0].Price != "46000.00" || ev.Bids[1].Price != "45999.50" {
+		t.Errorf("bad partial depth bids: %+v", ev.Bids)
+	}
+	if len(ev.Asks) != 2 || ev.Asks[0].Price != "46001.00" || ev.Asks[1].Price != "46001.50" {
+		t.Errorf("bad partial depth asks: %+v", ev.Asks)
+	}
+	if !ev.Timestamp.Equal(time.UnixMilli(1628843331742)) || ev.SeqID <= 0 || ev.ReceivedAt.IsZero() {
+		t.Errorf("bad time/seq fields: ts=%v seq=%d", ev.Timestamp, ev.SeqID)
+	}
+}
+
+func TestBinanceSubscribedPartialDepth(t *testing.T) {
+	b, _ := newTestBinance(t)
+	b.SubscribePartialDepth(context.Background(), MarketPerp, []string{"btcusdt"}, 20, "100ms")
+	c := b.connFor(MarketPerp, classPublic)
+
+	if got := c.subscribedPartialDepth("btcusdt"); got != "btcusdt@depth20@100ms" {
+		t.Errorf("subscribedPartialDepth(btcusdt) = %q, want btcusdt@depth20@100ms", got)
+	}
+	if got := c.subscribedPartialDepth("ethusdt"); got != "" {
+		t.Errorf("subscribedPartialDepth(ethusdt) = %q, want empty", got)
+	}
+
+	b.UnsubscribePartialDepth(context.Background(), MarketPerp, []string{"btcusdt"}, 20, "100ms")
+	if got := c.subscribedPartialDepth("btcusdt"); got != "" {
+		t.Errorf("after unsubscribe subscribedPartialDepth(btcusdt) = %q, want empty", got)
 	}
 }

@@ -58,6 +58,13 @@ func klineStream(symbol, interval string) string {
 	return symbol + "@kline_" + interval
 }
 
+// partialDepthStream builds a partial book depth stream name, e.g.
+// "btcusdt@depth20@100ms". levels is one of Binance's supported partial
+// depth levels (5, 10 or 20); speed is "100ms", "500ms" or "1000ms".
+func partialDepthStream(symbol string, levels int, speed string) string {
+	return fmt.Sprintf("%s@depth%d@%s", symbol, levels, speed)
+}
+
 // streamType is the kind of Binance data stream.
 type streamType string
 
