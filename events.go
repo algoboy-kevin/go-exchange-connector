@@ -165,23 +165,25 @@ type BinanceDepthEvent struct {
 }
 
 // BinanceKlineEvent is an OHLCV candle from Binance's kline stream (spot +
-// perpetual). IsFinal marks a closed candle.
+// perpetual). Every kline update for the in-progress candle is dispatched
+// (~1/s); IsFinal marks the last update, i.e. the closed candle.
 type BinanceKlineEvent struct {
 	SeqID       int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt  time.Time `json:"received_at"` // local arrival timestamp
 	Symbol      string    `json:"symbol"`      // e.g. "BTCUSDT"
 	Market      string    `json:"market"`      // "spot" or "perp"
-	Interval    string    `json:"interval"`    // e.g. "1m", "15m", "1h"
-	Open        string    `json:"open"`
-	High        string    `json:"high"`
-	Low         string    `json:"low"`
-	Close       string    `json:"close"`
-	Volume      string    `json:"volume"`
+	Interval    string    `json:"interval"`    // "1m", "5m", "15m", "1h", "4h", "1d"
+	OpenTime    time.Time `json:"open_time"`   // kline open time (exchange)
+	CloseTime   time.Time `json:"close_time"`  // kline close time (exchange)
+	Open        string    `json:"open"`        // decimal string
+	High        string    `json:"high"`        // decimal string
+	Low         string    `json:"low"`         // decimal string
+	Close       string    `json:"close"`       // decimal string
+	Volume      string    `json:"volume"`      // base asset volume, decimal string
 	QuoteVolume string    `json:"quote_volume"`
-	IsFinal     bool      `json:"is_final"`
-	OpenTime    time.Time `json:"open_time"`
-	CloseTime   time.Time `json:"close_time"`
-	Timestamp   time.Time `json:"timestamp"` // exchange event time
+	TradeCount  int64     `json:"trade_count"` // number of trades in the kline
+	IsFinal     bool      `json:"is_final"`    // Binance "x": candle closed
+	Timestamp   time.Time `json:"timestamp"`   // exchange event time
 }
 
 // MarketResolvedEvent notifies that a prediction market has been resolved.

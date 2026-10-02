@@ -126,6 +126,57 @@ Notes:
 - Equity streams may require access/market-hours; updates mark
   `IsCarriedForward` when the market is closed.
 
+### Gamma series discovery (Polymarket)
+
+Discover the currently open and future events of a recurring market series
+(Gamma "series", e.g. `btc-up-or-down-daily` or `btc-multi-strikes-weekly`)
+without synthesizing market slugs. A ladder event holds one market per strike,
+labelled by `GammaMarket.GroupItemTitle`.
+
+```go
+conn := polymarket.New(false, polymarket.Config{}, nil)
+ctx := context.Background()
+
+// slug → series (cached for 1h; InvalidateSeries(slug) forces a refetch).
+series, err := conn.GetSeries(ctx, "btc-up-or-down-daily")
+// series[0].ID = "41", series[0].Recurrence = connector.RecurrenceDaily
+
+// Open + future events of that series, each with its nested markets.
+openOnly := false
+events, err := conn.ListSeriesEvents(ctx, connector.EventQuery{
+    SeriesID:  series[0].ID,
+    Closed:    &openOnly, // nil = server default (all events)
+    Limit:     50,        // default 100, max 500; paginated internally
+    Order:     "endDate",
+    Ascending: true,
+})
+for _, ev := range events {
+    fmt.Printf("%s settles %s (%d markets)\n", ev.Slug, ev.EndDate, len(ev.Markets))
+    for _, m := range ev.Markets {
+        outcomes, _ := m.OutcomeList()   // ["Yes", "No"]
+        tokens, _ := m.TokenIDList()     // index-aligned with outcomes
+        fmt.Printf("  strike=%s yes=%s\n", m.GroupItemTitle, tokens[0])
+    }
+}
+
+// One event (with nested markets) by slug/ticker.
+ev, err := conn.GetEvent(ctx, "bitcoin-above-on-october-3-2026")
+```
+
+Notes:
+- `outcomes` and `clobTokenIds` arrive as JSON-encoded **strings**; use
+  `GammaMarket.OutcomeList()` / `TokenIDList()` (index 0 = YES, 1 = NO).
+- `ListSeriesEvents` is live state and is never cached; `GetSeries` is cached
+  (`InvalidateSeries` to bust it). Duplicate events across pages are dropped
+  and a short page ends the walk.
+- Gamma requires a `User-Agent` header (403 without one) — the shared Gamma
+  client sets `go-exchange-connector/<version>` on every request.
+- Non-2xx responses surface as `*polymarket.GammaHTTPError` (status + URL);
+  a slug that matches nothing yields an empty result and a nil error.
+- `GetMarket` now also exposes `GroupItemTitle`, `NegRisk`, `NegRiskMarketID`,
+  `EventSlug`/`EventTicker`, `Description` (the machine-readable resolution
+  rule) and `StartDate`/`EndDate`.
+
 ### Binance market data streams (spot + perpetual)
 
 Stream live market data directly from Binance — spot (`stream.binance.com`)
@@ -157,7 +208,11 @@ defer bn.Stop()
 bn.SubscribeBookTicker(ctx, binance.MarketSpot, []string{"btcusdt", "ethusdt"})
 bn.SubscribeTrades(ctx, binance.MarketSpot, []string{"btcusdt"})
 bn.SubscribeDepth(ctx, binance.MarketPerp, []string{"btcusdt"})
-bn.SubscribeKlines(ctx, binance.MarketPerp, []string{"btcusdt"}, "1m")
+// Klines validate the interval ("1m", "5m", "15m", "1h", "4h", "1d") and
+// reject anything else instead of putting it in the stream name.
+if err := bn.SubscribeKlines(ctx, binance.MarketPerp, []string{"btcusdt"}, "5m"); err != nil {
+    log.Fatal(err)
+}
 ```
 
 Notes:
@@ -170,6 +225,11 @@ Notes:
   `Asks` ascending.
 - Spot `bookTicker` frames carry no event-type field — the manager detects
   them by shape; the dispatched event carries payload casing (e.g. `BTCUSDT`).
+- Klines are delivered for **every** update (~1/s per candle), not only the
+  closed one: `BinanceKlineEvent.IsFinal` marks the closing update, and
+  `TradeCount`/`Volume`/`QuoteVolume` are decimal strings (no float precision
+  loss). `OpenTime` sits on the interval grid; `CloseTime - OpenTime` is the
+  interval minus 1 ms.
 - Smoke test: `go run ./cmd/test_binance -spot btcusdt -perp btcusdt -trades -depth -kline 1m -duration 12s`.
 
 ## Architecture

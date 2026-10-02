@@ -38,6 +38,131 @@ func TestStreamNames(t *testing.T) {
 	}
 }
 
+func TestBuildKlineStreams(t *testing.T) {
+	// Every interval on the allow-list is accepted.
+	for _, interval := range klineIntervals {
+		streams, err := buildKlineStreams([]string{"BTCUSDT"}, interval)
+		if err != nil {
+			t.Fatalf("buildKlineStreams(%q): %v", interval, err)
+		}
+		if want := "btcusdt@kline_" + interval; len(streams) != 1 || streams[0] != want {
+			t.Errorf("buildKlineStreams(%q) = %v, want [%s]", interval, streams, want)
+		}
+	}
+
+	// Unsupported intervals are rejected, never passed through to the URL.
+	for _, interval := range []string{"7m", "", "2h", "1M", "5", "atm"} {
+		streams, err := buildKlineStreams([]string{"btcusdt"}, interval)
+		if err == nil {
+			t.Errorf("buildKlineStreams(%q) = %v, want error", interval, streams)
+		}
+	}
+
+	// Surrounding whitespace is trimmed, not embedded in the stream name.
+	streams, err := buildKlineStreams([]string{"btcusdt"}, " 5m ")
+	if err != nil {
+		t.Fatalf("buildKlineStreams(\" 5m \"): %v", err)
+	}
+	if len(streams) != 1 || streams[0] != "btcusdt@kline_5m" {
+		t.Errorf("streams = %v, want [btcusdt@kline_5m]", streams)
+	}
+
+	// Blank symbols are skipped, not turned into "@kline_5m".
+	streams, err = buildKlineStreams([]string{"", "  ", "ethusdt"}, "5m")
+	if err != nil {
+		t.Fatalf("buildKlineStreams: %v", err)
+	}
+	if len(streams) != 1 || streams[0] != "ethusdt@kline_5m" {
+		t.Errorf("streams = %v, want [ethusdt@kline_5m]", streams)
+	}
+}
+
+func TestSubscribeKlinesValidation(t *testing.T) {
+	b, got := newTestBinance(t)
+
+	// Invalid interval → error and no subscription.
+	if err := b.SubscribeKlines(context.Background(), MarketSpot, []string{"btcusdt"}, "7m"); err == nil {
+		t.Error("SubscribeKlines(\"7m\") = nil error, want error")
+	}
+	if streams := b.connFor(MarketSpot, classSpot).allStreams(); len(streams) != 0 {
+		t.Errorf("streams after rejected subscribe = %v, want none", streams)
+	}
+
+	// Invalid market → error.
+	if err := b.SubscribeKlines(context.Background(), MarketType("futures"), []string{"btcusdt"}, "5m"); err == nil {
+		t.Error("SubscribeKlines(invalid market) = nil error, want error")
+	}
+
+	// Valid interval → stream registered on the spot connection.
+	if err := b.SubscribeKlines(context.Background(), MarketSpot, []string{"BTCUSDT"}, "5m"); err != nil {
+		t.Fatalf("SubscribeKlines: %v", err)
+	}
+	streams := b.connFor(MarketSpot, classSpot).allStreams()
+	if len(streams) != 1 || streams[0] != "btcusdt@kline_5m" {
+		t.Errorf("streams = %v, want [btcusdt@kline_5m]", streams)
+	}
+
+	// Unsubscribe removes it again and rejects bad intervals the same way.
+	if err := b.UnsubscribeKlines(context.Background(), MarketSpot, []string{"btcusdt"}, "7m"); err == nil {
+		t.Error("UnsubscribeKlines(\"7m\") = nil error, want error")
+	}
+	if err := b.UnsubscribeKlines(context.Background(), MarketSpot, []string{"btcusdt"}, "5m"); err != nil {
+		t.Fatalf("UnsubscribeKlines: %v", err)
+	}
+	if streams := b.connFor(MarketSpot, classSpot).allStreams(); len(streams) != 0 {
+		t.Errorf("streams after unsubscribe = %v, want none", streams)
+	}
+
+	if len(*got) != 0 {
+		t.Errorf("dispatched %d events for a subscribe/unsubscribe-only test", len(*got))
+	}
+}
+
+func TestBinanceParseKlineDeliversNonFinalUpdates(t *testing.T) {
+	b, got := newTestBinance(t)
+	if err := b.SubscribeKlines(context.Background(), MarketPerp, []string{"btcusdt"}, "5m"); err != nil {
+		t.Fatalf("SubscribeKlines: %v", err)
+	}
+
+	// Two updates for the same 5m candle: an interim one (x=false) and the
+	// closing one (x=true). Both must be dispatched; the consumer filters.
+	interim := `{"e":"kline","E":1787380868016,"s":"BTCUSDT","k":{"t":1787380800000,"T":1787381099999,"s":"BTCUSDT","i":"5m","f":1,"L":2,"o":"77500.00","c":"77539.56","h":"77568.87","l":"77490.00","v":"2.89566000","n":42,"x":false,"q":"224590.84","V":"1.51","Q":"117873.71","B":"0"}}`
+	final := `{"e":"kline","E":1787381100000,"s":"BTCUSDT","k":{"t":1787380800000,"T":1787381099999,"s":"BTCUSDT","i":"5m","f":1,"L":9,"o":"77500.00","c":"77600.00","h":"77610.00","l":"77490.00","v":"9.50000000","n":899,"x":true,"q":"735000.00","V":"4.00","Q":"310000.00","B":"0"}}`
+
+	c := b.connFor(MarketPerp, classMarket)
+	b.processMessage(c, []byte(interim))
+	b.processMessage(c, []byte(final))
+
+	if len(*got) != 2 {
+		t.Fatalf("expected 2 events (interim + final), got %d", len(*got))
+	}
+
+	first, ok := (*got)[0].(*connector.BinanceKlineEvent)
+	if !ok {
+		t.Fatalf("expected *BinanceKlineEvent, got %T", (*got)[0])
+	}
+	if first.IsFinal || first.TradeCount != 42 || first.Interval != "5m" || first.Market != "perp" {
+		t.Errorf("bad interim kline: %+v", first)
+	}
+
+	second := (*got)[1].(*connector.BinanceKlineEvent)
+	if !second.IsFinal || second.TradeCount != 899 {
+		t.Errorf("bad final kline: %+v", second)
+	}
+	if !second.OpenTime.Equal(time.UnixMilli(1787380800000)) ||
+		!second.CloseTime.Equal(time.UnixMilli(1787381099999)) {
+		t.Errorf("bad 5m grid: open=%v close=%v", second.OpenTime, second.CloseTime)
+	}
+	if got := second.CloseTime.Sub(second.OpenTime); got != 5*time.Minute-time.Millisecond {
+		t.Errorf("CloseTime-OpenTime = %v, want 5m0s-1ms", got)
+	}
+
+	// SeqIDs stay monotonic across the shared Binance counter.
+	if second.SeqID <= first.SeqID {
+		t.Errorf("SeqID not increasing: %d then %d", first.SeqID, second.SeqID)
+	}
+}
+
 func TestPartialDepthStream(t *testing.T) {
 	cases := map[string]string{
 		partialDepthStream("btcusdt", 20, "100ms"): "btcusdt@depth20@100ms",
@@ -206,7 +331,8 @@ func TestBinanceParseKline(t *testing.T) {
 	if ev.Symbol != "BTCUSDT" || ev.Market != "spot" || ev.Interval != "1m" ||
 		ev.Open != "77560.64000000" || ev.Close != "77539.56000000" ||
 		ev.High != "77568.87000000" || ev.Low != "77539.56000000" ||
-		ev.Volume != "2.89566000" || ev.QuoteVolume != "224590.84896810" || ev.IsFinal {
+		ev.Volume != "2.89566000" || ev.QuoteVolume != "224590.84896810" ||
+		ev.TradeCount != 899 || ev.IsFinal {
 		t.Errorf("bad kline: %+v", ev)
 	}
 	if !ev.OpenTime.Equal(time.UnixMilli(1787380860000)) || !ev.CloseTime.Equal(time.UnixMilli(1787380919999)) {

@@ -1,16 +1,43 @@
 package polymarket
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	connector "github.com/algoboy-kevin/go-exchange-connector"
 )
 
 const defaultGammaAPIURL = "https://gamma-api.polymarket.com"
+
+// gammaUserAgent identifies this client to Gamma. A User-Agent header is
+// mandatory on the series/event endpoints — Gamma answers 403 Forbidden
+// without one — so every request sent through doJSON sets it.
+var gammaUserAgent = "go-exchange-connector/" + connector.Version
+
+// GammaHTTPError is a non-2xx response from the Gamma API. It carries the
+// status code and the request URL so callers can distinguish "not found" from
+// rate limiting or server errors without parsing the message.
+type GammaHTTPError struct {
+	StatusCode int
+	URL        string
+	Body       string // truncated response body, for diagnostics
+}
+
+func (e *GammaHTTPError) Error() string {
+	if e.Body != "" {
+		return fmt.Sprintf("gamma: %s returned %d: %s", e.URL, e.StatusCode, e.Body)
+	}
+	return fmt.Sprintf("gamma: %s returned %d", e.URL, e.StatusCode)
+}
+
+// IsNotFound reports whether the error is a 404 from the Gamma API.
+func (e *GammaHTTPError) IsNotFound() bool { return e.StatusCode == http.StatusNotFound }
 
 // GammaClient handles Polymarket Gamma API requests for market metadata.
 type GammaClient struct {
@@ -45,14 +72,22 @@ func (g *GammaClient) ToConnectorMarket(gm *GammaMarket) *connector.Market {
 		return nil
 	}
 	m := &connector.Market{
-		ID:          gm.ID,
-		Slug:        gm.Slug,
-		Question:    gm.Question,
-		ConditionID: gm.ConditionID,
-		YesAssetID:  gm.YesTokenID,
-		NoAssetID:   gm.NoTokenID,
-		Outcomes:    gm.Outcomes,
-		TickSize:    gm.TickSize,
+		ID:              gm.ID,
+		Slug:            gm.Slug,
+		Question:        gm.Question,
+		ConditionID:     gm.ConditionID,
+		YesAssetID:      gm.YesTokenID,
+		NoAssetID:       gm.NoTokenID,
+		Outcomes:        gm.Outcomes,
+		TickSize:        gm.TickSize,
+		GroupItemTitle:  gm.GroupItemTitle,
+		NegRisk:         gm.NegRisk,
+		NegRiskMarketID: gm.NegRiskMarketID,
+		EventSlug:       gm.EventSlug,
+		EventTicker:     gm.EventTicker,
+		Description:     gm.Description,
+		StartDate:       gm.StartDate,
+		EndDate:         gm.EndDate,
 	}
 	if gm.Resolution != nil {
 		m.IsResolved = true
@@ -65,6 +100,41 @@ func (g *GammaClient) ToConnectorMarket(gm *GammaMarket) *connector.Market {
 // ─────────────────────────────────────────────────────────────
 // Internal
 // ─────────────────────────────────────────────────────────────
+
+// doJSON performs a GET against the Gamma API and decodes the JSON response
+// into out. Every request carries a User-Agent (required — Gamma returns 403
+// without one) and honours ctx cancellation. Non-2xx responses are returned
+// as *GammaHTTPError.
+func (g *GammaClient) doJSON(ctx context.Context, rawURL string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return fmt.Errorf("gamma: build request: %w", err)
+	}
+	req.Header.Set("User-Agent", gammaUserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	slog.Debug("gamma: querying", "url", rawURL)
+
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("gamma: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return &GammaHTTPError{
+			StatusCode: resp.StatusCode,
+			URL:        rawURL,
+			Body:       strings.TrimSpace(string(body)),
+		}
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("gamma: decode %s: %w", rawURL, err)
+	}
+	return nil
+}
 
 type fetchParams struct {
 	ID   string
@@ -82,21 +152,9 @@ func (g *GammaClient) fetch(params fetchParams) (*GammaMarket, error) {
 		return nil, fmt.Errorf("gamma: must provide id or slug")
 	}
 
-	slog.Debug("gamma: querying", "url", query)
-
-	resp, err := g.http.Get(query)
-	if err != nil {
-		return nil, fmt.Errorf("gamma: request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gamma: %s returned %d", query, resp.StatusCode)
-	}
-
 	var raw RawGammaMarket
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("gamma: decode: %w", err)
+	if err := g.doJSON(context.Background(), query, &raw); err != nil {
+		return nil, err
 	}
 
 	return normalizeGammaMarket(&raw), nil
@@ -138,19 +196,33 @@ func normalizeGammaMarket(raw *RawGammaMarket) *GammaMarket {
 		negRisk = *raw.NegRisk
 	}
 
+	// GroupItemTitle is the strike label for ladder markets (e.g. "80,000").
+	// The enclosing event is referenced by a nested events array; a ladder
+	// event's markets all share it, which is how rungs are grouped.
+	eventSlug, eventTicker := "", ""
+	if len(raw.Events) > 0 {
+		eventSlug = raw.Events[0].Slug
+		eventTicker = raw.Events[0].Ticker
+	}
+
 	return &GammaMarket{
-		ID:          raw.ID,
-		ConditionID: raw.ConditionID,
-		Slug:        raw.Slug,
-		Question:    raw.Question,
-		Outcomes:    outcomes,
-		YesTokenID:  yesID,
-		NoTokenID:   noID,
-		TickSize:    raw.TickSize,
-		NegRisk:     negRisk,
-		Resolution:  resolution,
-		StartDate:   startDate,
-		EndDate:     endDate,
+		ID:              raw.ID,
+		ConditionID:     raw.ConditionID,
+		Slug:            raw.Slug,
+		Question:        raw.Question,
+		GroupItemTitle:  raw.GroupItemTitle,
+		Description:     raw.Description,
+		Outcomes:        outcomes,
+		YesTokenID:      yesID,
+		NoTokenID:       noID,
+		TickSize:        raw.TickSize,
+		NegRisk:         negRisk,
+		NegRiskMarketID: raw.NegRiskMarketID,
+		EventSlug:       eventSlug,
+		EventTicker:     eventTicker,
+		Resolution:      resolution,
+		StartDate:       startDate,
+		EndDate:         endDate,
 	}
 }
 

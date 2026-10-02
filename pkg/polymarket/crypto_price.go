@@ -132,6 +132,12 @@ func (c *CryptoPriceClient) Fetch(req connector.CryptoPriceRequest) (*connector.
 // ─────────────────────────────────────────────────────────────
 
 // variantDuration maps a price-history variant to its window duration.
+//
+// The allow-list is deliberately strict: the upstream price-history API is
+// lenient about unknown variants and silently falls back to a default candle
+// granularity (e.g. variant=4h and variant=hourly both return 60s points,
+// daily returns 300s), so a typo produces silently wrong data instead of an
+// error.
 func variantDuration(variant string) (time.Duration, error) {
 	switch variant {
 	case "fiveminute":
@@ -140,8 +146,12 @@ func variantDuration(variant string) (time.Duration, error) {
 		return 15 * time.Minute, nil
 	case "hourly":
 		return time.Hour, nil
+	case "4h":
+		return 4 * time.Hour, nil
 	case "daily":
 		return 24 * time.Hour, nil
+	case "weekly":
+		return 7 * 24 * time.Hour, nil
 	default:
 		return 0, fmt.Errorf("price-history: unknown variant %q", variant)
 	}

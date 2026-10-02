@@ -339,28 +339,38 @@ func (b *WSBinance) UnsubscribePartialDepth(ctx context.Context, mkt MarketType,
 	b.unsubscribe(ctx, mkt, streams)
 }
 
-// interval (e.g. "1m", "15m", "1h"). Matching is case-insensitive.
-func (b *WSBinance) SubscribeKlines(ctx context.Context, mkt MarketType, symbols []string, interval string) {
-	streams := make([]string, 0, len(symbols))
-	for _, s := range symbols {
-		if s = normalizeSymbol(s); s == "" {
-			continue
-		}
-		streams = append(streams, klineStream(s, interval))
+// SubscribeKlines streams kline/candlestick updates for the given symbols at
+// the given interval. interval must be one of "1m", "5m", "15m", "1h", "4h",
+// "1d" and is matched exactly (Binance stream names are lowercase); anything
+// else returns an error and subscribes to nothing.
+//
+// Binance pushes an update for the in-progress candle about once a second and
+// flags the last one with IsFinal when the candle closes. Every update is
+// dispatched; consumers filter on BinanceKlineEvent.IsFinal.
+func (b *WSBinance) SubscribeKlines(ctx context.Context, mkt MarketType, symbols []string, interval string) error {
+	streams, err := buildKlineStreams(symbols, interval)
+	if err != nil {
+		return err
+	}
+	if !mkt.valid() {
+		return fmt.Errorf("binance: invalid market type %q", mkt)
 	}
 	b.subscribe(ctx, mkt, streams)
+	return nil
 }
 
 // UnsubscribeKlines stops the kline stream for the given symbols/interval.
-func (b *WSBinance) UnsubscribeKlines(ctx context.Context, mkt MarketType, symbols []string, interval string) {
-	streams := make([]string, 0, len(symbols))
-	for _, s := range symbols {
-		if s = normalizeSymbol(s); s == "" {
-			continue
-		}
-		streams = append(streams, klineStream(s, interval))
+// The interval is validated the same way as SubscribeKlines.
+func (b *WSBinance) UnsubscribeKlines(ctx context.Context, mkt MarketType, symbols []string, interval string) error {
+	streams, err := buildKlineStreams(symbols, interval)
+	if err != nil {
+		return err
+	}
+	if !mkt.valid() {
+		return fmt.Errorf("binance: invalid market type %q", mkt)
 	}
 	b.unsubscribe(ctx, mkt, streams)
+	return nil
 }
 
 // subscribe adds streams to their class's connection and sends a SUBSCRIBE
@@ -795,15 +805,16 @@ func (b *WSBinance) handleKline(c *binanceConn, data []byte) {
 		Symbol:      ev.Symbol,
 		Market:      string(c.mkt),
 		Interval:    ev.Kline.Interval,
+		OpenTime:    time.UnixMilli(ev.Kline.OpenTime),
+		CloseTime:   time.UnixMilli(ev.Kline.CloseTime),
 		Open:        ev.Kline.Open,
 		High:        ev.Kline.High,
 		Low:         ev.Kline.Low,
 		Close:       ev.Kline.Close,
 		Volume:      ev.Kline.Volume,
 		QuoteVolume: ev.Kline.QuoteVolume,
+		TradeCount:  ev.Kline.TradeNum,
 		IsFinal:     ev.Kline.IsFinal,
-		OpenTime:    time.UnixMilli(ev.Kline.OpenTime),
-		CloseTime:   time.UnixMilli(ev.Kline.CloseTime),
 		Timestamp:   binanceEventTime(ev.EventTime, 0, b.base.Now()),
 	})
 }

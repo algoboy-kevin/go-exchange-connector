@@ -48,6 +48,10 @@ type PolymarketConnector struct {
 	market *WSPolymarketMarket
 	user   *WSPolymarketUserWS
 	rtds   *WSPolymarketRTDS
+
+	// series caches Gamma series lookups by slug (see series.go). Zero value
+	// is usable; guarded internally by a mutex.
+	series seriesCache
 }
 
 // New creates a new PolymarketConnector.

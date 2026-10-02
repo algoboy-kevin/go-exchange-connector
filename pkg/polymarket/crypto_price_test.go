@@ -31,8 +31,10 @@ func TestWindowFromMarket(t *testing.T) {
 		{"fiveminute", "fiveminute", "2026-08-21T11:40:00Z", "2026-08-21T11:35:00Z", false},
 		{"fifteen", "fifteen", "2026-08-21T11:45:00Z", "2026-08-21T11:30:00Z", false},
 		{"hourly", "hourly", "2026-08-21T11:00:00Z", "2026-08-21T10:00:00Z", false},
+		{"4h", "4h", "2026-08-21T12:00:00Z", "2026-08-21T08:00:00Z", false},
 		{"daily", "daily", "2026-08-21T00:00:00Z", "2026-08-20T00:00:00Z", false},
-		{"unknown variant", "weekly", "2026-08-21T11:40:00Z", "", true},
+		{"weekly", "weekly", "2026-10-03T16:00:00Z", "2026-09-26T16:00:00Z", false},
+		{"unknown variant", "biweekly", "2026-08-21T11:40:00Z", "", true},
 		{"nil market", "fiveminute", "", "", true},
 	}
 

@@ -53,9 +53,44 @@ func streamFor(symbol string, st streamType) string {
 }
 
 // klineStream builds a kline stream for an explicit interval, e.g.
-// "btcusdt@kline_15m".
+// "btcusdt@kline_15m". interval must be validated first (see
+// buildKlineStreams) — it is embedded in the stream name verbatim.
 func klineStream(symbol, interval string) string {
 	return symbol + "@kline_" + interval
+}
+
+// klineIntervals is the allow-list of kline intervals accepted by
+// SubscribeKlines / UnsubscribeKlines.
+var klineIntervals = []string{"1m", "5m", "15m", "1h", "4h", "1d"}
+
+// validKlineInterval reports whether interval is on the allow-list.
+func validKlineInterval(interval string) bool {
+	for _, v := range klineIntervals {
+		if v == interval {
+			return true
+		}
+	}
+	return false
+}
+
+// buildKlineStreams builds the kline stream names for the given symbols and
+// interval. Unsupported intervals are rejected here rather than passed
+// through to the subscription URL unchecked.
+func buildKlineStreams(symbols []string, interval string) ([]string, error) {
+	interval = strings.TrimSpace(interval)
+	if !validKlineInterval(interval) {
+		return nil, fmt.Errorf("binance: unsupported kline interval %q (supported: %s)",
+			interval, strings.Join(klineIntervals, ", "))
+	}
+
+	streams := make([]string, 0, len(symbols))
+	for _, s := range symbols {
+		if s = normalizeSymbol(s); s == "" {
+			continue
+		}
+		streams = append(streams, klineStream(s, interval))
+	}
+	return streams, nil
 }
 
 // partialDepthStream builds a partial book depth stream name, e.g.

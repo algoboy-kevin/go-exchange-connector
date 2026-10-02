@@ -38,6 +38,29 @@ type Market struct {
 	TickSize    float64     `json:"tick_size"`
 	IsResolved  bool        `json:"is_resolved"`
 	Resolution  *Resolution `json:"resolution,omitempty"`
+
+	// ── Optional Gamma metadata (populated for Polymarket markets) ──
+	//
+	// These describe where a market sits inside its event. Ladder events
+	// (e.g. "BTC above $74,000 … $94,000") hold one market per strike; the
+	// strike label is GroupItemTitle and EventSlug groups the rungs.
+
+	// GroupItemTitle is the strike/range label, e.g. "80,000".
+	GroupItemTitle string `json:"group_item_title,omitempty"`
+	// NegRisk is true when the market uses the neg-risk collateral adapter.
+	NegRisk bool `json:"neg_risk,omitempty"`
+	// NegRiskMarketID is the neg-risk group id (empty for non-neg-risk markets).
+	NegRiskMarketID string `json:"neg_risk_market_id,omitempty"`
+	// EventSlug / EventTicker identify the enclosing event.
+	EventSlug   string `json:"event_slug,omitempty"`
+	EventTicker string `json:"event_ticker,omitempty"`
+	// Description carries the machine-readable resolution rule
+	// (settlement anchor + source) when the exchange publishes one.
+	Description string `json:"description,omitempty"`
+	// StartDate/EndDate are the trading window open / close. EndDate is the
+	// settle instant for the recurring crypto families. Zero when unknown.
+	StartDate time.Time `json:"start_date,omitempty"`
+	EndDate   time.Time `json:"end_date,omitempty"`
 }
 
 // Resolution is the final outcome of a prediction market.

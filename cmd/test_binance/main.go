@@ -102,7 +102,10 @@ func main() {
 			bn.SubscribeDepth(ctx, binance.MarketSpot, spot)
 		}
 		if *klineFlag != "" {
-			bn.SubscribeKlines(ctx, binance.MarketSpot, spot, *klineFlag)
+			if err := bn.SubscribeKlines(ctx, binance.MarketSpot, spot, *klineFlag); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
 	if len(perp) > 0 {
@@ -114,7 +117,10 @@ func main() {
 			bn.SubscribeDepth(ctx, binance.MarketPerp, perp)
 		}
 		if *klineFlag != "" {
-			bn.SubscribeKlines(ctx, binance.MarketPerp, perp, *klineFlag)
+			if err := bn.SubscribeKlines(ctx, binance.MarketPerp, perp, *klineFlag); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
 	fmt.Printf("🟢 subscribed spot=%v perp=%v trades=%v depth=%v kline=%s (streaming for %s)\n",

@@ -168,22 +168,47 @@ type GammaMarket struct {
 	Resolution  *string   // "YES", "NO", or nil if unresolved
 	StartDate   time.Time // market start (used for crypto window derivation)
 	EndDate     time.Time // market resolution/end time (used for crypto window derivation)
+
+	// ── Event / ladder metadata (populated when Gamma returns it) ──
+
+	// GroupItemTitle is the strike label of a ladder rung, e.g. "80,000".
+	GroupItemTitle string
+	// Description carries the machine-readable resolution rule.
+	Description string
+	// NegRiskMarketID is the neg-risk group id ("" for non-neg-risk markets).
+	NegRiskMarketID string
+	// EventSlug / EventTicker identify the enclosing event; every market of a
+	// ladder event shares them, which groups the rungs.
+	EventSlug   string
+	EventTicker string
 }
 
 // RawGammaMarket is the raw JSON shape from the Gamma API.
 type RawGammaMarket struct {
-	ID            string  `json:"id"`
-	ConditionID   string  `json:"conditionId"`
-	Slug          string  `json:"slug"`
-	Question      string  `json:"question"`
-	Outcomes      string  `json:"outcomes"`      // JSON string: ["Up", "Down"]
-	OutcomePrices string  `json:"outcomePrices"` // JSON string: ["0.505", "0.495"]
-	ClobTokenIDs  string  `json:"clobTokenIds"`  // JSON string: ["<yesId>", "<noId>"]
-	Closed        bool    `json:"closed"`
-	TickSize      float64 `json:"orderPriceMinTickSize"`
-	NegRisk       *bool   `json:"negRisk"` // nullable — some markets omit it
-	StartDate     string  `json:"startDate"`
-	EndDate       string  `json:"endDate"`
+	ID              string             `json:"id"`
+	ConditionID     string             `json:"conditionId"`
+	Slug            string             `json:"slug"`
+	Question        string             `json:"question"`
+	GroupItemTitle  string             `json:"groupItemTitle"` // strike label for ladder markets
+	Description     string             `json:"description"`    // machine-readable resolution rule
+	Outcomes        string             `json:"outcomes"`       // JSON string: ["Up", "Down"]
+	OutcomePrices   string             `json:"outcomePrices"`  // JSON string: ["0.505", "0.495"]
+	ClobTokenIDs    string             `json:"clobTokenIds"`   // JSON string: ["<yesId>", "<noId>"]
+	Closed          bool               `json:"closed"`
+	TickSize        float64            `json:"orderPriceMinTickSize"`
+	NegRisk         *bool              `json:"negRisk"`         // nullable — some markets omit it
+	NegRiskMarketID string             `json:"negRiskMarketID"` // nullable
+	Events          []RawGammaEventRef `json:"events"`          // enclosing events (may be absent)
+	StartDate       string             `json:"startDate"`
+	EndDate         string             `json:"endDate"`
+}
+
+// RawGammaEventRef is the subset of an embedded Gamma event used to identify
+// the event a market belongs to.
+type RawGammaEventRef struct {
+	ID     string `json:"id"`
+	Slug   string `json:"slug"`
+	Ticker string `json:"ticker"`
 }
 
 // ─────────────────────────────────────────────────────────────
