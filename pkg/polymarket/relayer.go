@@ -186,7 +186,6 @@ func NewRelayerClient(apiKey, apiKeyAddr string) *RelayerClient {
 	}
 }
 
- 
 var maxUint256 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
 
 // ─────────────────────────────────────────────────────────────
