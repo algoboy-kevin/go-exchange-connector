@@ -70,6 +70,10 @@ type WSPolymarketRTDS struct {
 	dispatcherWorkers int
 	connectAttempts   atomic.Int64
 
+	// readLimit caps a single inbound message; resolved from
+	// Config.ReadLimitBytes (0 → 1 MiB default).
+	readLimit int64
+
 	onStatusChange func(ws.ConnectionStatus)
 }
 
@@ -113,6 +117,7 @@ func NewWSPolymarketRTDS(base *connector.Connector) *WSPolymarketRTDS {
 		subs:              make(map[string]*rtdsTopicState),
 		eventCh:           make(chan []byte, 8192),
 		dispatcherWorkers: 4,
+		readLimit:         defaultReadLimitBytes,
 	}
 
 	r.ShouldConnect = func() bool {
@@ -162,6 +167,19 @@ func (r *WSPolymarketRTDS) Start(ctx context.Context, wsURL string, reconnectInt
 		go r.eventDispatcher(dispatchCtx)
 	}
 
+	return r.Connect(ctx, wsURL, r.wsOptions(reconnectIntervalMs))
+}
+
+// SetReadLimitBytes overrides the per-message WebSocket read limit. Zero
+// selects the 1 MiB default; a negative value disables the limit entirely.
+// Call before Start.
+func (r *WSPolymarketRTDS) SetReadLimitBytes(n int64) {
+	r.readLimit = resolveReadLimit(n)
+}
+
+// wsOptions builds the connection options for the RTDS channel. Kept separate
+// from Start so the transport settings can be asserted without a live socket.
+func (r *WSPolymarketRTDS) wsOptions(reconnectIntervalMs int64) ws.WSOptions {
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — server drops idle connections
 	if reconnectIntervalMs > 0 {
@@ -169,8 +187,8 @@ func (r *WSPolymarketRTDS) Start(ctx context.Context, wsURL string, reconnectInt
 	} else {
 		opts.ReconnectInterval = defaultReconnectIntervalMs
 	}
-
-	return r.Connect(ctx, wsURL, opts)
+	opts.ReadLimit = r.readLimit
+	return opts
 }
 
 // Stop shuts down the WebSocket, stops the dispatcher, and clears state.

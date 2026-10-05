@@ -34,6 +34,10 @@ type WSPolymarketUserWS struct {
 	pendingSubscribeMarketIDs   map[string]struct{}
 	pendingUnsubscribeMarketIDs map[string]struct{}
 
+	// readLimit caps a single inbound message; resolved from
+	// Config.ReadLimitBytes (0 → 1 MiB default).
+	readLimit int64
+
 	pingCancel context.CancelFunc
 }
 
@@ -56,6 +60,7 @@ func NewWSPolymarketUserWS(base *connector.Connector, auth UserAuth, handlers Us
 		subscribedMarketIDs:         make(map[string]struct{}),
 		pendingSubscribeMarketIDs:   make(map[string]struct{}),
 		pendingUnsubscribeMarketIDs: make(map[string]struct{}),
+		readLimit:                   defaultReadLimitBytes,
 	}
 
 	u.ShouldConnect = func() bool { return true }
@@ -75,19 +80,32 @@ func NewWSPolymarketUserWS(base *connector.Connector, auth UserAuth, handlers Us
 
 // Start connects to the user WS. Starts a periodic ping loop.
 func (u *WSPolymarketUserWS) Start(ctx context.Context, wsURL string) error {
+	// Start ping loop.
+	pingCtx, pingCancel := context.WithCancel(ctx)
+	u.pingCancel = pingCancel
+	go u.pingLoop(pingCtx)
+
+	return u.Connect(ctx, wsURL, u.wsOptions())
+}
+
+// SetReadLimitBytes overrides the per-message WebSocket read limit. Zero
+// selects the 1 MiB default; a negative value disables the limit entirely.
+// Call before Start.
+func (u *WSPolymarketUserWS) SetReadLimitBytes(n int64) {
+	u.readLimit = resolveReadLimit(n)
+}
+
+// wsOptions builds the connection options for the user channel. Kept separate
+// from Start so the transport settings can be asserted without a live socket.
+func (u *WSPolymarketUserWS) wsOptions() ws.WSOptions {
 	opts := ws.DefaultWSOptions()
 	opts.ReconnectInterval = defaultUserReconnectIntervalMs
 	// The user WS is event-driven (order/fill updates only) and can
 	// legitimately be quiet for >5s, so it doesn't inherit the tight 5s
 	// streaming default for DataStaleTimeout.
 	opts.DataStaleTimeout = 30000
-
-	// Start ping loop.
-	pingCtx, pingCancel := context.WithCancel(ctx)
-	u.pingCancel = pingCancel
-	go u.pingLoop(pingCtx)
-
-	return u.Connect(ctx, wsURL, opts)
+	opts.ReadLimit = u.readLimit
+	return opts
 }
 
 // Stop shuts down the WebSocket and ping loop.

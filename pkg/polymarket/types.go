@@ -230,6 +230,18 @@ type Config struct {
 	DispatcherWorkers   int    `yaml:"dispatcher_workers,omitempty"`
 	LatencyLogEnabled   bool   `yaml:"latency_log_enabled,omitempty"`
 
+	// ReadLimitBytes caps a single WebSocket message on the market, user, and
+	// RTDS channels. Zero selects the 1 MiB default; a negative value disables
+	// the limit entirely.
+	//
+	// The market channel delivers full-depth book snapshots, which routinely
+	// exceed coder/websocket's 32 KiB default. An oversized frame fails the
+	// read, which closes the socket, which re-subscribes, which pulls the same
+	// oversized snapshot — a drop/reconnect loop that loses exactly the
+	// deepest, most liquid books. Binance and Hyperliquid already raise the
+	// limit to 1 MiB for the same reason.
+	ReadLimitBytes int64 `yaml:"read_limit_bytes,omitempty"`
+
 	// CLOB API settings (LIVE mode).
 	ClobURL           string `yaml:"clob_url,omitempty"`
 	ClobOwnerUUID     string `yaml:"clob_owner_uuid"`
@@ -246,4 +258,19 @@ type Config struct {
 	RelayerAPIKey     string `yaml:"relayer_api_key,omitempty"`         // Relayer API key from polymarket.com/settings
 	RelayerAPIKeyAddr string `yaml:"relayer_api_key_address,omitempty"` // Address that owns the relayer key
 	RelayerURL        string `yaml:"relayer_url,omitempty"`             // Relayer URL (default: https://relayer-v2.polymarket.com)
+}
+
+// defaultReadLimitBytes is the per-message WebSocket read limit applied when
+// Config.ReadLimitBytes is zero. It matches what the Binance and Hyperliquid
+// stream managers already use.
+const defaultReadLimitBytes = 1 << 20 // 1 MiB
+
+// resolveReadLimit maps the Config.ReadLimitBytes convention onto
+// websocket.WSOptions.ReadLimit: zero selects the default, a negative value
+// disables the limit.
+func resolveReadLimit(v int64) int64 {
+	if v == 0 {
+		return defaultReadLimitBytes
+	}
+	return v
 }

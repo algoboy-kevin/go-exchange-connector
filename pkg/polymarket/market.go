@@ -53,6 +53,10 @@ type WSPolymarketMarket struct {
 	latencyCancel     context.CancelFunc
 	latencyLogEnabled bool
 
+	// readLimit caps a single inbound message; resolved from
+	// Config.ReadLimitBytes (0 → 1 MiB default).
+	readLimit int64
+
 	writeMu sync.Mutex // serializes WS writes (onConnect + flushPending)
 }
 
@@ -78,6 +82,7 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 		pendingUnsubscribeIDs: make(map[string]struct{}),
 		pendingFlushInterval:  time.Duration(flushMs) * time.Millisecond,
 		eventCh:               make(chan []byte, 16384),
+		readLimit:             resolveReadLimit(cfg.ReadLimitBytes),
 	}
 
 	pm.ShouldConnect = func() bool {
@@ -127,6 +132,13 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 		go pm.latencyLogger(latencyCtx)
 	}
 
+	return pm.Connect(ctx, wsURL, pm.wsOptions(reconnectIntervalMs))
+}
+
+// wsOptions builds the connection options for the market channel. Kept
+// separate from Start so the transport settings can be asserted without a live
+// socket.
+func (pm *WSPolymarketMarket) wsOptions(reconnectIntervalMs int64) ws.WSOptions {
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — server drops idle connections
 	// The market channel is event-driven (price_change / last_trade_price
@@ -148,8 +160,12 @@ func (pm *WSPolymarketMarket) Start(ctx context.Context, wsURL string, reconnect
 	} else {
 		opts.ReconnectInterval = defaultReconnectIntervalMs
 	}
-
-	return pm.Connect(ctx, wsURL, opts)
+	// A full-depth book snapshot routinely exceeds coder/websocket's 32 KiB
+	// default; an oversized frame fails the read and closes the socket, and the
+	// reconnect re-pulls the same snapshot — a drop/reconnect loop that loses
+	// exactly the deepest, most liquid books.
+	opts.ReadLimit = pm.readLimit
+	return opts
 }
 
 // Stop shuts down the WebSocket, stops all timers, and clears state.

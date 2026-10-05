@@ -126,6 +126,7 @@ func New(isLive bool, cfg Config, now func() time.Time) *PolymarketConnector {
 		gamma:     gamma,
 		rtds:      NewWSPolymarketRTDS(base),
 	}
+	pc.rtds.SetReadLimitBytes(cfg.ReadLimitBytes)
 
 	if now != nil {
 		pc.Connector.Now = now
@@ -173,6 +174,7 @@ func (p *PolymarketConnector) Start(ctx context.Context) error {
 		}
 
 		p.user = NewWSPolymarketUserWS(p.Connector, auth, UserHandlers{})
+		p.user.SetReadLimitBytes(p.cfg.ReadLimitBytes)
 		if err := p.user.Start(ctx, userURL); err != nil {
 			slog.Warn("polymarket: user WS failed to start (continuing)", "err", err)
 		}
