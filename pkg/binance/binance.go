@@ -103,6 +103,11 @@ type WSBinance struct {
 	books   map[MarketType]map[string]*binanceBook
 
 	onStatusChange func(MarketType, ws.ConnectionStatus)
+
+	// onDisconnectHook receives the error that ended a connection (nil for a
+	// deliberate Disconnect()), tagged with the market whose connection
+	// dropped. See SetOnDisconnect.
+	onDisconnectHook func(MarketType, error)
 }
 
 // binanceConn is one class's WebSocket connection plus its local stream
@@ -179,6 +184,17 @@ func newBinanceConn(owner *WSBinance, mkt MarketType, class streamClass) *binanc
 // connection's status changes.
 func (b *WSBinance) SetOnStatusChange(fn func(MarketType, ws.ConnectionStatus)) {
 	b.onStatusChange = fn
+}
+
+// SetOnDisconnect registers a callback that receives the error which ended a
+// connection, or nil for a deliberate Disconnect(), tagged with the market
+// whose connection dropped. Unlike SetOnStatusChange it carries WHY the
+// connection dropped: the peer's close frame reason is in the error message and
+// its code is available via websocket.CloseStatus. Note that MarketPerp uses two
+// connections (market + public classes), so this can fire once per class. Set it
+// before Start.
+func (b *WSBinance) SetOnDisconnect(fn func(MarketType, error)) {
+	b.onDisconnectHook = fn
 }
 
 // SetDispatcher routes events dispatched by the connector (BinanceBookTickerEvent,
@@ -577,6 +593,9 @@ func (c *binanceConn) onDisconnect(err error) {
 drained:
 	c.owner.resetDepthBooks(c.mkt)
 
+	if fn := c.owner.onDisconnectHook; fn != nil {
+		fn(c.mkt, err)
+	}
 	if c.owner.onStatusChange != nil {
 		c.owner.onStatusChange(c.mkt, ws.StatusDisconnected)
 	}

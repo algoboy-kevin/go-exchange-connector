@@ -49,6 +49,10 @@ type WSPolymarketMarket struct {
 
 	onStatusChange func(ws.ConnectionStatus)
 
+	// onDisconnectHook receives the error that ended the connection (nil for a
+	// deliberate Disconnect()). See SetOnDisconnect.
+	onDisconnectHook func(err error)
+
 	latencyTracker    latencyTracker
 	latencyCancel     context.CancelFunc
 	latencyLogEnabled bool
@@ -65,6 +69,16 @@ type WSPolymarketMarket struct {
 // duration, or triggering reconnection logic.
 func (pm *WSPolymarketMarket) SetOnStatusChange(fn func(ws.ConnectionStatus)) {
 	pm.onStatusChange = fn
+}
+
+// SetOnDisconnect registers a callback that receives the error which ended the
+// connection, or nil for a deliberate Disconnect(). Unlike SetOnStatusChange it
+// carries WHY the connection dropped: the peer's close frame reason is in the
+// error message and its code is available via websocket.CloseStatus — e.g. a
+// 1001 GoingAway for a server-side idle close, or the venue's policy-close
+// reason for a refused subscription. Set it before Start.
+func (pm *WSPolymarketMarket) SetOnDisconnect(fn func(err error)) {
+	pm.onDisconnectHook = fn
 }
 
 // NewWSPolymarketMarket creates a new market WebSocket manager.
@@ -386,6 +400,9 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 		slog.Info("market WS: disconnected", "reason", err)
 	}
 
+	if pm.onDisconnectHook != nil {
+		pm.onDisconnectHook(err)
+	}
 	if pm.onStatusChange != nil {
 		pm.onStatusChange(ws.StatusDisconnected)
 	}

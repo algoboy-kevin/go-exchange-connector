@@ -75,6 +75,10 @@ type WSPolymarketRTDS struct {
 	readLimit int64
 
 	onStatusChange func(ws.ConnectionStatus)
+
+	// onDisconnectHook receives the error that ended the connection (nil for a
+	// deliberate Disconnect()). See SetOnDisconnect.
+	onDisconnectHook func(err error)
 }
 
 // rtdsTopicState holds the locally-subscribed symbols for one RTDS topic.
@@ -145,6 +149,16 @@ func NewWSPolymarketRTDS(base *connector.Connector) *WSPolymarketRTDS {
 // connection status changes.
 func (r *WSPolymarketRTDS) SetOnStatusChange(fn func(ws.ConnectionStatus)) {
 	r.onStatusChange = fn
+}
+
+// SetOnDisconnect registers a callback that receives the error which ended the
+// connection, or nil for a deliberate Disconnect(). Unlike SetOnStatusChange it
+// carries WHY the connection dropped: the peer's close frame reason is in the
+// error message and its code is available via websocket.CloseStatus — e.g. the
+// 1013 slow-consumer kick an overloaded RTDS connection gets. Set it before
+// Start.
+func (r *WSPolymarketRTDS) SetOnDisconnect(fn func(err error)) {
+	r.onDisconnectHook = fn
 }
 
 // SetDispatcherWorkers configures how many eventDispatcher goroutines run.
@@ -561,6 +575,9 @@ func (r *WSPolymarketRTDS) onDisconnect(err error) {
 		slog.Info("rtds: disconnected", "reason", err)
 	}
 
+	if r.onDisconnectHook != nil {
+		r.onDisconnectHook(err)
+	}
 	if r.onStatusChange != nil {
 		r.onStatusChange(ws.StatusDisconnected)
 	}

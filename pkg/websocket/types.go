@@ -44,6 +44,20 @@ type WSOptions struct {
 	// ReconnectInterval. Default: 30s.
 	ReconnectMaxInterval int64 `json:"reconnect_max_interval_ms,omitempty"`
 
+	// MinStableConnectionMs is how long a connection must survive before it
+	// counts as a successful reconnect that resets the backoff to
+	// ReconnectInterval. A venue that accepts the handshake and then closes the
+	// socket immediately — a refused subscription, a per-IP connection cap, a
+	// policy close — produces a "successful" dial every cycle, which would
+	// reset the backoff and turn the reconnect loop into a hot storm that
+	// spends the venue's new-connection budget and deepens the rejection it is
+	// reacting to. Connections shorter than this escalate the backoff instead.
+	// Default: 5s. Negative disables the check (every successful dial resets
+	// the backoff, the pre-0.7.2 behaviour). Keep the default well below any
+	// venue idle-close interval so a server that closes idle sockets on a fixed
+	// cadence is not mistaken for a flapping one.
+	MinStableConnectionMs int64 `json:"min_stable_connection_ms,omitempty"`
+
 	// ConnectionTimeout is how long to wait for the initial dial to succeed.
 	// Default: 30s.
 	ConnectionTimeout int64 `json:"connection_timeout_ms,omitempty"`

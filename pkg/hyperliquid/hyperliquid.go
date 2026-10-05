@@ -141,6 +141,10 @@ type WSHyperliquid struct {
 	conn *hlConn
 
 	onStatusChange func(ws.ConnectionStatus)
+
+	// onDisconnectHook receives the error that ended the connection (nil for a
+	// deliberate Disconnect()). See SetOnDisconnect.
+	onDisconnectHook func(err error)
 }
 
 // New creates a stream manager over a connector base, using DefaultOptions.
@@ -185,6 +189,17 @@ func (h *WSHyperliquid) SetDispatcher(d func(any)) {
 // change (connected / disconnected).
 func (h *WSHyperliquid) SetOnStatusChange(fn func(ws.ConnectionStatus)) {
 	h.onStatusChange = fn
+}
+
+// SetOnDisconnect registers a callback that receives the error which ended the
+// connection, or nil for a deliberate Disconnect(). Unlike SetOnStatusChange it
+// carries WHY the connection dropped: the peer's close frame reason is in the
+// error message and its code is available via websocket.CloseStatus. That is
+// the difference between "the socket blipped" and "the venue refused us" —
+// e.g. "Cannot open more than 15 connections." for a per-IP connection cap,
+// which is otherwise only visible in a log line. Set it before Start.
+func (h *WSHyperliquid) SetOnDisconnect(fn func(err error)) {
+	h.onDisconnectHook = fn
 }
 
 // SetRawFrameHandler registers a callback invoked for every frame exactly as it
@@ -617,6 +632,9 @@ func (c *hlConn) onDisconnect(err error) {
 		slog.Info("hyperliquid: disconnected", "reason", err)
 	} else {
 		slog.Info("hyperliquid: disconnected")
+	}
+	if fn := c.owner.onDisconnectHook; fn != nil {
+		fn(err)
 	}
 	if fn := c.owner.onStatusChange; fn != nil {
 		fn(ws.StatusDisconnected)

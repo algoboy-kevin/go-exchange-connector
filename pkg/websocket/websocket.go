@@ -43,7 +43,10 @@ type BaseWebSocket struct {
 	OnMessage func(ctx context.Context, data []byte) error
 
 	// OnDisconnect is called when the connection drops (read error or
-	// clean close). Use it to re-queue active subscriptions.
+	// clean close). Use it to re-queue active subscriptions. err carries the
+	// read error — for a peer close frame the code is available via CloseStatus
+	// and the reason is in the message — and is nil for a deliberate
+	// Disconnect().
 	OnDisconnect func(err error)
 
 	// OnError is called for non-fatal errors (handler panics, bad data).
@@ -72,7 +75,20 @@ type BaseWebSocket struct {
 	// ignored so a server that only delivers keepalives is still caught.
 	lastDataMu sync.RWMutex
 	lastDataAt time.Time
+
+	// connEstablishedAt is when the current connection became usable (set by
+	// dialSync once the dial and the OnConnect hook both succeeded). When the
+	// connection drops, reconnLoop compares the connection's lifetime against
+	// MinStableConnectionMs to decide whether it was a success or a flap (see
+	// nextDelayAfterDrop). The zero time means no connection has been
+	// established since the last drop was accounted for.
+	connEstablishedAt time.Time
 }
+
+// defaultMinStableConnectionMs is the stability window used when
+// WSOptions.MinStableConnectionMs is zero: a connection must stay up at least
+// this long before it counts as a successful reconnect that resets the backoff.
+const defaultMinStableConnectionMs = 5000
 
 // Connect establishes the WebSocket connection and starts the read loop and
 // reconnection watcher. It blocks until the initial dial succeeds or fails.
@@ -102,6 +118,9 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 	}
 	if opts.DataStaleTimeout <= 0 {
 		opts.DataStaleTimeout = 5000 // 5s default
+	}
+	if opts.MinStableConnectionMs == 0 {
+		opts.MinStableConnectionMs = defaultMinStableConnectionMs
 	}
 	b.opts = opts
 
@@ -247,6 +266,10 @@ func (b *BaseWebSocket) dialSync(ctx context.Context) error {
 			return err
 		}
 	}
+
+	// Record when this connection became usable. reconnLoop measures the
+	// connection's lifetime against MinStableConnectionMs when it drops.
+	b.setConnEstablishedAt(time.Now())
 	return nil
 }
 
@@ -352,25 +375,51 @@ func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
 
 	baseDelay := time.Duration(b.opts.ReconnectInterval) * time.Millisecond
 	maxDelay := time.Duration(b.opts.ReconnectMaxInterval) * time.Millisecond
+	minStable := time.Duration(b.opts.MinStableConnectionMs) * time.Millisecond
 	delay := baseDelay
 
 	for {
-		// Wait the current backoff delay before (re)connecting. While
-		// connected this idles at the base interval and keeps the backoff
-		// reset, so the next disconnect starts fresh from ReconnectInterval.
+		// While connected, poll at the base interval so a drop is redialled
+		// promptly. The backoff state itself is not reset here — it is decided
+		// below, from how long the connection actually lived.
+		wait := delay
+		if b.Status() == StatusConnected {
+			wait = baseDelay
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(delay):
+		case <-time.After(wait):
 		}
 
 		if b.Status() == StatusConnected {
-			delay = baseDelay
 			continue
 		}
 
 		if !b.shouldConnect() {
 			continue
+		}
+
+		// The previous connection has dropped. Whether that counts as a success
+		// (reset the backoff) or a flap (escalate it) is decided from the
+		// connection's lifetime — never from the mere fact that the dial
+		// succeeded.
+		if established := b.establishedAt(); !established.IsZero() {
+			b.setConnEstablishedAt(time.Time{})
+			lived := time.Since(established)
+			var flapped bool
+			delay, flapped = nextDelayAfterDrop(delay, baseDelay, maxDelay, minStable, lived)
+			if flapped {
+				slog.Warn("websocket: connection flapping, backing off",
+					"url", b.url,
+					"lived", lived.Round(time.Millisecond).String(),
+					"next_backoff", delay.String(),
+				)
+				// Loop back to actually wait the escalated delay. Dialling here
+				// would let the cycle run at the poll interval instead, which is
+				// the storm this backoff exists to prevent.
+				continue
+			}
 		}
 
 		slog.Debug("websocket: reconnecting", "url", b.url, "delay", delay.String())
@@ -380,10 +429,29 @@ func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
 			continue
 		}
 
-		// Successful reconnection — restart the read loop and reset backoff.
-		delay = baseDelay
+		// The dial succeeded and OnConnect ran. Restart the read loop; the
+		// delay for the next drop is decided above, from this connection's
+		// lifetime.
 		go b.readLoop(ctx)
 	}
+}
+
+// nextDelayAfterDrop returns the reconnect delay to use after a connection that
+// stayed up for `lived` has dropped, plus whether that drop counts as a flap.
+//
+// A connection that outlived minStable is a success, so the backoff restarts
+// from base. A shorter one is a flap — the venue accepted the handshake and
+// then closed the socket (refused subscription, per-IP connection cap, policy
+// close) — so the delay escalates instead of resetting. Without that
+// distinction such a close resets the backoff on every cycle and the reconnect
+// loop degrades into a hot storm that spends the venue's new-connection budget
+// and deepens the rejection it is reacting to. minStable <= 0 disables the
+// check, restoring the pre-0.7.2 behaviour.
+func nextDelayAfterDrop(current, base, max, minStable, lived time.Duration) (delay time.Duration, flapped bool) {
+	if minStable > 0 && lived < minStable {
+		return nextBackoff(current, max), true
+	}
+	return base, false
 }
 
 // nextBackoff returns the next reconnect delay: d doubled, capped at max.
@@ -458,6 +526,22 @@ func (b *BaseWebSocket) setStatus(s ConnectionStatus) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.status = s
+}
+
+// setConnEstablishedAt records when the current connection became usable.
+func (b *BaseWebSocket) setConnEstablishedAt(t time.Time) {
+	b.mu.Lock()
+	b.connEstablishedAt = t
+	b.mu.Unlock()
+}
+
+// establishedAt returns when the current connection became usable, or the
+// zero time if no connection has been established since the last drop was
+// accounted for.
+func (b *BaseWebSocket) establishedAt() time.Time {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.connEstablishedAt
 }
 
 func (b *BaseWebSocket) closeConn() {
