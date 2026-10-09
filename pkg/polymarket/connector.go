@@ -224,6 +224,27 @@ func (p *PolymarketConnector) SetOnMarketStatusChange(fn func(ws.ConnectionStatu
 	}
 }
 
+// ReconnectMarket forces the market WebSocket to drop its current connection
+// and re-dial, without touching the RTDS or user sockets (which share this
+// connector's base but have their own connections).
+//
+// It exists for the case the transport-level ping/pong watchdog cannot catch:
+// the socket is still answering pings, but the market channel has stopped
+// delivering events for the assets we care about. A caller with its own
+// silence watchdog calls this to recover the subscription.
+//
+// The market WS's embedded BaseWebSocket keeps its reconnection loop alive
+// across Disconnect() (unlike Stop(), which tears down the whole manager), and
+// its onDisconnect hook re-queues the full subscription set, so the next
+// connection re-sends the handshake with every subscribed asset id. Nil-safe:
+// calling it before Start (or on a connector with no market WS) is a no-op.
+func (p *PolymarketConnector) ReconnectMarket() {
+	if p.market == nil {
+		return
+	}
+	p.market.Disconnect()
+}
+
 // Subscribe starts receiving market data for the given asset IDs.
 func (p *PolymarketConnector) Subscribe(assetIDs []string) {
 	if p.market != nil {
