@@ -114,6 +114,13 @@ type Options struct {
 	// block. Silence therefore means "nothing happened", not "the socket is
 	// dead", and a watchdog would manufacture reconnect gaps in a quiet market.
 	// Half-open sockets are still caught by the ping/pong keepalive.
+	//
+	// The two ACCOUNT channels (orderUpdates, userFills) are event-driven in the
+	// strongest sense — a desk that is not trading sees nothing for minutes or
+	// hours — so a connection that carries ONLY user channels must leave this at
+	// 0. The driver is expected to run a SEPARATE WSHyperliquid instance for the
+	// user channels, with DefaultOptions (this stays 0); the market-data
+	// instance may enable the watchdog for the l2Book stream it carries.
 	DataStaleTimeoutMs int64
 }
 
@@ -180,6 +187,7 @@ func NewWithOptions(base *connector.Connector, opts Options) *WSHyperliquid {
 // SetDispatcher routes the events dispatched by this manager
 // (HyperliquidBookEvent, HyperliquidTradeEvent, HyperliquidBBOEvent,
 // HyperliquidAssetCtxEvent, HyperliquidAllMidsEvent, HyperliquidCandleEvent,
+// HyperliquidOrderUpdateEvent, HyperliquidUserFillsEvent,
 // HyperliquidErrorEvent) to the application handler.
 func (h *WSHyperliquid) SetDispatcher(d func(any)) {
 	h.base.SetDispatcher(d)
@@ -293,36 +301,56 @@ func (h *WSHyperliquid) Subscriptions() []Subscription {
 // ─────────────────────────────────────────────────────────────
 
 // Subscribe registers and sends subscriptions. Subscriptions already
-// registered (same channel, coin and interval) are skipped, so calling this
-// twice is harmless.
+// registered (same channel, coin, user and interval) are skipped, so calling
+// this twice is harmless.
 //
 // A subscription registered while the socket is down is not lost: it is sent
 // when the connection comes back. The returned error is therefore about the
-// request (unknown channel, malformed coin, bad parameters), not about the
-// transport.
+// request (unknown channel, malformed coin or user address, bad parameters),
+// not about the transport.
 func (h *WSHyperliquid) Subscribe(ctx context.Context, subs ...Subscription) error {
-	for _, sub := range subs {
+	// Normalize user addresses (trim + lowercase) so one account collapses to
+	// one canonical key. Done on a copy: the caller's slice is not mutated.
+	norm := make([]Subscription, len(subs))
+	copy(norm, subs)
+	for i := range norm {
+		sub := &norm[i]
 		if !IsSubscribable(sub.Type) {
 			return fmt.Errorf("hyperliquid: unknown channel %q (subscribable: %s)", sub.Type, channelList())
+		}
+		switch {
+		case isUserChannel(sub.Type):
+			// Keyed by user, not coin: a coin would be a caller mixing the two
+			// shapes.
+			if sub.Coin != "" {
+				return fmt.Errorf("hyperliquid: channel %s takes no coin (got %q)", sub.Type, sub.Coin)
+			}
+			user, err := NormalizeUser(sub.User)
+			if err != nil {
+				return err
+			}
+			sub.User = user
+		case sub.Type == ChannelAllMids:
+			if sub.Coin != "" {
+				return fmt.Errorf("hyperliquid: channel %s takes no coin (got %q)", sub.Type, sub.Coin)
+			}
+		default:
+			if err := ValidateCoin(sub.Coin); err != nil {
+				return err
+			}
 		}
 		if err := (SubParams{
 			Interval: sub.Interval,
 			NSigFigs: sub.NSigFigs,
 			Mantissa: sub.Mantissa,
 			Fast:     sub.Fast,
+			User:     sub.User,
 		}).validate(sub.Type); err != nil {
 			return err
 		}
-		if sub.Type != ChannelAllMids {
-			if err := ValidateCoin(sub.Coin); err != nil {
-				return err
-			}
-		} else if sub.Coin != "" {
-			return fmt.Errorf("hyperliquid: channel %s takes no coin (got %q)", sub.Type, sub.Coin)
-		}
 	}
 
-	for _, sub := range h.conn.addSubs(subs) {
+	for _, sub := range h.conn.addSubs(norm) {
 		h.conn.writeSub(ctx, sub, false)
 	}
 	return nil
@@ -409,6 +437,40 @@ func (h *WSHyperliquid) SubscribeCandles(ctx context.Context, coins []string, in
 // UnsubscribeCandles stops the candle stream for the given coins/interval.
 func (h *WSHyperliquid) UnsubscribeCandles(ctx context.Context, coins []string, interval string) error {
 	return h.unsubscribeChannel(ctx, ChannelCandle, coins, SubParams{Interval: interval})
+}
+
+// SubscribeOrderUpdates streams the account's own order lifecycle updates
+// (open, filled, canceled, rejected, …) for user, a 0x-prefixed address. It is
+// keyed by user, not coin.
+//
+// This channel is event-driven: a quiet account produces no frames for
+// arbitrarily long stretches, so a connection that carries only user channels
+// must NOT enable the data-staleness watchdog — leave Options.DataStaleTimeoutMs
+// at its default of 0 (see Options.DataStaleTimeoutMs). The WebSocket-level
+// ping/pong keepalive still catches a half-open socket.
+func (h *WSHyperliquid) SubscribeOrderUpdates(ctx context.Context, user string) error {
+	return h.subscribeChannel(ctx, ChannelOrderUpdates, nil, SubParams{User: user})
+}
+
+// UnsubscribeOrderUpdates stops the orderUpdates stream for user.
+func (h *WSHyperliquid) UnsubscribeOrderUpdates(ctx context.Context, user string) error {
+	return h.unsubscribeChannel(ctx, ChannelOrderUpdates, nil, SubParams{User: user})
+}
+
+// SubscribeUserFills streams the account's fills for user, a 0x-prefixed
+// address. Keyed by user, not coin. The first frame after subscribing is a
+// snapshot of recent fills (IsSnapshot=true on the event); later frames are
+// incremental.
+//
+// Like orderUpdates this channel is event-driven, so a user-only connection
+// must leave Options.DataStaleTimeoutMs at 0.
+func (h *WSHyperliquid) SubscribeUserFills(ctx context.Context, user string) error {
+	return h.subscribeChannel(ctx, ChannelUserFills, nil, SubParams{User: user})
+}
+
+// UnsubscribeUserFills stops the userFills stream for user.
+func (h *WSHyperliquid) UnsubscribeUserFills(ctx context.Context, user string) error {
+	return h.unsubscribeChannel(ctx, ChannelUserFills, nil, SubParams{User: user})
 }
 
 func (h *WSHyperliquid) subscribeChannel(ctx context.Context, ch Channel, coins []string, p SubParams) error {
@@ -759,6 +821,10 @@ func (h *WSHyperliquid) processFrame(f frame) {
 		h.handleAllMids(env.Data, f.rx)
 	case ChannelCandle:
 		h.handleCandle(env.Data, f.rx)
+	case ChannelOrderUpdates:
+		h.handleOrderUpdates(env.Data, f.rx)
+	case ChannelUserFills:
+		h.handleUserFills(env.Data, f.rx)
 	case ServerChannelSubscriptionResponse:
 		slog.Debug("hyperliquid: subscription acknowledged", "data", truncate(string(env.Data), 256))
 	case ServerChannelPong:
@@ -946,6 +1012,91 @@ func (h *WSHyperliquid) handleCandle(data json.RawMessage, rx time.Time) {
 // ─────────────────────────────────────────────────────────────
 // Decode helpers
 // ─────────────────────────────────────────────────────────────
+
+// handleOrderUpdates decodes an orderUpdates frame and dispatches one event per
+// element. The venue's data is an array of {order, status, statusTimestamp}
+// objects; the frame carries no user, so it is dispatched regardless of the
+// subscription registry — the spec for these account channels is that a frame
+// is always decoded, unlike the coin channels where an unsubscribed coin is
+// dropped. A user-channel socket is dedicated to a single account, so a frame
+// that arrives on it belongs to that account.
+func (h *WSHyperliquid) handleOrderUpdates(data json.RawMessage, rx time.Time) {
+	if nullOrEmpty(data) {
+		return
+	}
+	var updates []OrderUpdate
+	if err := json.Unmarshal(data, &updates); err != nil {
+		slog.Warn("hyperliquid: orderUpdates decode failed", "err", err, "data", truncate(string(data), 256))
+		return
+	}
+	for i := range updates {
+		u := updates[i]
+		h.base.DispatchEvent(&connector.HyperliquidOrderUpdateEvent{
+			SeqID:           h.base.NextSeqID(),
+			ReceivedAt:      rx,
+			Coin:            u.Order.Coin,
+			Side:            u.Order.Side,
+			LimitPx:         u.Order.LimitPx.String(),
+			Sz:              u.Order.Sz.String(),
+			OrigSz:          u.Order.OrigSz.String(),
+			Oid:             u.Order.Oid,
+			Timestamp:       u.Order.Timestamp,
+			Cloid:           u.Order.Cloid,
+			Status:          u.Status,
+			StatusTimestamp: u.StatusTimestamp,
+		})
+	}
+}
+
+// handleUserFills decodes a userFills frame and dispatches one event carrying
+// the whole batch. The first frame after subscribing is the account's fill
+// snapshot (IsSnapshot=true); later frames are incremental. Like orderUpdates
+// the frame is always decoded, never gated on the subscription registry.
+func (h *WSHyperliquid) handleUserFills(data json.RawMessage, rx time.Time) {
+	if nullOrEmpty(data) {
+		return
+	}
+	var msg UserFills
+	if err := json.Unmarshal(data, &msg); err != nil {
+		slog.Warn("hyperliquid: userFills decode failed", "err", err, "data", truncate(string(data), 256))
+		return
+	}
+	fills := make([]connector.HyperliquidFill, 0, len(msg.Fills))
+	for _, f := range msg.Fills {
+		fills = append(fills, connector.HyperliquidFill{
+			Coin:          f.Coin,
+			Px:            f.Px.String(),
+			Sz:            f.Sz.String(),
+			Side:          f.Side,
+			Dir:           f.Dir,
+			ClosedPnl:     f.ClosedPnl.String(),
+			Hash:          f.Hash,
+			Fee:           f.Fee.String(),
+			FeeToken:      f.FeeToken,
+			StartPosition: f.StartPosition.String(),
+			Time:          f.Time,
+			Oid:           f.Oid,
+			Tid:           f.Tid,
+			Crossed:       f.Crossed,
+			Cloid:         f.Cloid,
+		})
+	}
+	h.base.DispatchEvent(&connector.HyperliquidUserFillsEvent{
+		SeqID:      h.base.NextSeqID(),
+		ReceivedAt: rx,
+		User:       msg.User,
+		IsSnapshot: msg.IsSnapshot,
+		Fills:      fills,
+	})
+}
+
+// nullOrEmpty reports whether a frame's data payload is absent or JSON null.
+// json.Unmarshal of "null" into a struct leaves it zero with no error, so a
+// handler must check before dispatching an empty event.
+func nullOrEmpty(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || string(trimmed) == "null"
+}
 
 // decodeCandles accepts either shape the candle channel might use. The venue
 // docs type the payload as Candle[], while at least one published SDK decodes a

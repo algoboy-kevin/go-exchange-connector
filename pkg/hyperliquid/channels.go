@@ -1,6 +1,7 @@
 package hyperliquid
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -48,6 +49,21 @@ const (
 	ChannelAllMids Channel = "allMids"
 	// ChannelCandle streams OHLCV candles (Candle) for a coin/interval pair.
 	ChannelCandle Channel = "candle"
+
+	// ChannelOrderUpdates streams the account's own order lifecycle updates
+	// (accepted/resting, filled, canceled, rejected) for one user. It takes a
+	// user address, not a coin, and is event-driven: a quiet account produces
+	// no frames at all.
+	//
+	// A frame's `data` is an ARRAY of order-update elements; one event is
+	// dispatched per element (see connector.HyperliquidOrderUpdateEvent).
+	ChannelOrderUpdates Channel = "orderUpdates"
+
+	// ChannelUserFills streams the account's fills for one user address. It
+	// takes a user, not a coin. The first frame after subscribing is a
+	// snapshot of recent fills (HyperliquidUserFillsEvent.IsSnapshot); later
+	// frames are incremental. Event-driven.
+	ChannelUserFills Channel = "userFills"
 )
 
 // Channels the venue sends that are not subscribable. They are named here so
@@ -76,6 +92,14 @@ var subscribableChannels = []Channel{
 	ChannelActiveAssetCtx,
 	ChannelAllMids,
 	ChannelCandle,
+	ChannelOrderUpdates,
+	ChannelUserFills,
+}
+
+// isUserChannel reports whether ch is keyed by a user address rather than a
+// coin: the two account channels take {"user": "<address>"} and no coin.
+func isUserChannel(ch Channel) bool {
+	return ch == ChannelOrderUpdates || ch == ChannelUserFills
 }
 
 // SubscribableChannels returns the closed set of subscribable channels.
@@ -169,6 +193,47 @@ func NormalizeCoin(coin string) (string, error) {
 	return c, nil
 }
 
+// ValidateUser checks a user address before it is interpolated into a
+// subscription frame. Hyperliquid account addresses are 0x-prefixed, 20-byte
+// (40 hex character) values, e.g. "0x8ba1f109551bd432803012645ac136ddd64dba72".
+//
+// The address is embedded in a JSON document written raw to the socket. Go's
+// json.Marshal escapes it, so this is not an injection guard the way
+// ValidateCoin is; it is a typo guard — an empty or truncated address is a
+// subscription the venue accepts and then never delivers on.
+//
+// Addresses are case-insensitive at the venue; compare via NormalizeUser.
+func ValidateUser(user string) error {
+	if user == "" {
+		return fmt.Errorf("hyperliquid: empty user address")
+	}
+	if user != strings.TrimSpace(user) {
+		return fmt.Errorf("hyperliquid: user address %q has surrounding whitespace", user)
+	}
+	if !strings.HasPrefix(user, "0x") && !strings.HasPrefix(user, "0X") {
+		return fmt.Errorf("hyperliquid: user address %q must start with 0x", user)
+	}
+	if len(user) != 42 {
+		return fmt.Errorf("hyperliquid: user address %q must be 0x + 40 hex characters", user)
+	}
+	if _, err := hex.DecodeString(user[2:]); err != nil {
+		return fmt.Errorf("hyperliquid: user address %q is not valid hex", user)
+	}
+	return nil
+}
+
+// NormalizeUser trims surrounding whitespace, validates the result and
+// lowercases it. The lowercased form is canonical: the venue treats the user
+// field case-insensitively, so this makes one account collapse to a single
+// subscription key.
+func NormalizeUser(user string) (string, error) {
+	u := strings.TrimSpace(user)
+	if err := ValidateUser(u); err != nil {
+		return "", err
+	}
+	return strings.ToLower(u), nil
+}
+
 // ─────────────────────────────────────────────────────────────
 // Subscription parameters
 // ─────────────────────────────────────────────────────────────
@@ -202,10 +267,33 @@ type SubParams struct {
 	// Fast requests a 5-level book instead of the default 20 (ChannelL2Book
 	// only). It roughly halves the l2Book byte rate.
 	Fast bool
+
+	// User is the account address the two account channels
+	// (ChannelOrderUpdates, ChannelUserFills) subscribe for. It is required
+	// for those channels and rejected for every other: coin channels have no
+	// user field on the wire. NormalizeUser is applied when the subscription
+	// is built.
+	User string
 }
 
 // validate checks the parameters against the channel they were passed for.
 func (p SubParams) validate(ch Channel) error {
+	if isUserChannel(ch) {
+		if p.User == "" {
+			return fmt.Errorf("hyperliquid: channel %s requires a user address", ch)
+		}
+		if _, err := NormalizeUser(p.User); err != nil {
+			return err
+		}
+		if p.Interval != "" || p.NSigFigs != 0 || p.Mantissa != 0 || p.Fast {
+			return fmt.Errorf("hyperliquid: channel %s takes no other subscription parameters", ch)
+		}
+		return nil
+	}
+	if p.User != "" {
+		return fmt.Errorf("hyperliquid: user is orderUpdates/userFills-only (channel %s)", ch)
+	}
+
 	switch ch {
 	case ChannelCandle:
 		if p.Interval == "" {
@@ -257,18 +345,23 @@ func (p SubParams) validate(ch Channel) error {
 type Subscription struct {
 	Type     Channel `json:"type"`
 	Coin     string  `json:"coin,omitempty"`
+	User     string  `json:"user,omitempty"`
 	Interval string  `json:"interval,omitempty"`
 	NSigFigs int     `json:"nSigFigs,omitempty"`
 	Mantissa int     `json:"mantissa,omitempty"`
 	Fast     bool    `json:"fast,omitempty"`
 }
 
-// Key returns the identity of the subscription, e.g. "l2Book:BTC" or
-// "candle:BTC:1m". Duplicate keys are what the manager deduplicates on.
+// Key returns the identity of the subscription, e.g. "l2Book:BTC",
+// "candle:BTC:1m" or "orderUpdates:0x8ba1f109…". Duplicate keys are what the
+// manager deduplicates on.
 func (s Subscription) Key() string {
 	parts := []string{string(s.Type)}
 	if s.Coin != "" {
 		parts = append(parts, s.Coin)
+	}
+	if s.User != "" {
+		parts = append(parts, s.User)
 	}
 	if s.Interval != "" {
 		parts = append(parts, s.Interval)
@@ -279,10 +372,11 @@ func (s Subscription) Key() string {
 // BuildSubscriptions validates the request and builds one Subscription per
 // coin.
 //
-// coins must be empty for ChannelAllMids (the subscription is global) and
-// non-empty otherwise; duplicates are rejected rather than silently
-// deduplicated, because a duplicate is a caller bug that would otherwise cost
-// connection budget for nothing.
+// coins must be empty for ChannelAllMids (the subscription is global) and for
+// the two user channels (they are keyed by SubParams.User instead); non-empty
+// otherwise. Duplicates are rejected rather than silently deduplicated, because
+// a duplicate is a caller bug that would otherwise cost connection budget for
+// nothing.
 func BuildSubscriptions(ch Channel, coins []string, p SubParams) ([]Subscription, error) {
 	if !IsSubscribable(ch) {
 		return nil, fmt.Errorf("hyperliquid: unknown channel %q (subscribable: %s)",
@@ -290,6 +384,17 @@ func BuildSubscriptions(ch Channel, coins []string, p SubParams) ([]Subscription
 	}
 	if err := p.validate(ch); err != nil {
 		return nil, err
+	}
+
+	if isUserChannel(ch) {
+		if len(coins) != 0 {
+			return nil, fmt.Errorf("hyperliquid: channel %s takes no coin (got %d)", ch, len(coins))
+		}
+		user, err := NormalizeUser(p.User)
+		if err != nil {
+			return nil, err
+		}
+		return []Subscription{{Type: ch, User: user}}, nil
 	}
 
 	if ch == ChannelAllMids {

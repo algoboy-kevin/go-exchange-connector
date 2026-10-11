@@ -206,6 +206,64 @@ type Candle struct {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Account channel payloads (orderUpdates, userFills)
+// ─────────────────────────────────────────────────────────────
+
+// OrderUpdate is one element of an orderUpdates frame's data array. The order
+// under it is the venue's basic order snapshot; Status is the lifecycle
+// transition this frame reports (see the venue's order status enum: "open",
+// "filled", "canceled", "badAloPxRejected", …).
+type OrderUpdate struct {
+	Order           OrderUpdateOrder `json:"order"`
+	Status          string           `json:"status"`
+	StatusTimestamp int64            `json:"statusTimestamp"` // ms since epoch
+}
+
+// OrderUpdateOrder is the order snapshot inside an OrderUpdate. Cloid is empty
+// when the order has no client order id (the venue sends the field null or
+// omits it).
+type OrderUpdateOrder struct {
+	Coin      string `json:"coin"`
+	Side      string `json:"side"` // "A" (ask/sell) or "B" (bid/buy)
+	LimitPx   Num    `json:"limitPx"`
+	Sz        Num    `json:"sz"`
+	Oid       int64  `json:"oid"`
+	Timestamp int64  `json:"timestamp"` // ms since epoch
+	OrigSz    Num    `json:"origSz"`
+	Cloid     string `json:"cloid"`
+}
+
+// UserFills is the payload of a userFills frame: the account's fills for one
+// user. IsSnapshot is true on the first frame after subscribing (a snapshot of
+// recent fills); later frames are incremental.
+type UserFills struct {
+	IsSnapshot bool   `json:"isSnapshot"`
+	User       string `json:"user"`
+	Fills      []Fill `json:"fills"`
+}
+
+// Fill is one fill inside a userFills frame. Fee is negative for a rebate; Dir
+// is the venue's display direction ("Open Long", "Close Short", …). The venue's
+// userFills carry no client order id, so Cloid is normally empty.
+type Fill struct {
+	Coin          string `json:"coin"`
+	Px            Num    `json:"px"`
+	Sz            Num    `json:"sz"`
+	Side          string `json:"side"`          // "A" or "B"
+	Time          int64  `json:"time"`          // ms since epoch
+	StartPosition Num    `json:"startPosition"` // position size before this fill
+	Dir           string `json:"dir"`
+	ClosedPnl     Num    `json:"closedPnl"`
+	Hash          string `json:"hash"` // L1 transaction hash
+	Oid           int64  `json:"oid"`  // order id
+	Crossed       bool   `json:"crossed"`
+	Fee           Num    `json:"fee"`
+	Tid           int64  `json:"tid"` // unique trade id
+	FeeToken      string `json:"feeToken"`
+	Cloid         string `json:"cloid"`
+}
+
+// ─────────────────────────────────────────────────────────────
 // REST /info types
 // ─────────────────────────────────────────────────────────────
 

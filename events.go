@@ -343,6 +343,69 @@ type HyperliquidErrorEvent struct {
 	Message    string    `json:"message"`
 }
 
+// HyperliquidOrderUpdateEvent is one order lifecycle update from the
+// orderUpdates channel, which streams the account's own orders. A single frame
+// carries an array of updates and produces one event per element (all sharing
+// ReceivedAt, with increasing SeqID).
+//
+// Coin/Side/LimitPx/Sz/OrigSz are exactly what the venue sent (decimals stay
+// strings); Side is "B" (buy) or "A" (sell) — use HyperliquidNormalizeSide for
+// a "buy"/"sell" form. Timestamp is the order's creation time in ms and
+// StatusTimestamp is when it entered Status. Cloid is empty when the order has
+// no client order id.
+//
+// Status is the venue's lifecycle transition: "open", "filled", "canceled", and
+// the various rejection codes ("badAloPxRejected" for a post-only order that
+// would have matched, "perpMarginRejected", "reduceOnlyRejected", …).
+type HyperliquidOrderUpdateEvent struct {
+	SeqID           int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
+	ReceivedAt      time.Time `json:"received_at"` // local arrival timestamp
+	Coin            string    `json:"coin"`
+	Side            string    `json:"side"` // "A" or "B"
+	LimitPx         string    `json:"limit_px"`
+	Sz              string    `json:"sz"`
+	OrigSz          string    `json:"orig_sz"`
+	Oid             int64     `json:"oid"`
+	Timestamp       int64     `json:"timestamp"`        // order creation ms epoch
+	Cloid           string    `json:"cloid,omitempty"`  // empty when the order has none
+	Status          string    `json:"status"`           // "open", "filled", "canceled", "badAloPxRejected", …
+	StatusTimestamp int64     `json:"status_timestamp"` // ms epoch the status was set
+}
+
+// HyperliquidUserFillsEvent is a batch of the account's fills from the
+// userFills channel. The first frame after subscribing is a snapshot
+// (IsSnapshot true) of recent fills; later frames carry only new fills. User is
+// the account the fills belong to.
+type HyperliquidUserFillsEvent struct {
+	SeqID      int64             `json:"seq_id"`      // monotonic sequence for ordered DES replay
+	ReceivedAt time.Time         `json:"received_at"` // local arrival timestamp
+	User       string            `json:"user"`
+	IsSnapshot bool              `json:"is_snapshot,omitempty"`
+	Fills      []HyperliquidFill `json:"fills"`
+}
+
+// HyperliquidFill is one fill inside a HyperliquidUserFillsEvent. Every decimal
+// is the venue's text (Px, Sz, ClosedPnl, Fee, StartPosition); Fee is negative
+// for a rebate. Side is "B"/"A"; Dir is the venue's display direction. Cloid is
+// empty for the venue's userFills, which do not carry a client order id.
+type HyperliquidFill struct {
+	Coin          string `json:"coin"`
+	Px            string `json:"px"`
+	Sz            string `json:"sz"`
+	Side          string `json:"side"` // "A" or "B"
+	Dir           string `json:"dir"`
+	ClosedPnl     string `json:"closed_pnl"`
+	Hash          string `json:"hash,omitempty"` // L1 transaction hash
+	Fee           string `json:"fee"`
+	FeeToken      string `json:"fee_token,omitempty"`
+	StartPosition string `json:"start_position"`
+	Time          int64  `json:"time"` // ms epoch
+	Oid           int64  `json:"oid"`
+	Tid           int64  `json:"tid"` // unique trade id
+	Crossed       bool   `json:"crossed"`
+	Cloid         string `json:"cloid,omitempty"`
+}
+
 // HyperliquidNormalizeSide maps the venue's trade side encoding to "buy" or
 // "sell". The venue documents "B"/"A" but some payloads (and the fills stream)
 // use "buy"/"sell"; both are accepted, case-insensitively.

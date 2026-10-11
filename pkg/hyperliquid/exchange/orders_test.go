@@ -506,6 +506,8 @@ func TestUpdateLeverage(t *testing.T) {
 	v, url := newVenue(t)
 	c := newTestClient(t, url)
 	v.setExchange(`{}`, http.StatusOK)
+	// UpdateLeverage verifies via activeAssetData: ETH must come back cross/10.
+	v.setInfo("activeAssetData", `{"leverage":{"type":"cross","value":10}}`, 0)
 
 	if err := c.UpdateLeverage(context.Background(), "ETH", 10, true); err != nil {
 		t.Fatalf("UpdateLeverage: %v", err)
@@ -515,6 +517,15 @@ func TestUpdateLeverage(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("posted body missing %s: %s", want, body)
 		}
+	}
+	// The verification query must target the master account for the same coin.
+	reqs := v.queryRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("/info queries = %d, want 1 (the activeAssetData verification)", len(reqs))
+	}
+	assertUsesMasterAccount(t, reqs[0])
+	if !bytes.Contains(reqs[0], []byte(`"type":"activeAssetData"`)) || !bytes.Contains(reqs[0], []byte(`"coin":"ETH"`)) {
+		t.Errorf("verification query = %s, want activeAssetData for ETH", reqs[0])
 	}
 
 	if err := c.UpdateLeverage(context.Background(), "ETH", 0, false); err == nil {

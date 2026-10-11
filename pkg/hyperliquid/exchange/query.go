@@ -82,6 +82,39 @@ func (c *Client) OpenOrders(ctx context.Context) ([]OpenOrder, error) {
 	return out, nil
 }
 
+// Leverage returns the master account's configured leverage for coin and
+// whether that coin is currently in cross margin, from the venue's
+// activeAssetData query.
+//
+// It is the observable counterpart of UpdateLeverage: sonirico's UpdateLeverage
+// cannot see a venue rejection (it decodes the response into a UserState), so
+// UpdateLeverage re-queries through this method to confirm the change.
+func (c *Client) Leverage(ctx context.Context, coin string) (leverage int, isCross bool, err error) {
+	var resp struct {
+		Leverage struct {
+			Type  string `json:"type"` // "cross" | "isolated"
+			Value int    `json:"value"`
+		} `json:"leverage"`
+	}
+	if err := c.postInfo(ctx, "activeAssetData", map[string]any{
+		"type": "activeAssetData",
+		"user": c.account,
+		"coin": coin,
+	}, &resp); err != nil {
+		return 0, false, err
+	}
+	switch resp.Leverage.Type {
+	case "cross":
+		isCross = true
+	case "isolated":
+		isCross = false
+	default:
+		return 0, false, fmt.Errorf("hyperliquid: activeAssetData for %s: unknown leverage type %q",
+			coin, resp.Leverage.Type)
+	}
+	return resp.Leverage.Value, isCross, nil
+}
+
 // postInfo POSTs one /info query and decodes the response into out. Errors keep
 // the /info client's typing (*hyperliquid.HTTPError) so IsUncertain /
 // IsRateLimited can classify them.

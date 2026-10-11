@@ -130,11 +130,20 @@ func (c *Client) ScheduleCancel(ctx context.Context, at *time.Time) error {
 	return nil
 }
 
-// UpdateLeverage sets the leverage for one coin (isCross selects cross margin).
+// UpdateLeverage sets the leverage for one coin (isCross selects cross margin)
+// and then VERIFIES that the venue applied it.
 //
-// Note: sonirico decodes this response straight into a UserState, so a top-level
-// venue rejection is not observable here — a failed leverage change is reported
-// as success. Confirm the result via the position's leverage if it matters.
+// sonirico's UpdateLeverage decodes the response straight into a UserState, so a
+// top-level venue rejection ({"status":"err","response":"…"}) is not observable
+// there — a failed leverage change looks like success. To close that hole this
+// method re-queries the account's leverage for the coin (activeAssetData) and
+// returns an error when the value or the margin mode did not take, e.g.
+//
+//	hyperliquid: leverage for ETH not applied: want 5 isolated, venue has 20 cross
+//
+// So a nil return means the venue really reports the requested setting. The
+// verification is one extra read-only /info request; it is deliberate, not
+// something to optimise away.
 func (c *Client) UpdateLeverage(ctx context.Context, coin string, leverage int, isCross bool) error {
 	if leverage <= 0 {
 		return fmt.Errorf("hyperliquid: leverage for %s must be positive, got %d", coin, leverage)
@@ -142,7 +151,24 @@ func (c *Client) UpdateLeverage(ctx context.Context, coin string, leverage int, 
 	if _, err := c.ex.UpdateLeverage(ctx, leverage, coin, isCross); err != nil {
 		return fmt.Errorf("hyperliquid: update leverage %s: %w", coin, err)
 	}
+
+	got, gotCross, err := c.Leverage(ctx, coin)
+	if err != nil {
+		return fmt.Errorf("hyperliquid: verify leverage %s: %w", coin, err)
+	}
+	if got != leverage || gotCross != isCross {
+		return fmt.Errorf("hyperliquid: leverage for %s not applied: want %d %s, venue has %d %s",
+			coin, leverage, marginMode(isCross), got, marginMode(gotCross))
+	}
 	return nil
+}
+
+// marginMode renders a cross/isolated flag the way the venue spells it.
+func marginMode(isCross bool) string {
+	if isCross {
+		return "cross"
+	}
+	return "isolated"
 }
 
 // ─────────────────────────────────────────────────────────────
