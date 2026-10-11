@@ -48,6 +48,8 @@ func streamFor(symbol string, st streamType) string {
 		return symbol + "@depth@100ms"
 	case streamKline:
 		return symbol + "@kline_1m"
+	case streamMarkPrice:
+		return symbol + "@markPrice@1s"
 	}
 	return ""
 }
@@ -108,6 +110,7 @@ const (
 	streamAggTrade   streamType = "aggTrade"
 	streamDepth      streamType = "depth" // diff depth @100ms (book maintained locally)
 	streamKline      streamType = "kline"
+	streamMarkPrice  streamType = "markPrice" // <sym>@markPrice@1s (perp only)
 )
 
 // ─────────────────────────────────────────────────────────────

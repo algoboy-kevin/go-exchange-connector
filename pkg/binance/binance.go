@@ -36,6 +36,38 @@ const (
 	defaultReconnectIntervalMs = 1000
 )
 
+// Options overrides the Binance endpoints a WSBinance connects to. The zero
+// value keeps the production defaults; every field is optional. It exists so
+// market data can be pointed at the futures testnet (or a local test server)
+// without changing New's signature.
+type Options struct {
+	// PerpMarketWS is the USDⓈ-M market-stream endpoint that carries
+	// aggTrade, kline and markPrice. Default: wss://fstream.binance.com/market/ws
+	// (testnet: wss://demo-fstream.binance.com/market/ws).
+	PerpMarketWS string
+	// PerpPublicWS is the USDⓈ-M public-stream endpoint that carries
+	// bookTicker and depth. Default: wss://fstream.binance.com/public/ws
+	// (testnet: wss://demo-fstream.binance.com/public/ws).
+	PerpPublicWS string
+	// PerpREST is the USDⓈ-M REST base used for depth snapshots.
+	// Default: https://fapi.binance.com (testnet: https://demo-fapi.binance.com).
+	PerpREST string
+}
+
+// resolved fills in the production defaults for any empty field.
+func (o Options) resolved() Options {
+	if o.PerpMarketWS == "" {
+		o.PerpMarketWS = perpMarketWSSURL
+	}
+	if o.PerpPublicWS == "" {
+		o.PerpPublicWS = perpPublicWSSURL
+	}
+	if o.PerpREST == "" {
+		o.PerpREST = perpRESTURL
+	}
+	return o
+}
+
 // WSBinance manages raw WebSocket connections to Binance for both the spot
 // and USDⓈ-M perpetual futures markets, streaming market data through the
 // connector dispatcher as typed connector.Binance*Event values.
@@ -96,6 +128,7 @@ type WSBinance struct {
 	base   *connector.Connector
 	http   *http.Client
 	rootCx context.Context
+	opts   Options
 
 	conns map[MarketType]map[streamClass]*binanceConn
 
@@ -133,16 +166,35 @@ func (c *binanceConn) wsURL() string {
 		return spotWSSURL
 	}
 	if c.class == classMarket {
-		return perpMarketWSSURL
+		return c.owner.opts.PerpMarketWS
 	}
-	return perpPublicWSSURL
+	return c.owner.opts.PerpPublicWS
 }
 
-// New creates a Binance stream manager over a connector base.
+// restURL returns the REST base for a market, honouring the Options override
+// for USDⓈ-M futures (used to fetch depth snapshots).
+func (b *WSBinance) restURL(mkt MarketType) string {
+	if mkt == MarketPerp {
+		return b.opts.PerpREST
+	}
+	return mkt.restURL()
+}
+
+// New creates a Binance stream manager over a connector base using the
+// production endpoints.
 func New(base *connector.Connector) *WSBinance {
+	return NewWithOptions(base, Options{})
+}
+
+// NewWithOptions creates a Binance stream manager over a connector base with
+// overridable USDⓈ-M endpoints (e.g. the futures testnet). Empty Options
+// fields fall back to the production defaults, so NewWithOptions(base,
+// Options{}) is exactly New(base).
+func NewWithOptions(base *connector.Connector, opts Options) *WSBinance {
 	b := &WSBinance{
 		base:  base,
 		http:  &http.Client{Timeout: 10 * time.Second},
+		opts:  opts.resolved(),
 		conns: make(map[MarketType]map[streamClass]*binanceConn, 2),
 		books: make(map[MarketType]map[string]*binanceBook, 2),
 	}
@@ -387,6 +439,19 @@ func (b *WSBinance) UnsubscribeKlines(ctx context.Context, mkt MarketType, symbo
 	}
 	b.unsubscribe(ctx, mkt, streams)
 	return nil
+}
+
+// SubscribeMarkPrice streams mark-price updates (<symbol>@markPrice@1s) for the
+// given symbols. The stream is only available on USDⓈ-M perpetual futures and
+// is carried by the /market connection (see streamClassOf), so it must be
+// subscribed with MarketPerp.
+func (b *WSBinance) SubscribeMarkPrice(ctx context.Context, mkt MarketType, symbols []string) {
+	b.subscribe(ctx, mkt, buildStreams(symbols, streamMarkPrice))
+}
+
+// UnsubscribeMarkPrice stops the mark-price stream for the given symbols.
+func (b *WSBinance) UnsubscribeMarkPrice(ctx context.Context, mkt MarketType, symbols []string) {
+	b.unsubscribe(ctx, mkt, buildStreams(symbols, streamMarkPrice))
 }
 
 // subscribe adds streams to their class's connection and sends a SUBSCRIBE
@@ -653,6 +718,8 @@ func (b *WSBinance) processMessage(c *binanceConn, data []byte) {
 		b.handleAggTrade(c, data)
 	case "kline":
 		b.handleKline(c, data)
+	case "markPriceUpdate":
+		b.handleMarkPrice(c, data)
 	case "depthUpdate":
 		b.handleDepth(c, data)
 	case "":
@@ -835,6 +902,49 @@ func (b *WSBinance) handleKline(c *binanceConn, data []byte) {
 		TradeCount:  ev.Kline.TradeNum,
 		IsFinal:     ev.Kline.IsFinal,
 		Timestamp:   binanceEventTime(ev.EventTime, 0, b.base.Now()),
+	})
+}
+
+// ── Mark price ──────────────────────────────────────────────
+
+// binanceMarkPrice is the <symbol>@markPrice@1s payload. Every field carries an
+// explicit tag: the JSON keys are case-sensitive and several differ only by
+// case (p/P, i/I, r/R, T/t), so encoding/json must match them exactly — the
+// documented indexPrice ("i") must never land in an "I" field, etc.
+type binanceMarkPrice struct {
+	Event           string `json:"e"` // "markPriceUpdate"
+	EventTime       int64  `json:"E"`
+	Symbol          string `json:"s"`
+	MarkPrice       string `json:"p"`
+	IndexPrice      string `json:"i"`
+	EstSettlePrice  string `json:"P"`
+	FundingRate     string `json:"r"`
+	NextFundingTime int64  `json:"T"`
+}
+
+func (b *WSBinance) handleMarkPrice(c *binanceConn, data []byte) {
+	var ev binanceMarkPrice
+	if err := json.Unmarshal(data, &ev); err != nil {
+		slog.Warn("binance: failed to parse markPrice", "err", err)
+		return
+	}
+	symbol := normalizeSymbol(ev.Symbol)
+	if !c.isSubscribed(streamFor(symbol, streamMarkPrice)) {
+		return
+	}
+	now := b.base.Now()
+	b.base.DispatchEvent(&connector.BinanceMarkPriceEvent{
+		SeqID:           b.base.NextSeqID(),
+		ReceivedAt:      now,
+		Symbol:          ev.Symbol,
+		Market:          string(c.mkt),
+		MarkPrice:       ev.MarkPrice,
+		IndexPrice:      ev.IndexPrice,
+		EstSettlePrice:  ev.EstSettlePrice,
+		FundingRate:     ev.FundingRate,
+		NextFundingTime: ev.NextFundingTime,
+		EventTime:       ev.EventTime,
+		RecvTime:        now,
 	})
 }
 
@@ -1034,7 +1144,7 @@ func (b *WSBinance) snapshotDepthBook(ctx context.Context, mkt MarketType, symbo
 
 	// limit=50 keeps the REST snapshot small (lower weight + smaller payload),
 	// which eases rate-limit pressure; deeper levels still arrive via diffs.
-	url := fmt.Sprintf("%s%s?symbol=%s&limit=50", mkt.restURL(), depthRESTPath(mkt), strings.ToUpper(symbol))
+	url := fmt.Sprintf("%s%s?symbol=%s&limit=50", b.restURL(mkt), depthRESTPath(mkt), strings.ToUpper(symbol))
 	resp, err := b.http.Get(url)
 	if err != nil {
 		return fmt.Errorf("binance %s depth snapshot %s: %w", mkt, symbol, err)

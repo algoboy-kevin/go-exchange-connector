@@ -189,6 +189,29 @@ type BinanceKlineEvent struct {
 	Timestamp   time.Time `json:"timestamp"`   // exchange event time
 }
 
+// BinanceMarkPriceEvent is a mark-price update from Binance's
+// <symbol>@markPrice@1s stream (perpetual futures only). It carries the venue's
+// mark price, index price, estimated settle price and the current funding rate,
+// pushed once a second.
+//
+// MarkPrice/IndexPrice/EstSettlePrice/FundingRate are decimal strings exactly as
+// the venue sent them (FundingRate may be negative). NextFundingTime and
+// EventTime are the venue's raw millisecond fields ("T" and "E"); RecvTime is
+// the local arrival instant and mirrors ReceivedAt.
+type BinanceMarkPriceEvent struct {
+	SeqID           int64     `json:"seq_id"`            // monotonic sequence for ordered DES replay
+	ReceivedAt      time.Time `json:"received_at"`       // local arrival timestamp
+	Symbol          string    `json:"symbol"`            // e.g. "BTCUSDT"
+	Market          string    `json:"market"`            // "perp"
+	MarkPrice       string    `json:"mark_price"`        // decimal string ("p")
+	IndexPrice      string    `json:"index_price"`       // decimal string ("i")
+	EstSettlePrice  string    `json:"est_settle_price"`  // decimal string ("P")
+	FundingRate     string    `json:"funding_rate"`      // decimal string, may be negative ("r")
+	NextFundingTime int64     `json:"next_funding_time"` // ms epoch ("T")
+	EventTime       int64     `json:"event_time"`        // ms epoch ("E")
+	RecvTime        time.Time `json:"recv_time"`         // local arrival timestamp (== ReceivedAt)
+}
+
 // ── Hyperliquid stream events ──────────────────────────────
 
 // Hyperliquid market data (pkg/hyperliquid) dispatches these typed events.
