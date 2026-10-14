@@ -99,12 +99,22 @@ func (c *Client) CancelByOid(ctx context.Context, reqs []OidCancel) ([]CancelSta
 // switch: every open order is cancelled at the given time.
 //
 // The time must be at least 5s in the future — the venue rejects anything
-// closer, so it is validated locally. An account below the venue's traded-volume
-// threshold cannot arm the switch; that refusal is reported as
-// ErrScheduleCancelUnavailable (errors.Is), but only when the venue's message
-// mentions volume: sonirico decodes the response into a struct that keeps
-// "status"/"error" and drops a "response" message, so a textless rejection can
-// only be reported as the generic status error.
+// closer, so it is validated locally.
+//
+// The outcome is classified from THIS request's raw HTTP status and (bounded)
+// body, captured through the /exchange client's transport: sonirico decodes the
+// response into a struct that keeps "status"/"error" and drops the venue's
+// top-level "response" rejection string. Signing and the request itself remain
+// sonirico's. The classification:
+//
+//   - 2xx {"status":"ok"}                        → nil
+//   - 2xx {"status":"err"} naming traded volume  → ErrScheduleCancelUnavailable
+//     (wrapping an *ActionError with the venue's message)
+//   - 2xx {"status":"err"} with any other text   → *ActionError (business)
+//   - 2xx with no/unknown status, oversize body  → uncertain (IsUncertain)
+//   - HTTP ≥ 400                                 → *StatusError (5xx uncertain,
+//     429 rate-limited), never ErrScheduleCancelUnavailable
+//   - transport error / timeout                  → uncertain
 func (c *Client) ScheduleCancel(ctx context.Context, at *time.Time) error {
 	var ms *int64
 	if at != nil {
@@ -116,18 +126,94 @@ func (c *Client) ScheduleCancel(ctx context.Context, at *time.Time) error {
 		ms = &t
 	}
 
-	res, err := c.ex.ScheduleCancel(ctx, ms)
+	cctx, rc := withCapture(ctx)
+	_, err := c.ex.ScheduleCancel(cctx, ms)
+	return classifyScheduleCancel(err, rc.snapshot())
+}
+
+// classifyScheduleCancel maps one schedule-cancel exchange (sonirico's error
+// plus the captured raw response) onto this package's error classes.
+func classifyScheduleCancel(err error, got captured) error {
 	if err != nil {
-		return scheduleCancelErr(err)
-	}
-	if res != nil && res.Status != "" && res.Status != "ok" {
-		msg := res.Error
-		if msg == "" {
-			msg = "schedule cancel rejected (status " + res.Status + ")"
+		if got.seen && got.status >= 400 {
+			return fmt.Errorf("hyperliquid: schedule cancel: %w", &StatusError{Code: got.status, Err: err})
 		}
-		return scheduleCancelErr(errors.New(msg))
+		// Transport error, timeout, unreadable/oversize body: keep sonirico's
+		// error so IsUncertain classifies it. Never a volume refusal.
+		return fmt.Errorf("hyperliquid: schedule cancel: %w", err)
 	}
-	return nil
+	if !got.seen || got.over {
+		return &uncertainError{msg: "schedule cancel: response was not captured; outcome unknown"}
+	}
+	var env struct {
+		Status   string          `json:"status"`
+		Response json.RawMessage `json:"response"`
+		Error    string          `json:"error"`
+	}
+	if jerr := json.Unmarshal(got.body, &env); jerr != nil {
+		return fmt.Errorf("hyperliquid: schedule cancel: decode response: %w", jerr)
+	}
+	switch env.Status {
+	case "ok":
+		return nil
+	case "err":
+		msg := venueMessage(env.Response, env.Error)
+		ae := &ActionError{Msg: "schedule cancel rejected: " + msg}
+		if msg == "" {
+			ae.Msg = "schedule cancel rejected (status err, no message)"
+		}
+		if isVolumeRefusal(msg) {
+			return fmt.Errorf("%w: %w", ErrScheduleCancelUnavailable, ae)
+		}
+		return ae
+	default:
+		return &uncertainError{msg: fmt.Sprintf("schedule cancel: response status %q is neither ok nor err; outcome unknown", sanitizeVenueText(env.Status))}
+	}
+}
+
+// venueMessage extracts the rejection text: the top-level "response" when it is
+// a JSON string, else the "error" field. Non-string responses yield "".
+func venueMessage(resp json.RawMessage, errField string) string {
+	var s string
+	if len(resp) > 0 && json.Unmarshal(resp, &s) == nil && strings.TrimSpace(s) != "" {
+		return sanitizeVenueText(s)
+	}
+	return sanitizeVenueText(errField)
+}
+
+// maxVenueText bounds venue-provided text carried in errors and logs.
+const maxVenueText = 512
+
+// sanitizeVenueText trims, replaces control characters and bounds venue text.
+func sanitizeVenueText(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > maxVenueText {
+		s = s[:maxVenueText] + "…"
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// isVolumeRefusal reports whether a venue rejection message explicitly refuses
+// schedule-cancel for insufficient traded volume: it must mention "volume" AND
+// "traded"/"trading". A rejection that merely mentions volume (a parameter
+// error, say) is not one.
+func isVolumeRefusal(msg string) bool {
+	m := strings.ToLower(msg)
+	if !strings.Contains(m, "volume") {
+		return false
+	}
+	// Require an explicit unmet trading threshold, not merely the words
+	// "trading" and "volume" in an unrelated parameter rejection.
+	return strings.Contains(m, "enough volume traded") ||
+		strings.Contains(m, "not traded enough") ||
+		strings.Contains(m, "has not traded") ||
+		strings.Contains(m, "insufficient traded volume") ||
+		strings.Contains(m, "insufficient trading volume")
 }
 
 // UpdateLeverage sets the leverage for one coin (isCross selects cross margin)
@@ -181,16 +267,6 @@ func callFailure(op string, err error) error {
 		err = errors.New("empty response")
 	}
 	return fmt.Errorf("hyperliquid: %s: %w", op, err)
-}
-
-func scheduleCancelErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	if strings.Contains(strings.ToLower(err.Error()), "volume") {
-		return fmt.Errorf("%w: %v", ErrScheduleCancelUnavailable, err)
-	}
-	return fmt.Errorf("hyperliquid: schedule cancel: %w", err)
 }
 
 func parseTif(tif string) (hl.Tif, error) {

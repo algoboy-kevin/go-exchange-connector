@@ -46,6 +46,55 @@ func (c *Client) Positions(ctx context.Context) ([]Position, error) {
 	return out, nil
 }
 
+// AccountState returns a read-only snapshot of the MASTER account's perp
+// clearinghouse (POST /info {"type":"clearinghouseState"}), with every decimal
+// kept as the venue's string. The required fields (marginSummary.accountValue,
+// marginSummary.totalMarginUsed, withdrawable) must be present and be JSON
+// strings, else a decode error is returned (never a zero-valued snapshot).
+//
+// Scope: this is the PERP clearinghouse only. Spot balances, vault equity and
+// funding-payment history are not included.
+func (c *Client) AccountState(ctx context.Context) (*AccountState, error) {
+	var resp struct {
+		MarginSummary *struct {
+			AccountValue    *string `json:"accountValue"`
+			TotalNtlPos     string  `json:"totalNtlPos"`
+			TotalRawUsd     string  `json:"totalRawUsd"`
+			TotalMarginUsed *string `json:"totalMarginUsed"`
+		} `json:"marginSummary"`
+		CrossMaintenanceMarginUsed string  `json:"crossMaintenanceMarginUsed"`
+		Withdrawable               *string `json:"withdrawable"`
+		Time                       int64   `json:"time"`
+	}
+	if err := c.postInfo(ctx, "clearinghouseState", map[string]any{
+		"type": "clearinghouseState",
+		"user": c.account,
+	}, &resp); err != nil {
+		return nil, err
+	}
+	ms := resp.MarginSummary
+	switch {
+	case ms == nil:
+		return nil, fmt.Errorf("hyperliquid: clearinghouseState: response has no marginSummary")
+	case ms.AccountValue == nil || *ms.AccountValue == "":
+		return nil, fmt.Errorf("hyperliquid: clearinghouseState: response has no marginSummary.accountValue")
+	case ms.TotalMarginUsed == nil || *ms.TotalMarginUsed == "":
+		return nil, fmt.Errorf("hyperliquid: clearinghouseState: response has no marginSummary.totalMarginUsed")
+	case resp.Withdrawable == nil || *resp.Withdrawable == "":
+		return nil, fmt.Errorf("hyperliquid: clearinghouseState: response has no withdrawable")
+	}
+	return &AccountState{
+		Account:                    c.account,
+		AccountValue:               *ms.AccountValue,
+		TotalMarginUsed:            *ms.TotalMarginUsed,
+		TotalNtlPos:                ms.TotalNtlPos,
+		TotalRawUsd:                ms.TotalRawUsd,
+		CrossMaintenanceMarginUsed: resp.CrossMaintenanceMarginUsed,
+		Withdrawable:               *resp.Withdrawable,
+		Time:                       resp.Time,
+	}, nil
+}
+
 // OpenOrders returns the master account's open orders from frontendOpenOrders
 // (the richer variant: it carries the client order id, which plain openOrders
 // does not). Decimals stay strings.

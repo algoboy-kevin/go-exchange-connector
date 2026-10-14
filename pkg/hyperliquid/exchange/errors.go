@@ -32,6 +32,13 @@ func (e *ConfigError) Error() string { return "hyperliquid: " + e.Reason }
 // ErrScheduleCancelUnavailable is returned by ScheduleCancel when the venue
 // refuses to arm the dead-man switch because the account's traded volume is
 // below the venue's threshold. Test with errors.Is.
+//
+// It is reported ONLY for a cleanly decoded 2xx {"status":"err"} envelope whose
+// message explicitly names traded volume (see isVolumeRefusal). Transport
+// failures, HTTP errors, unreadable bodies and any other rejection text are
+// never mapped to it: a caller treats this error as "the venue does not offer
+// the feature to this account", so a false positive would silently disable the
+// dead-man switch.
 var ErrScheduleCancelUnavailable = errors.New("hyperliquid: schedule cancel unavailable (account traded volume below the venue's threshold)")
 
 // IsUncertain reports whether a failed action MAY still have executed on the
@@ -46,6 +53,18 @@ func IsUncertain(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+
+	// /exchange with a captured HTTP status (ScheduleCancel): the status is
+	// authoritative even when the body happened to be JSON.
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code >= 500
+	}
+	// A 2xx exchange whose outcome could not be read (oversize body, unknown
+	// envelope status).
+	if isUncertainMarker(err) {
 		return true
 	}
 
@@ -105,6 +124,10 @@ func IsUncertain(err error) bool {
 func IsRateLimited(err error) bool {
 	if err == nil {
 		return false
+	}
+	var se *StatusError
+	if errors.As(err, &se) && se.Code == 429 {
+		return true
 	}
 	var he *hlinfo.HTTPError
 	if errors.As(err, &he) {

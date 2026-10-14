@@ -90,5 +90,19 @@ type OpenOrder struct {
 	Timestamp int64 // venue ms — order creation time
 }
 
+// AccountState is a read-only snapshot of the master account's perp
+// clearinghouse. Every decimal is the venue's string (quote = USDC); callers
+// convert and validate. Time is the venue's snapshot time in ms (0 if absent).
+type AccountState struct {
+	Account                    string // master address the snapshot is for (lowercase)
+	AccountValue               string // marginSummary.accountValue (perp equity)
+	TotalMarginUsed            string // marginSummary.totalMarginUsed
+	TotalNtlPos                string // marginSummary.totalNtlPos
+	TotalRawUsd                string // marginSummary.totalRawUsd
+	CrossMaintenanceMarginUsed string // crossMaintenanceMarginUsed
+	Withdrawable               string // withdrawable
+	Time                       int64  // venue ms
+}
+
 // minScheduleCancelLead is the venue's minimum lead time for ScheduleCancel.
 const minScheduleCancelLead = 5 * time.Second

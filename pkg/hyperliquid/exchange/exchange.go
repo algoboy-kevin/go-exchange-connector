@@ -122,7 +122,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		account,
 		&hl.SpotMeta{}, // pre-supplied so NewInfo never fetches (and never panics)
 		nil,            // no builder perp dex: main perps only
-		hl.ExchangeOptClientOptions(hl.ClientOptHTTPClient(hc)),
+		hl.ExchangeOptClientOptions(hl.ClientOptHTTPClient(withCaptureTransport(hc))),
 	)
 
 	return &Client{ex: ex, info: info, base: base, account: account, meta: meta}, nil
@@ -151,13 +151,15 @@ func parseAgentKey(s string) (*ecdsa.PrivateKey, error) {
 		return nil, &ConfigError{Reason: "agent key is empty"}
 	}
 	s = strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X")
+	// Errors describe only the SHAPE of the key: hex.DecodeString's error
+	// quotes the offending character, which is key material.
 	raw, err := hex.DecodeString(s)
 	if err != nil {
-		return nil, &ConfigError{Reason: "agent key is not valid hex: " + err.Error()}
+		return nil, &ConfigError{Reason: fmt.Sprintf("agent key is not valid hex (%d hex characters after any 0x prefix; want 64)", len(s))}
 	}
 	key, err := crypto.ToECDSA(raw)
 	if err != nil {
-		return nil, &ConfigError{Reason: "agent key is not a valid secp256k1 key: " + err.Error()}
+		return nil, &ConfigError{Reason: "agent key is not a valid secp256k1 private key"}
 	}
 	return key, nil
 }
