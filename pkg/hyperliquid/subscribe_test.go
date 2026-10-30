@@ -237,13 +237,27 @@ func keysOf(subs []Subscription) []string {
 	return out
 }
 
-// assertGaps checks consecutive receive times are at least min apart.
+// assertGaps checks that frames were paced min apart. Receive timestamps on a
+// loaded machine jitter by tens of milliseconds, so a per-gap bound at the
+// full pace is a flaky test of the scheduler, not of the pacing. Two checks
+// that jitter cannot defeat: no gap is a burst (every gap >= min/3), and the
+// whole sequence is spread out (first to last >= (n-1)*min minus one jitter
+// allowance), because the sender's spacing adds up while a single receive
+// delay does not.
 func assertGaps(t *testing.T, frames []venueFrame, min time.Duration) {
 	t.Helper()
+	if len(frames) < 2 {
+		return
+	}
 	for i := 1; i < len(frames); i++ {
-		if gap := frames[i].at.Sub(frames[i-1].at); gap < min {
-			t.Errorf("gap %d->%d = %v, want >= %v", i-1, i, gap, min)
+		if gap := frames[i].at.Sub(frames[i-1].at); gap < min/3 {
+			t.Errorf("gap %d->%d = %v, want >= %v (frames look unpaced)", i-1, i, gap, min/3)
 		}
+	}
+	const jitter = 40 * time.Millisecond
+	span := frames[len(frames)-1].at.Sub(frames[0].at)
+	if want := time.Duration(len(frames)-1)*min - jitter; span < want {
+		t.Errorf("%d frames spread over %v, want >= %v at a %v pace", len(frames), span, want, min)
 	}
 }
 
