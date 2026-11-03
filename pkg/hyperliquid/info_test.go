@@ -70,6 +70,42 @@ func TestInfoClientMeta(t *testing.T) {
 	}
 }
 
+func TestInfoClientMetaDex(t *testing.T) {
+	c, bodies, _ := newTestInfoServer(t, http.StatusOK,
+		`{"universe":[{"name":"xyz:JP225","szDecimals":5,"maxLeverage":20,"onlyIsolated":true}]}`)
+
+	meta, err := c.MetaDex(context.Background(), "xyz")
+	if err != nil {
+		t.Fatalf("MetaDex: %v", err)
+	}
+	if len(meta.Universe) != 1 || meta.Universe[0].Name != "xyz:JP225" ||
+		meta.Universe[0].SzDecimals != 5 || meta.Universe[0].MaxLeverage != 20 || !meta.Universe[0].OnlyIsolated {
+		t.Fatalf("bad dex universe: %+v", meta.Universe)
+	}
+	if len(*bodies) != 1 || len((*bodies)[0]) != 2 ||
+		(*bodies)[0]["type"] != "meta" || (*bodies)[0]["dex"] != "xyz" {
+		t.Fatalf("bad request body: %+v", *bodies)
+	}
+}
+
+func TestInfoClientMetaDexError(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"http", http.StatusTooManyRequests, `{"error":"rate limited"}`},
+		{"decode", http.StatusOK, `{"universe":"invalid"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, _ := newTestInfoServer(t, tc.status, tc.body)
+			if meta, err := c.MetaDex(context.Background(), "xyz"); err == nil || meta != nil {
+				t.Fatalf("MetaDex = %+v, %v; want nil, error", meta, err)
+			}
+		})
+	}
+}
+
 // TestInfoClientMetaRaw pins the raw path a recorder uses: the body must come
 // back byte-identical, because it is archived verbatim.
 func TestInfoClientMetaRaw(t *testing.T) {

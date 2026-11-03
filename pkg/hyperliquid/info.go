@@ -156,6 +156,16 @@ func (c *InfoClient) Meta(ctx context.Context) (*PerpMeta, error) {
 	return &meta, nil
 }
 
+// MetaDex fetches a HIP-3 dex's perpetual universe. Asset names are fully
+// qualified (for example, xyz:JP225); universe indices are not order asset ids.
+func (c *InfoClient) MetaDex(ctx context.Context, dex string) (*PerpMeta, error) {
+	var meta PerpMeta
+	if err := c.get(ctx, map[string]any{"type": "meta", "dex": dex}, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
 // MetaRaw fetches the meta response body verbatim, for callers that archive
 // venue output instead of interpreting it.
 func (c *InfoClient) MetaRaw(ctx context.Context) ([]byte, error) {
