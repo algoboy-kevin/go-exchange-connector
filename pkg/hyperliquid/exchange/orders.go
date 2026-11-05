@@ -10,11 +10,15 @@ import (
 	"strings"
 	"time"
 
-	hl "github.com/sonirico/go-hyperliquid"
+	hl "github.com/algoboy-kevin/go-exchange-connector/internal/hlsdk"
 )
 
-// Place submits orders as one "order" action (grouping "na") and returns one
-// status per order, in the order they were submitted.
+// Place validates the entire batch (every scope, coin, cloid, decimal and tif)
+// before any wire action, then submits ONE signed "order" action (grouping
+// "na") covering every core and HIP-3 scope on the merged write Exchange. The
+// wire and the returned statuses keep the caller's original order. A single
+// bulk action is not all-or-nothing: statuses are per item. One mutation
+// attempt is made; it is never resent.
 //
 // sonirico's BulkOrders returns a non-nil result AND an error whenever any item
 // failed, so that error is NOT a call failure: the statuses are mapped per item
@@ -24,6 +28,17 @@ import (
 func (c *Client) Place(ctx context.Context, orders []Order) ([]OrderStatus, error) {
 	if len(orders) == 0 {
 		return nil, nil
+	}
+	coins := make([]string, len(orders))
+	for i, o := range orders {
+		coins[i] = o.Coin
+		if err := validateCloid(o.Cloid, false); err != nil {
+			return nil, err
+		}
+	}
+	ex, err := c.resolveWrite(coins)
+	if err != nil {
+		return nil, err
 	}
 	reqs := make([]hl.CreateOrderRequest, len(orders))
 	for i, o := range orders {
@@ -55,14 +70,16 @@ func (c *Client) Place(ctx context.Context, orders []Order) ([]OrderStatus, erro
 		}
 	}
 
-	res, err := c.ex.BulkOrders(ctx, reqs, nil)
-	if res == nil {
-		return nil, callFailure("place", err)
-	}
-	if !res.Ok {
-		return nil, &ActionError{Msg: res.Err}
-	}
-	return mapOrderStatuses(res.Data.Statuses, len(orders)), nil
+	return runAction(ctx, c, ex, reqs, func(ctx context.Context, ex *hl.Exchange, part []hl.CreateOrderRequest) ([]OrderStatus, error) {
+		res, err := ex.BulkOrders(ctx, part, nil)
+		if res == nil {
+			return nil, callFailure("place", err)
+		}
+		if !res.Ok {
+			return nil, &ActionError{Msg: res.Err}
+		}
+		return mapOrderStatuses(res.Data.Statuses, len(part)), nil
+	})
 }
 
 // CancelByCloid cancels orders by client order id, one status per request.
@@ -74,12 +91,25 @@ func (c *Client) CancelByCloid(ctx context.Context, reqs []CancelReq) ([]CancelS
 	if len(reqs) == 0 {
 		return nil, nil
 	}
+	coins := make([]string, len(reqs))
+	for i, r := range reqs {
+		coins[i] = r.Coin
+		if err := validateCloid(r.Cloid, true); err != nil {
+			return nil, err
+		}
+	}
+	ex, err := c.resolveWrite(coins)
+	if err != nil {
+		return nil, err
+	}
 	wire := make([]hl.CancelOrderRequestByCloid, len(reqs))
 	for i, r := range reqs {
 		wire[i] = hl.CancelOrderRequestByCloid{Coin: r.Coin, Cloid: r.Cloid}
 	}
-	res, err := c.ex.BulkCancelByCloids(ctx, wire)
-	return mapCancelResult(res, err, len(reqs), "cancelByCloid")
+	return runAction(ctx, c, ex, wire, func(ctx context.Context, ex *hl.Exchange, part []hl.CancelOrderRequestByCloid) ([]CancelStatus, error) {
+		res, err := ex.BulkCancelByCloids(ctx, part)
+		return mapCancelResult(res, err, len(part), "cancelByCloid")
+	})
 }
 
 // CancelByOid cancels orders by venue order id, one status per request.
@@ -87,12 +117,22 @@ func (c *Client) CancelByOid(ctx context.Context, reqs []OidCancel) ([]CancelSta
 	if len(reqs) == 0 {
 		return nil, nil
 	}
+	coins := make([]string, len(reqs))
+	for i, r := range reqs {
+		coins[i] = r.Coin
+	}
+	ex, err := c.resolveWrite(coins)
+	if err != nil {
+		return nil, err
+	}
 	wire := make([]hl.CancelOrderRequest, len(reqs))
 	for i, r := range reqs {
 		wire[i] = hl.CancelOrderRequest{Coin: r.Coin, OrderID: r.Oid}
 	}
-	res, err := c.ex.BulkCancel(ctx, wire)
-	return mapCancelResult(res, err, len(reqs), "cancel")
+	return runAction(ctx, c, ex, wire, func(ctx context.Context, ex *hl.Exchange, part []hl.CancelOrderRequest) ([]CancelStatus, error) {
+		res, err := ex.BulkCancel(ctx, part)
+		return mapCancelResult(res, err, len(part), "cancel")
+	})
 }
 
 // ScheduleCancel arms (at non-nil) or disarms (at nil) the venue's dead-man
@@ -126,6 +166,11 @@ func (c *Client) ScheduleCancel(ctx context.Context, at *time.Time) error {
 		ms = &t
 	}
 
+	if err := c.lockAction(ctx); err != nil {
+		return err
+	}
+	defer c.unlockAction()
+	c.seed(c.ex)
 	cctx, rc := withCapture(ctx)
 	_, err := c.ex.ScheduleCancel(cctx, ms)
 	return classifyScheduleCancel(err, rc.snapshot())
@@ -234,7 +279,17 @@ func (c *Client) UpdateLeverage(ctx context.Context, coin string, leverage int, 
 	if leverage <= 0 {
 		return fmt.Errorf("hyperliquid: leverage for %s must be positive, got %d", coin, leverage)
 	}
-	if _, err := c.ex.UpdateLeverage(ctx, leverage, coin, isCross); err != nil {
+	ex, err := c.route(coin)
+	if err != nil {
+		return err
+	}
+	if err := c.lockAction(ctx); err != nil {
+		return err
+	}
+	c.seed(ex)
+	_, err = ex.UpdateLeverage(ctx, leverage, coin, isCross)
+	c.unlockAction()
+	if err != nil {
 		return fmt.Errorf("hyperliquid: update leverage %s: %w", coin, err)
 	}
 
@@ -296,6 +351,12 @@ func parseDecimal(what, coin, s string) (float64, error) {
 	}
 	if f <= 0 {
 		return 0, fmt.Errorf("hyperliquid: order %s: %s must be positive, got %q", coin, what, s)
+	}
+	// Preflight the pinned SDK's floatToWire representability check before any
+	// scope is sent. Keep actual wire rendering/signing in the SDK.
+	rounded, err := strconv.ParseFloat(strconv.FormatFloat(f, 'f', 8, 64), 64)
+	if err != nil || math.Abs(rounded-f) >= 1e-12 {
+		return 0, fmt.Errorf("hyperliquid: order %s: %s cannot be represented by SDK wire precision", coin, what)
 	}
 	return f, nil
 }

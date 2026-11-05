@@ -1,5 +1,5 @@
 // Command test_hyperliquid validates the Hyperliquid market-data streams and
-// doubles as the probe for the open questions in PERP_COLLECTOR_SPEC.md §8.
+// doubles as the probe for the open questions in docs/PERP_COLLECTOR_SPEC.md §8.
 //
 // It connects to the venue's public WebSocket, subscribes to the requested
 // channels for the requested coins, prints each dispatched event, and reports

@@ -13,10 +13,11 @@
 //   - Everything is a business error unless IsUncertain or IsRateLimited says
 //     otherwise: an order action that "failed" may still have executed.
 //   - Queries read the master account's state; only signing uses the agent key.
-//   - No retries: the driver decides what a rate limit or an uncertain outcome
-//     means for its own order state.
+//   - Mutations are never retried: the driver decides what a rate limit or an
+//     uncertain outcome means for its own order state. Read-only /info queries
+//     have bounded context-aware HTTP 429 backoff (see postInfo).
 //
-// Scope is Hyperliquid main perps: no HIP-3 builder dexes, no spot, no vaults.
+// Scope is core perps plus explicitly registered HIP-3 DEXes; no spot or vaults.
 package exchange
 
 import (
@@ -28,11 +29,11 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
-	hlinfo "github.com/algoboy-kevin/go-exchange-connector/pkg/hyperliquid"
 	"github.com/ethereum/go-ethereum/crypto"
-	hl "github.com/sonirico/go-hyperliquid"
+	hl "github.com/algoboy-kevin/go-exchange-connector/internal/hlsdk"
 )
 
 const (
@@ -62,17 +63,33 @@ type Config struct {
 	AgentKey string // hex private key, with or without a 0x prefix
 	Account  string // master account address, 0x… (40 hex)
 	HTTP     *http.Client
+	PerpDexs []string // explicitly registered optional HIP-3 scopes
+
+	// InfoRetry overrides the bounded HTTP 429 retry budget of read-only /info
+	// queries. nil selects the default (3 retries). A pointer to 0 disables
+	// retries, so a 429 is returned at once (use this on the quoting path). A
+	// negative value is treated as 0.
+	InfoRetry *int
 }
 
-// Client is a Hyperliquid execution client. It is safe for concurrent use: the
-// underlying exchange takes its nonce from a single atomic counter, so
-// concurrent submits are ordered (and never share a nonce).
+// Client is safe for concurrent use. Routing snapshots are immutable after
+// publication; all SDK mutations share one account-wide action/nonce gate.
 type Client struct {
-	ex      *hl.Exchange
-	info    *hlinfo.InfoClient
-	base    string
-	account string
-	meta    Meta
+	ex           *hl.Exchange
+	info         *boundedInfo
+	base         string
+	account      string
+	meta         Meta
+	key          *ecdsa.PrivateKey
+	http         *http.Client
+	routesMu     sync.RWMutex
+	routes       map[string]*hl.Exchange
+	metas        map[string]*hl.Meta // per-scope SDK meta, same lifetime as routes
+	write        *hl.Exchange        // merged core+HIP-3 Exchange: the only order/cancel poster
+	registerGate chan struct{}
+	actionGate   chan struct{}
+	signer       *nonceSigner // last is protected by actionGate, never routesMu
+	infoRetry    *int         // Config.InfoRetry; nil means the default budget
 }
 
 // New builds a Client.
@@ -95,14 +112,14 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	hc := cfg.HTTP
-	if hc == nil {
-		hc = &http.Client{Timeout: defaultHTTPTimeout}
+	hc := &http.Client{Timeout: defaultHTTPTimeout}
+	if cfg.HTTP != nil {
+		*hc = *cfg.HTTP
+		if hc.Timeout <= 0 {
+			hc.Timeout = defaultHTTPTimeout
+		}
 	}
-
-	// The repo's /info client: bounded bodies, a user agent, and typed errors
-	// (hyperliquid.HTTPError) that classify 5xx / 429 / non-JSON precisely.
-	info := hlinfo.NewInfoClient(base + "/info")
+	info := &boundedInfo{url: base + "/info", http: hc}
 	raw, err := info.Post(ctx, map[string]any{"type": "meta"})
 	if err != nil {
 		return nil, fmt.Errorf("hyperliquid: fetch perp meta: %w", err)
@@ -113,19 +130,26 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, err
 	}
 
-	ex := hl.NewExchange(
-		ctx,
-		key,
-		base,
-		hlMeta,
-		"", // no vault
-		account,
-		&hl.SpotMeta{}, // pre-supplied so NewInfo never fetches (and never panics)
-		nil,            // no builder perp dex: main perps only
-		hl.ExchangeOptClientOptions(hl.ClientOptHTTPClient(withCaptureTransport(hc))),
-	)
-
-	return &Client{ex: ex, info: info, base: base, account: account, meta: meta}, nil
+	c := &Client{info: info, base: base, account: account, meta: meta, key: key, http: withCaptureTransport(hc), routes: make(map[string]*hl.Exchange), metas: make(map[string]*hl.Meta), registerGate: make(chan struct{}, 1), actionGate: make(chan struct{}, 1), signer: &nonceSigner{delegate: hl.ECDSAL1Signer(key)}, infoRetry: cfg.InfoRetry}
+	if err := validateMeta(meta, ""); err != nil {
+		return nil, err
+	}
+	c.ex, err = c.newExchange(ctx, "", hlMeta, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.routes[""] = c.ex
+	c.metas[""] = hlMeta
+	c.write, err = c.newWriteExchange(ctx, map[string]*hl.Meta{"": hlMeta}, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, dex := range cfg.PerpDexs {
+		if err := c.RegisterDex(ctx, dex); err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
 }
 
 // resolveBaseURL picks the REST base: BaseURL wins, else Network, else mainnet.
@@ -199,6 +223,22 @@ type hlMetaShadow struct {
 // parseMeta decodes the venue's meta body into both the shape sonirico needs and
 // this package's public Meta.
 func parseMeta(raw []byte) (*hl.Meta, Meta, error) {
+	// Required fields use stdlib pointers: generated SDK decoders otherwise
+	// silently turn missing/null decimals into zero (a valid but wrong precision).
+	var required struct {
+		Universe []struct {
+			Name       *string `json:"name"`
+			SzDecimals *int    `json:"szDecimals"`
+		} `json:"universe"`
+	}
+	if err := json.Unmarshal(raw, &required); err != nil {
+		return nil, Meta{}, &ScopeError{Reason: "invalid metadata shape"}
+	}
+	for _, a := range required.Universe {
+		if a.Name == nil || a.SzDecimals == nil {
+			return nil, Meta{}, &ScopeError{Reason: "metadata missing name/szDecimals"}
+		}
+	}
 	var shadow hlMetaShadow
 	if err := json.Unmarshal(raw, &shadow); err != nil {
 		return nil, Meta{}, fmt.Errorf("hyperliquid: decode perp meta: %w", err)

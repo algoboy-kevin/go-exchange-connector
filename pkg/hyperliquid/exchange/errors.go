@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	hlinfo "github.com/algoboy-kevin/go-exchange-connector/pkg/hyperliquid"
-	hl "github.com/sonirico/go-hyperliquid"
+	hl "github.com/algoboy-kevin/go-exchange-connector/internal/hlsdk"
 )
 
 // ActionError is a business rejection returned by the venue in a TOP-LEVEL
@@ -51,6 +51,10 @@ var ErrScheduleCancelUnavailable = errors.New("hyperliquid: schedule cancel unav
 func IsUncertain(err error) bool {
 	if err == nil {
 		return false
+	}
+	var partial *PartialBatchError
+	if errors.As(err, &partial) {
+		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true

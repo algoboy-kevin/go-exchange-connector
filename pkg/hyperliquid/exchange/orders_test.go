@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
-	hl "github.com/sonirico/go-hyperliquid"
+	hl "github.com/algoboy-kevin/go-exchange-connector/internal/hlsdk"
 )
 
 // placeResponse builds an /exchange order envelope with the given statuses.
@@ -214,12 +214,14 @@ func TestPlacePostsSignedOrderAction(t *testing.T) {
 	// White-box: pin the nonce (the public API has no nonce control, and a
 	// wall-clock nonce cannot be asserted).
 	c.ex.SetLastNonce(pinnedNonce - 1)
+	c.signer.last = pinnedNonce - 1 // pin the account-wide nonce state too
 	if _, err := c.Place(context.Background(), []Order{order}); err != nil {
 		t.Fatalf("Place: %v", err)
 	}
 	body1 := append([]byte(nil), lastExchangeBody(t, v)...)
 
 	c.ex.SetLastNonce(pinnedNonce - 1)
+	c.signer.last = pinnedNonce - 1 // pin the account-wide nonce state too
 	if _, err := c.Place(context.Background(), []Order{order}); err != nil {
 		t.Fatalf("Place (second): %v", err)
 	}

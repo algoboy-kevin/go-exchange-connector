@@ -11,7 +11,12 @@ go-exchange-connector/
 ├── errors.go           # Sentinel errors + domain error types
 ├── mock.go             # MockConnector — accept-all no-op for testing
 ├── go.mod
+├── AGENTS.md           # repo conventions for agents
 ├── README.md
+├── docs/               # feature matrix, exchange audit, specs, verification status
+├── cmd/                # runnable checks (test_hl_orders, test_hl_fill, test_hl_reserve, ...)
+├── internal/
+│   └── hlnet/          # Hyperliquid testnet/mainnet URLs and .env key names
 └── pkg/
     ├── binance/
     │   ├── binance.go  # WSBinance — spot + perpetual market data streams
@@ -20,11 +25,37 @@ go-exchange-connector/
     │   ├── hyperliquid.go  # WSHyperliquid — perp market data streams
     │   ├── channels.go     # channel registry, validation, subscription frames
     │   ├── types.go        # WS payloads + REST /info types
-    │   └── info.go         # InfoClient — /info metadata & snapshots
+    │   ├── info.go         # InfoClient — /info metadata & snapshots
+    │   └── exchange/       # order execution: place, cancel, reserve, account reads
     └── websocket/
         ├── types.go    # ConnectionStatus, WSOptions, WSocketError, PanicError
         └── websocket.go# BaseWebSocket — reconnect, ping/pong, status tracking
 ```
+
+## Documentation
+
+| File | Contents |
+|---|---|
+| `AGENTS.md` | Repo conventions and rules for agents |
+| `docs/FEATURE_MATRIX.md` | Venue × market map: which packages implement what |
+| `docs/EXCHANGE_AUDIT.md` | Per-exchange readiness, and the verification status table (level and network per feature) |
+| `docs/CONNECTOR_CHANGES.md` | Changes the go-collector needs from this connector |
+| `docs/PERP_COLLECTOR_SPEC.md` | Perp collector spec (open questions in §8) |
+| `docs/authentication.md`, `docs/ctf.md`, `docs/migrating.md` | Auth, CTF and migration notes |
+
+## Verification
+
+Live checks are commands under `cmd/`. Each sends nothing unless `-live` is given, and mainnet
+also requires `-confirm-mainnet`. Keys are read from `.env` by name only; values are never printed.
+
+| Command | What it checks |
+|---|---|
+| `cmd/test_hl_orders` | Place, cancel by oid, batch, cancel by cloid, WS order updates |
+| `cmd/test_hl_fill` | IOC entry fill, reduce-only exit, userFills, flat position, IOC no-fill |
+| `cmd/test_hl_reserve` | `reserveRequestWeight` (costs 0.0005 USDC per weight unit) |
+
+Run the read-only check first: `go run ./cmd/test_hl_orders -network mainnet`. Then see the
+verification table in `docs/EXCHANGE_AUDIT.md` before claiming a feature is tested on a network.
 
 ## Quick Start
 
@@ -290,7 +321,7 @@ Notes — all verified live on 2026-10-04 with `go run ./cmd/test_hyperliquid`:
 
 - **Wire format is `{"method":"subscribe","subscription":{...}}`, one
   subscription per frame** — *not* the bare `{"type":"l2Book","coin":"BTC"}`
-  form shown in `PERP_COLLECTOR_SPEC.md` §1. The bare form is not the venue's
+  form shown in `docs/PERP_COLLECTOR_SPEC.md` §1. The bare form is not the venue's
   protocol; the method/subscription form is what the docs and every published
   SDK send, and what this package emits (`BuildSubscriptions` +
   `SubscribeFrame` are exported for a recorder that needs the frames itself).

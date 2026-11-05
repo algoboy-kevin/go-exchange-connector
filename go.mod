@@ -3,9 +3,16 @@ module github.com/algoboy-kevin/go-exchange-connector
 go 1.25.3
 
 require (
+	github.com/algoboy-kevin/go-common v0.2.0
 	github.com/coder/websocket v1.8.12
 	github.com/ethereum/go-ethereum v1.17.5
-	github.com/sonirico/go-hyperliquid v0.46.1
+	github.com/gorilla/websocket v1.5.3
+	github.com/joho/godotenv v1.5.1
+	github.com/mailru/easyjson v0.9.2
+	github.com/sonirico/vago v0.12.0
+	github.com/sonirico/vago/lol v0.1.0
+	github.com/valyala/fastjson v1.6.10
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 
 require (
@@ -28,24 +35,17 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
-	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
 	github.com/rs/zerolog v1.34.0 // indirect
 	github.com/shirou/gopsutil v3.21.4-0.20210419000835-c7a38de76ee5+incompatible // indirect
-	github.com/sonirico/vago v0.12.0 // indirect
-	github.com/sonirico/vago/lol v0.1.0 // indirect
 	github.com/supranational/blst v0.3.16 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
-	github.com/valyala/fastjson v1.6.10 // indirect
-	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.elastic.co/apm/module/apmzerolog/v2 v2.7.2 // indirect
 	go.elastic.co/apm/v2 v2.7.2 // indirect
@@ -59,3 +59,6 @@ require (
 	golang.org/x/sys v0.41.0 // indirect
 	howett.net/plist v1.0.1 // indirect
 )
+
+// TEMP (S32 Option B, owner-approved 2026-11-05): local pinned-SDK checkout
+// (v0.46.1 == de732b3) for the multi-DEX Info patch. Keep until upstream lands.
