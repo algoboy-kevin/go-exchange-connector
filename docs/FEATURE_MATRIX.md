@@ -1,5 +1,10 @@
 # Exchange feature matrix (venue × market)
 
+## Binance spot "testnet" remap — 2026-11-05 (no live run)
+
+- Project `testnet` for Binance spot now means Binance **Spot Demo Mode** (`demo-api.binance.com`, `demo-ws-api.binance.com`, `demo-stream.binance.com`; official doc cached line 132362, llms-full sha256 `7fe8634d231eacc5564bef1995fe45c1bbc52ea7b7072cc50e3b0d06ad05c68e`). The label is a project alias; legacy Spot Testnet is not used by this repo.
+- The "Testnet authentication failed with -2015" row below targeted the legacy testnet and does NOT establish Demo Mode key invalidity. No new live run was performed.
+
 ## Latest Binance validation — November 5, 2026
 
 - BN-perp: place single, place batch (2), cancel by client id and batch cancel, open-order reads, and matching NEW/CANCELED user-stream events are **P on testnet only (L2)**. Three order-status queries confirmed canceled with zero executed quantity. Mainnet signed reads and user-stream connection worked, but an order was rejected for insufficient margin (-2019); mainnet execution is not proven.

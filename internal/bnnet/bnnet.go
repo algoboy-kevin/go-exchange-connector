@@ -8,7 +8,7 @@
 //
 //	BINANCE_FUTURES_TESTNET_API_KEY / _API_SECRET   USDⓈ-M futures testnet (demo-fapi)
 //	BINANCE_FUTURES_MAINNET_API_KEY / _API_SECRET
-//	BINANCE_SPOT_TESTNET_API_KEY / _API_SECRET      spot testnet (testnet.binance.vision)
+//	BINANCE_SPOT_TESTNET_API_KEY / _API_SECRET      spot "testnet" = Spot Demo Mode (demo-api.binance.com)
 //	BINANCE_SPOT_MAINNET_API_KEY / _API_SECRET
 package bnnet
 
@@ -53,8 +53,10 @@ func Resolve(market, network string) (Env, error) {
 		e.RESTURL, e.WSURL = "https://fapi.binance.com", "wss://fstream.binance.com"
 		e.WSAPIURL = "wss://ws-fapi.binance.com/ws-fapi/v1"
 	case m == Spot && n == "testnet":
-		e.RESTURL, e.WSURL = "https://testnet.binance.vision", "wss://stream.testnet.binance.vision"
-		e.WSAPIURL = "wss://ws-api.testnet.binance.vision/ws-api/v3"
+		// "testnet" is the project alias for Binance Spot Demo Mode (official
+		// doc: demo-mode/general-info). Binance's legacy Spot Testnet is not used.
+		e.RESTURL, e.WSURL = "https://demo-api.binance.com", "wss://demo-stream.binance.com"
+		e.WSAPIURL = "wss://demo-ws-api.binance.com/ws-api/v3"
 	case m == Spot && n == "mainnet":
 		e.RESTURL, e.WSURL = "https://api.binance.com", "wss://stream.binance.com:9443"
 		e.WSAPIURL = "wss://ws-api.binance.com:443/ws-api/v3"

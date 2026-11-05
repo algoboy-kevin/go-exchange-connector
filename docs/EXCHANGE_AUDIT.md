@@ -1,5 +1,10 @@
 # Exchange connector audit (per exchange)
 
+## Binance spot "testnet" remap — 2026-11-05 (no live run)
+
+- Project `testnet` for Binance spot now maps to Binance **Spot Demo Mode** (REST `https://demo-api.binance.com`, WS API `wss://demo-ws-api.binance.com/ws-api/v3`, market WS `wss://demo-stream.binance.com`). Source: official Demo Mode doc, cached llms-full line 132362; `https://developers.binance.com/en/docs/llms-full.txt`, sha256 `7fe8634d231eacc5564bef1995fe45c1bbc52ea7b7072cc50e3b0d06ad05c68e`. "testnet" here is a project alias; legacy Spot Testnet (`testnet.binance.vision`) is no longer used by this repo. Binance's own legacy testnet is not claimed removed.
+- The 2026-11-05 "Spot testnet: BLOCKED" entry below (-2015) was measured against the legacy testnet host. It does NOT establish that a Demo Mode key is invalid. No new live rerun was performed for Demo Mode.
+
 ## Binance validation — November 5, 2026
 
 - Local Mac egress through the approved Tokyo Tailscale exit node was verified before every run. All four public dry runs passed; no credentials are recorded here.

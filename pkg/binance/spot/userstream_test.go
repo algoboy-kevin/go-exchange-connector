@@ -523,7 +523,7 @@ func TestNewUserStreamValidation(t *testing.T) {
 		t.Fatal("bad event type accepted")
 	}
 	u, err := NewUserStream(UserStreamConfig{Client: c, Network: Testnet})
-	if err != nil || u.wsURL != "wss://ws-api.testnet.binance.vision/ws-api/v3" {
+	if err != nil || u.wsURL != "wss://demo-ws-api.binance.com/ws-api/v3" {
 		t.Fatalf("%v %v", u, err)
 	}
 	u, _ = NewUserStream(UserStreamConfig{Client: c})

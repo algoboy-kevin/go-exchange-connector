@@ -1,14 +1,12 @@
 // Package spot is a Binance SPOT signed REST client plus a user-data stream.
 //
 // Source of every rule below: the Binance docs as recorded by exchange-docs-hub
-// (catalog entry `binance`, https://developers.binance.com/en/docs/llms-full.txt,
-// content_sha256 7fe8634d231eacc5564bef1995fe45c1bbc52ea7b7072cc50e3b0d06ad05c68e).
-// "line N" below is a line of that file. The mainnet spot REST page in that text
-// holds only the general information (line 21453); the per-endpoint pages
-// (POST /api/v3/order, DELETE /api/v3/openOrders, ...) are present only in the
-// spot TESTNET REST page (line 117730), which documents the same API on
-// testnet.binance.vision. Endpoint parameters and response shapes here are cited
-// to that page.
+// (https://developers.binance.com/en/docs/llms-full.txt, content_sha256 7fe8634d231eacc5564bef1995fe45c1bbc52ea7b7072cc50e3b0d06ad05c68e). "line N" below is a line of that file.
+// The mainnet spot REST page holds only the general information (line 21453);
+// the per-endpoint pages are present only in the spot TESTNET REST page (line
+// 117730), which documents the same API as the legacy testnet.binance.vision.
+// The project's "testnet" now points at Spot Demo Mode (demo-api.binance.com,
+// line 132362); the endpoint shapes cited from the legacy page still apply.
 //
 // # Signing (mainnet lines 21665-21720; testnet 117896-118090)
 //
@@ -106,13 +104,15 @@ type Network string
 const (
 	// Mainnet is production spot (https://api.binance.com, line 21466).
 	Mainnet Network = "mainnet"
-	// Testnet is the spot test network (https://testnet.binance.vision, line 117740).
+	// Testnet is the project alias for Binance Spot Demo Mode
+	// (https://demo-api.binance.com; official doc demo-mode/general-info, cached
+	// llms-full line 132362). It is NOT the legacy testnet.binance.vision.
 	Testnet Network = "testnet"
 )
 
 const (
 	mainnetBaseURL = "https://api.binance.com"
-	testnetBaseURL = "https://testnet.binance.vision"
+	testnetBaseURL = "https://demo-api.binance.com"
 
 	defaultRecvWindow  = 5 * time.Second
 	maxRecvWindow      = 60 * time.Second // line 21692

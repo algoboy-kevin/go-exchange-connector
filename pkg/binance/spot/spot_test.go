@@ -224,7 +224,7 @@ func TestUnsignedPublicRequestsCarryNoSignature(t *testing.T) {
 
 func TestNewConfig(t *testing.T) {
 	c, err := New(Config{Network: Testnet})
-	if err != nil || c.BaseURL() != "https://testnet.binance.vision" {
+	if err != nil || c.BaseURL() != "https://demo-api.binance.com" {
 		t.Fatalf("%v %v", c, err)
 	}
 	c, _ = New(Config{})

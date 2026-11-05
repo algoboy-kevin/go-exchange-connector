@@ -45,7 +45,7 @@ import (
 // or {"id","status":4xx,"error":{"code","msg"}} (lines 19945, 117165-117190).
 //
 // Connection facts (line 19796-19820): the endpoint is
-// wss://ws-api.binance.com:443/ws-api/v3 (testnet wss://ws-api.testnet.binance.vision/ws-api/v3);
+// wss://ws-api.binance.com:443/ws-api/v3 (Testnet = Demo Mode wss://demo-ws-api.binance.com/ws-api/v3);
 // a single connection is only valid for 24 HOURS ("expect to be disconnected
 // after the 24-hour mark"); a serverShutdown event announces a server stop and
 // the disconnect that follows (line 20124); the server pings every 20 s and
@@ -63,7 +63,7 @@ import (
 
 const (
 	mainnetWSAPI = "wss://ws-api.binance.com:443/ws-api/v3"
-	testnetWSAPI = "wss://ws-api.testnet.binance.vision/ws-api/v3"
+	testnetWSAPI = "wss://demo-ws-api.binance.com/ws-api/v3"
 
 	methodSubscribeSignature = "userDataStream.subscribe.signature"
 
