@@ -193,41 +193,63 @@ func (a *Adapter) PlaceOrders(ctx context.Context, reqs []contract.OrderRequest)
 	return out, nil
 }
 
-// CancelOrder cancels by client order id. Cancel by exchange order id is
-// documented by Binance but not implemented in pkg/binance/futures yet.
+// CancelOrder cancels by exchange order id when OrderID is set (it wins when
+// both are set), otherwise by client order id.
 func (a *Adapter) CancelOrder(ctx context.Context, req contract.CancelRequest) (contract.CancelResult, error) {
 	if err := req.Validate(); err != nil {
 		return contract.CancelResult{}, err
 	}
-	if req.ClientID == "" {
-		return contract.CancelResult{}, fmt.Errorf("%w: cancel by exchange order id (pkg/binance/futures has only CancelOrder by client id)", contract.ErrNotImplemented)
+	var (
+		o   *futures.Order
+		err error
+	)
+	if req.OrderID != "" {
+		id, perr := parseOrderID(req.OrderID)
+		if perr != nil {
+			return contract.CancelResult{}, perr
+		}
+		o, err = a.c.CancelOrderByID(ctx, req.Symbol, id)
+	} else {
+		o, err = a.c.CancelOrder(ctx, req.Symbol, req.ClientID)
 	}
-	o, err := a.c.CancelOrder(ctx, req.Symbol, req.ClientID)
 	if err != nil {
 		if futures.IsUncertain(err) {
-			return contract.CancelResult{ClientID: req.ClientID, Reason: err.Error()},
+			return contract.CancelResult{OrderID: req.OrderID, ClientID: req.ClientID, Reason: err.Error()},
 				fmt.Errorf("%w: %v", contract.ErrUncertain, err)
 		}
 		var apiErr *futures.APIError
 		if errors.As(err, &apiErr) {
-			return contract.CancelResult{ClientID: req.ClientID, Reason: apiErr.Msg}, nil
+			return contract.CancelResult{OrderID: req.OrderID, ClientID: req.ClientID, Reason: apiErr.Msg}, nil
 		}
 		return contract.CancelResult{}, err
 	}
-	res := contract.CancelResult{ClientID: req.ClientID, Canceled: true}
+	res := contract.CancelResult{OrderID: req.OrderID, ClientID: req.ClientID, Canceled: true}
 	if o != nil && o.OrderID != 0 {
 		res.OrderID = strconv.FormatInt(o.OrderID, 10)
 	}
 	return res, nil
 }
 
-// CancelOrders cancels up to 10 orders by client order id (cancel batch).
+// parseOrderID converts a contract order id to Binance's positive integer.
+func parseOrderID(s string) (int64, error) {
+	id, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("%w: order id %q is not a positive integer", contract.ErrInvalid, s)
+	}
+	return id, nil
+}
+
+// CancelOrders cancels up to 10 orders in one call. All requests must be on one
+// symbol and must all use order ids (OrderID wins when both are set) or all use
+// client ids; a mixed batch is rejected locally because Binance takes one list.
 func (a *Adapter) CancelOrders(ctx context.Context, reqs []contract.CancelRequest) ([]contract.CancelResult, error) {
 	if err := contract.CheckBatch(len(reqs), maxCancelBatch); err != nil {
 		return nil, err
 	}
 	symbol := reqs[0].Symbol
-	ids := make([]string, len(reqs))
+	byID := reqs[0].OrderID != ""
+	oids := make([]int64, 0, len(reqs))
+	cids := make([]string, 0, len(reqs))
 	for i, r := range reqs {
 		if err := r.Validate(); err != nil {
 			return nil, fmt.Errorf("cancel %d: %w", i, err)
@@ -235,17 +257,33 @@ func (a *Adapter) CancelOrders(ctx context.Context, reqs []contract.CancelReques
 		if r.Symbol != symbol {
 			return nil, fmt.Errorf("%w: one symbol per cancel batch (got %s and %s)", contract.ErrInvalid, symbol, r.Symbol)
 		}
-		if r.ClientID == "" {
-			return nil, fmt.Errorf("cancel %d: %w: cancel by exchange order id not implemented", i, contract.ErrNotImplemented)
+		if (r.OrderID != "") != byID {
+			return nil, fmt.Errorf("cancel %d: %w: a cancel batch cannot mix order ids and client ids", i, contract.ErrInvalid)
 		}
-		ids[i] = r.ClientID
+		if byID {
+			id, err := parseOrderID(r.OrderID)
+			if err != nil {
+				return nil, fmt.Errorf("cancel %d: %w", i, err)
+			}
+			oids = append(oids, id)
+		} else {
+			cids = append(cids, r.ClientID)
+		}
 	}
-	items, err := a.c.CancelBatch(ctx, symbol, ids)
+	var (
+		items []futures.BatchItem
+		err   error
+	)
+	if byID {
+		items, err = a.c.CancelBatchByID(ctx, symbol, oids)
+	} else {
+		items, err = a.c.CancelBatch(ctx, symbol, cids)
+	}
 	if err != nil {
 		if futures.IsUncertain(err) {
 			out := make([]contract.CancelResult, len(reqs))
 			for i, r := range reqs {
-				out[i] = contract.CancelResult{ClientID: r.ClientID, Reason: err.Error()}
+				out[i] = contract.CancelResult{OrderID: r.OrderID, ClientID: r.ClientID, Reason: err.Error()}
 			}
 			return out, fmt.Errorf("%w: %v", contract.ErrUncertain, err)
 		}
@@ -256,7 +294,7 @@ func (a *Adapter) CancelOrders(ctx context.Context, reqs []contract.CancelReques
 	}
 	out := make([]contract.CancelResult, len(reqs))
 	for i, it := range items {
-		out[i] = contract.CancelResult{ClientID: reqs[i].ClientID, Canceled: it.Err == nil}
+		out[i] = contract.CancelResult{OrderID: reqs[i].OrderID, ClientID: reqs[i].ClientID, Canceled: it.Err == nil}
 		if it.Err != nil {
 			var apiErr *futures.APIError
 			if errors.As(it.Err, &apiErr) {
