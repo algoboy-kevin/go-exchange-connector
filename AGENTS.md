@@ -33,6 +33,7 @@ pushed only when the user asks; until then go-collector uses a TEMP `replace` to
 - No push / tag push unless asked.
 
 ## Current state (update every session)
+- 2026-11-05: v0.8.1 (a1e63af) on main and tagged: HL execution (pkg/hyperliquid/exchange, vendored SDK subset internal/hlsdk), Binance USD-M futures REST + user stream, contract adapters. HL verified L3 on testnet+mainnet (docs/EXCHANGE_AUDIT.md). go-mm-driver consumes the tag. Open: Aster connector (pkg/aster) not started; Binance/Polymarket execution live-verification not run; HL batch cap 50 unverified; go-collector/go-market-feature still use TEMP local replace; local tag v0.8.0 (36fd3c3) unpushed, superseded by v0.8.1.
 - 2026-10-11: branch `feat/mm-exec` (from feat/reconnect-market, local, NOT pushed) for go-mm-driver
   execution (specs live in go-mm-driver/docs/specs S11, S13): a4d2b64 `pkg/binance/futures` signed
   REST; 93445e2 Binance user-data stream (`/private/ws?listenKey=&events=`, rekey with retry),
