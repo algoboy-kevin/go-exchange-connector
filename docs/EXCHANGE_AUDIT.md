@@ -12,7 +12,7 @@ Target bar: **market-making speed, lightweight**. That means the order path does
 | Binance USDS-M | ✅ | ✅ place/batch/cancel/countdown | REST only | Ready for REST MM after live test. No WS-order path |
 | Polymarket | ✅ | ✅ place/cancel (live cmd exists) | REST (CLOB) | Live test is **ungated** and places real orders. Auth must be checked against V2 |
 | Binance spot | ✅ (market WS in `pkg/binance`) | ❌ | — | Not built. Spot WS API is the fastest candidate |
-| Aster | ❌ | ❌ | — | Not built |
+| Aster perps | ✅ (public streams probed live) | ✅ place/batch/cancel/countdown (L0 only) | REST (same client as Binance futures) | `pkg/aster/futures` + `asfutures` adapter. No live order test run; no testnet documented. Spot not built |
 
 ## Per-exchange audit
 

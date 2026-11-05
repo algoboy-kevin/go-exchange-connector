@@ -41,6 +41,9 @@ type UserStreamConfig struct {
 	// "wss://fstream.binance.com/private". Tests point it at an httptest
 	// server.
 	WSURL string
+	// KeyInPath dials <WSURL>/ws/<listenKey> with no events parameter (the
+	// legacy layout Aster serves) instead of <WSURL>/ws?listenKey=&events=.
+	KeyInPath bool
 	// KeepAliveInterval is how often the listen key is extended with a PUT.
 	// Default 30m (Binance expires a key after 60 minutes of silence).
 	KeepAliveInterval time.Duration
@@ -326,6 +329,9 @@ func (u *UserStream) connect(ctx context.Context, key string) error {
 // but not what Binance documents, so the literal slash is restored afterwards
 // (a "/" is legal inside a query value).
 func (u *UserStream) buildURL(key string) string {
+	if u.cfg.KeyInPath {
+		return u.wsBase + "/ws/" + url.PathEscape(key)
+	}
 	v := url.Values{}
 	v.Set("listenKey", key)
 	v.Set("events", strings.Join(u.events, "/"))

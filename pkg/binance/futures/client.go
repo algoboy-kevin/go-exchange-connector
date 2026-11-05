@@ -16,6 +16,7 @@
 package futures
 
 import (
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -44,8 +45,9 @@ const (
 	mainnetBaseURL = "https://fapi.binance.com"
 	testnetBaseURL = "https://demo-fapi.binance.com"
 
-	defaultRecvWindow  = 5 * time.Second
-	defaultHTTPTimeout = 10 * time.Second
+	defaultPositionRiskPath = "/fapi/v3/positionRisk"
+	defaultRecvWindow       = 5 * time.Second
+	defaultHTTPTimeout      = 10 * time.Second
 )
 
 // Config configures a Client. Network picks a default host; BaseURL overrides
@@ -58,6 +60,9 @@ type Config struct {
 	APISecret  string
 	RecvWindow time.Duration
 	HTTP       *http.Client
+	// PositionRiskPath overrides the positionRisk route. Default
+	// /fapi/v3/positionRisk (Binance); Aster serves /fapi/v2/positionRisk.
+	PositionRiskPath string
 }
 
 // Client is a Binance USDⓈ-M REST client. It is safe for concurrent use.
@@ -69,6 +74,8 @@ type Client struct {
 	apiSecret  string
 	recvWindow time.Duration
 	http       *http.Client
+
+	positionRiskPath string
 
 	// timeOffset is server−local in milliseconds, applied to every signed
 	// timestamp. Updated by SyncTime.
@@ -109,6 +116,8 @@ func New(cfg Config) (*Client, error) {
 		apiSecret:  cfg.APISecret,
 		recvWindow: recv,
 		http:       hc,
+
+		positionRiskPath: cmp.Or(cfg.PositionRiskPath, defaultPositionRiskPath),
 	}, nil
 }
 

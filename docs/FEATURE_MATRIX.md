@@ -12,7 +12,7 @@ downloaded file matched its recorded `content_sha256`, or was baselined on this 
 | **HL-spot** | Hyperliquid | spot (same API, asset id `10000 + index`) | none for execution (`unified.go` reads balance) | same as HL-perp |
 | **BN-perp** | Binance | USDS-M futures | `pkg/binance`, `pkg/binance/futures` | `binance llms-full` |
 | **BN-spot** | Binance | spot | `pkg/binance` (market data only) | `binance llms-full` |
-| **AS-perp** | Aster | futures (Binance-style, `fapi`) | none | `aster markdown` (API doc) |
+| **AS-perp** | Aster | futures (Binance-style, `fapi`) | `pkg/aster/futures` (thin config over `pkg/binance/futures`), `pkg/contract/asfutures` | `aster markdown` (API doc) |
 | **AS-spot** | Aster | spot (`sapi`, `/api/v3`) | none | `aster-finance-spot-api-v3.md` (GitHub, added 2026-11-05) |
 | **PM-clob** | Polymarket | prediction market (CLOB, V2) | `pkg/polymarket` | `polymarket llms-full` |
 | **PM-perp** | Polymarket | perpetuals (`api.perpetuals`, `ws.perpetuals`) | none | `perps/overview`, `perps-openapi.json`, `asyncapi-perps.json` (added 2026-11-05; not fetched in full) |
@@ -41,25 +41,25 @@ downloaded file matched its recorded `content_sha256`, or was baselined on this 
 
 | Operation | Contract | HL-perp | HL-spot | BN-perp | BN-spot | AS-perp | AS-spot | PM-clob | PM-perp |
 |---|---|---|---|---|---|---|---|---|---|
-| Subscribe / unsubscribe (market WS) | `Subscribe`/`Unsubscribe` | R | D (`coin` `PURR/USDC`) | R | R | D `fstream` | D `sstream` (`/ws/<stream>`) | R | D (`req: sub`/`unsub`, `chs`) |
-| Book snapshot | `Book` | D `l2Book` | D | D depth | R (market WS) | D depth | D `/api/v3/depth` | D | ? (`bbo`, depth not checked) |
-| Trades stream | `Trades` | D `trades` | D | D | D | D | D | R | D `trades::<id>` |
-| Reconnect, ping, stale watchdog | internal | R | R | R | R | D (24 h, 5 min ping) | D (24 h) | R | D (ping ~25 s; stale after ~65 s) |
+| Subscribe / unsubscribe (market WS) | `Subscribe`/`Unsubscribe` | R | D (`coin` `PURR/USDC`) | R | R | P `aster.MarketOptions` + `binance.NewWithOptions` | D `sstream` (`/ws/<stream>`) | R | D (`req: sub`/`unsub`, `chs`) |
+| Book snapshot | `Book` | D `l2Book` | D | D depth | R (market WS) | P (local book, 51/52 levels live) | D `/api/v3/depth` | D | ? (`bbo`, depth not checked) |
+| Trades stream | `Trades` | D `trades` | D | D | D | P `aggTrade` | D | R | D `trades::<id>` |
+| Reconnect, ping, stale watchdog | internal | R | R | R | R | R (shared BaseWebSocket) | D (24 h) | R | D (ping ~25 s; stale after ~65 s) |
 
 ## Orders (REST)
 
 | Operation | Contract | HL-perp | HL-spot | BN-perp | BN-spot | AS-perp | AS-spot | PM-clob | PM-perp |
 |---|---|---|---|---|---|---|---|---|---|
-| Place single limit | `PlaceOrder` | R `Place` | D (same action) | R `NewOrder` | D `order.place` | D `POST /fapi/v1/order` | D `POST /api/v3/order` | R `PlaceLimitOrders` | ? (REST `api.perpetuals`) |
-| Place batch | `PlaceOrders` | R (one action) | D | R `BatchOrders` | ? | D `batchOrders` | X (not in endpoint list) | R (loop; CLOB has `PostOrders`) | ? |
+| Place single limit | `PlaceOrder` | R `Place` | D (same action) | R `NewOrder` | D `order.place` | R `NewOrder` | D `POST /api/v3/order` | R `PlaceLimitOrders` | ? (REST `api.perpetuals`) |
+| Place batch | `PlaceOrders` | R (one action) | D | R `BatchOrders` | ? | R `BatchOrders` (max 5) | X (not in endpoint list) | R (loop; CLOB has `PostOrders`) | ? |
 | Place market | `PlaceMarketOrder` | ? | ? | ? | D | ? | D (`MARKET`, `quoteOrderQty`) | R | ? |
 | Cancel by exchange id | `CancelOrder` | R `CancelByOid` | D | D | D `order.cancel` | D | D `DELETE /api/v3/order` | R `CancelOrders` | ? |
-| Cancel by client id | `CancelOrder` (ref) | R `CancelByCloid` | D | R `CancelOrder` | D | D | D (`newClientOrderId`) | ? | ? |
-| Cancel batch | `CancelOrders` | R (slice) | D | R `CancelBatch` | D `orderList.cancel` | D `batchOrders` (DELETE) | X | R | ? |
-| Cancel all on a symbol | `CancelAll` | ? | ? | R `CancelAll` | D `openOrders.cancelAll` | D `allOpenOrders` | X | D `cancel-all` | ? |
+| Cancel by client id | `CancelOrder` (ref) | R `CancelByCloid` | D | R `CancelOrder` | D | R `CancelOrder` | D (`newClientOrderId`) | ? | ? |
+| Cancel batch | `CancelOrders` | R (slice) | D | R `CancelBatch` | D `orderList.cancel` | R `CancelBatch` (max 10) | X | R | ? |
+| Cancel all on a symbol | `CancelAll` | ? | ? | R `CancelAll` | D `openOrders.cancelAll` | R `CancelAll` | X | D `cancel-all` | ? |
 | Amend / modify | `Amend` | D `modify`, `batchModify` | D | ? | D `order.amend.keepPriority` | ? | X | ? | ? |
 | Cancel-replace (atomic) | `CancelReplace` | ? | ? | ? | D `order.cancelReplace` | ? | X | ? | ? |
-| Open orders | `OpenOrders` | R | ? | R | D `openOrders.status` | D | D `GET /api/v3/openOrders` | D `list_open_orders` | ? |
+| Open orders | `OpenOrders` | R | ? | R | D `openOrders.status` | R | D `GET /api/v3/openOrders` | D `list_open_orders` | ? |
 | Order status | `GetOrder` | D `orderStatus` | D | ? | D `order.status` | D | D `GET /api/v3/order` | D `get_order` | ? |
 | Fills (REST history) | `Fills` | D `userFills` | D | D `userTrades` | D `myTrades` | D `userTrades` | D `GET /api/v3/userTrades` | D `list_account_trades` | D (`fills` channel; REST not checked) |
 
@@ -71,17 +71,17 @@ downloaded file matched its recorded `content_sha256`, or was baselined on this 
 | Cancel over WS | `CancelOrderWS` (optional) | D (unproven) | D | D | D `order.cancel` | X | X | X | ? |
 | Info over WS | `InfoWS` (optional) | P (`meta`, 135 ms median) | D | ? | ? | ? | ? | X | D (`req: post`, `op.type` ping/auth) |
 | Auth over WS | `Authenticate` (optional) | X (none; signing per action) | X | D (listenKey) | D (listenKey) | D (listenKey) | D (listenKey) | D (L2 HMAC headers) | D (`op.type: auth`, proxy + secret) |
-| User stream (orders, fills) | `SubscribeUser` | R `orderUpdates`, `userFills` | D | R `userstream.go` | D `userDataStream.subscribe` | D listenKey `/ws/<key>` | D listenKey `wss://sstream.asterdex.com/ws/<key>` | R `user.go` | D (`orders`, `fills`, `portfolio` channels) |
+| User stream (orders, fills) | `SubscribeUser` | R `orderUpdates`, `userFills` | D | R `userstream.go` | D `userDataStream.subscribe` | R `aster.NewUserStream` (`/ws/<key>`) | D listenKey `wss://sstream.asterdex.com/ws/<key>` | R `user.go` | D (`orders`, `fills`, `portfolio` channels) |
 
 ## Order options
 
 | Option | Contract field | HL-perp | HL-spot | BN-perp | BN-spot | AS-perp | AS-spot | PM-clob | PM-perp |
 |---|---|---|---|---|---|---|---|---|---|
-| Post-only | `PostOnly` | R (`Alo`) | D | D (GTX) | D (LIMIT_MAKER) | D (GTX) | D (post-only page, not fetched) | D | D (`po` field; rejects `post_only_rejected`) |
-| IOC | `TIF` IOC | R | D | D | D | D | ? | D (FAK) | ? |
+| Post-only | `PostOnly` | R (`Alo`) | D | D (GTX) | D (LIMIT_MAKER) | R (GTX) | D (post-only page, not fetched) | D | D (`po` field; rejects `post_only_rejected`) |
+| IOC | `TIF` IOC | R | D | D | D | R | ? | D (FAK) | ? |
 | FOK | `TIF` FOK | ? | ? | D | D | D | ? | D | ? |
 | GTD / expiry | `TIF` GTD + `Expiry` | ? | ? | X | X | ? | ? | D | ? |
-| Reduce-only | `ReduceOnly` | D | X | D | X | D | ? | X | ? |
+| Reduce-only | `ReduceOnly` | D | X | D | X | R | ? | X | ? |
 | Trigger / stop | `Trigger` | D | ? | D `STOP_MARKET` | D | D `STOP_MARKET` | D `STOP`, `STOP_MARKET`, `TAKE_PROFIT_MARKET` | X | ? |
 | Trailing stop | `Trailing` | D | ? | ? | ? | D `TRAILING_STOP` | X | X | ? |
 | TWAP / algo | `TWAP` (optional) | D `twapOrder` | D | ? | ? | X | X | X | ? |
@@ -91,7 +91,7 @@ downloaded file matched its recorded `content_sha256`, or was baselined on this 
 
 | Operation | Contract | HL-perp | HL-spot | BN-perp | BN-spot | AS-perp | AS-spot | PM-clob | PM-perp |
 |---|---|---|---|---|---|---|---|---|---|
-| Dead-man switch (server cancels after timeout) | `DeadManSwitch` (optional) | R `ScheduleCancel` (global) | ? | R `CountdownCancelAll` (per symbol) | ? | D `countdownCancelAll` (per symbol) | X | X | ? |
+| Dead-man switch (server cancels after timeout) | `DeadManSwitch` (optional) | R `ScheduleCancel` (global) | ? | R `CountdownCancelAll` (per symbol) | ? | R `CountdownCancelAll` (per symbol) | X | X | ? |
 | Order heartbeat (client keepalive for orders) | `Heartbeat` (optional) | X | X | X | X | X | X | D `POST /v1/heartbeats` (10 s) | ? |
 
 Note: AS `countdownCancelAll` is documented as repeated heartbeats: a dead-man switch the
@@ -102,14 +102,14 @@ contracts.
 
 | Operation | Contract | HL-perp | HL-spot | BN-perp | BN-spot | AS-perp | AS-spot | PM-clob | PM-perp |
 |---|---|---|---|---|---|---|---|---|---|
-| Positions | `Positions` | R | X | R `PositionRisk` | X | D `positionRisk` | X | D (Data API) | D (`portfolio` channel) |
+| Positions | `Positions` | R | X | R `PositionRisk` | X | R `PositionRisk` (v2) | X | D (Data API) | D (`portfolio` channel) |
 | Balances | `Balances` | R `AccountState` | R `SpotUSDCBalance` | D `fapi/v2/balance` | D | D | D `GET /api/v3/account` | D | D (`portfolio.margin`, `withdrawable`) |
-| Set leverage | `SetLeverage` (optional) | R `UpdateLeverage` | X | R | X | D `leverage` | X | X | ? |
-| Margin mode | `SetMarginMode` (optional) | R (`isCross`) | X | R | X | D `marginType` | X | X | D (`invalid_margin_mode` error exists) |
-| Position mode | `SetPositionMode` (optional) | X | X | R | X | ? | X | X | ? |
-| Clock sync | `SyncTime` | X | X | R | D | D `time` | D `GET /api/v3/time` | X | ? |
+| Set leverage | `SetLeverage` (optional) | R `UpdateLeverage` | X | R | X | R | X | X | ? |
+| Margin mode | `SetMarginMode` (optional) | R (`isCross`) | X | R | X | R | X | X | D (`invalid_margin_mode` error exists) |
+| Position mode | `SetPositionMode` (optional) | X | X | R | X | R | X | X | ? |
+| Clock sync | `SyncTime` | X | X | R | D | R | D `GET /api/v3/time` | X | ? |
 | Commission / fee tier | `Fees` | ? | ? | ? | ? | ? | D `GET /api/v3/commissionRate` | D (fees page) | D (`fee_tier` in portfolio) |
-| Rate-limit state | `Usage` | R (info 429 retry) | ? | R `Usage()` | D | D | D | ? | ? |
+| Rate-limit state | `Usage` | R (info 429 retry) | ? | R `Usage()` | D | R `Usage()` | D | ? | ? |
 
 ## Venue-specific (no shared contract)
 
@@ -142,7 +142,7 @@ contracts.
 - HL-spot: all execution (docs: same API as perp with `10000 + index`).
 - BN-spot: execution (market data only in repo).
 - BN-perp: REST `GetOrder`, `Amend`, `TWAP`, `Trigger` builders (types exist in `userstream_types.go`).
-- AS-perp: the whole venue (no connector).
+- AS-perp: no live order test yet (`cmd/test_aster_orders` is written, never run with `-live`). Cancel by exchange id not wired (same as BN-perp). No testnet is documented.
 - AS-spot: the whole venue (no connector; endpoints listed above).
 - PM-clob: batch as one call (connector loops single posts), order heartbeat, `GetOrder`, `CancelAll`.
 - PM-perp: the whole venue (no connector).

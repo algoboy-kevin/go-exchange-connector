@@ -10,7 +10,7 @@ import (
 // PositionRisk lists current position risk (GET /fapi/v3/positionRisk, signed,
 // no symbol filter).
 func (c *Client) PositionRisk(ctx context.Context) ([]PositionRisk, error) {
-	body, err := c.do(ctx, http.MethodGet, "/fapi/v3/positionRisk", nil, true)
+	body, err := c.do(ctx, http.MethodGet, c.positionRiskPath, nil, true)
 	if err != nil {
 		return nil, err
 	}
