@@ -11,7 +11,7 @@ Target bar: **market-making speed, lightweight**. That means the order path does
 | Hyperliquid | ✅ | ✅ place/cancel/schedule/leverage (uncommitted) | REST (`/exchange`) | Closest to ready. Needs WS-post, latency metric, testnet live test |
 | Binance USDS-M | ✅ | ✅ place/batch/cancel/countdown | REST only | Ready for REST MM after live test. No WS-order path |
 | Polymarket | ✅ | ✅ place/cancel (live cmd exists) | REST (CLOB) | Live test is **ungated** and places real orders. Auth must be checked against V2 |
-| Binance spot | ✅ (market WS in `pkg/binance`) | ❌ | — | Not built. Spot WS API is the fastest candidate |
+| Binance spot | ✅ (market WS in `pkg/binance`) | ✅ place/cancel/cancel-all/queries (L0 only) | REST; no batch on spot | `pkg/binance/spot` + `bnspot` adapter. WS API order path not built |
 | Aster perps | ✅ (public streams probed live) | ✅ place/batch/cancel/countdown (L0 only) | REST (same client as Binance futures) | `pkg/aster/futures` + `asfutures` adapter. No live order test run; no testnet documented. Spot not built |
 
 ## Per-exchange audit
@@ -92,7 +92,10 @@ Date: 2026-11-05. Evidence is the run output recorded in this section.
 | HL user stream (userFills, orderUpdates) | wt | L2 | testnet | fill test read userFills; the WS fill event itself was not checked |
 | Aster perps execution (REST place/batch/cancel/countdown, user stream) | d6ab3d9 | L0 | none | unit tests with httptest only (signing, routes, caps, error classes, `/ws/<key>` dial) |
 | Aster perps public market WS | d6ab3d9 | L1 | mainnet | 20 s read-only probe 2026-11-05: bookTicker 272, aggTrade 6, depth 190, kline 6 events for BTCUSDT/ETHUSDT |
-| Binance / Polymarket execution | — | not run | — | out of scope for this run |
+| Binance futures cancel/get by order id | eee4f03 | L0 | none | httptest unit tests |
+| Binance spot REST + user stream | (this commit) | L0 | none | httptest and fake WS tests; public dry run of `test_binance_spot_orders` only |
+| Binance futures and spot live order tests | — | not run | — | tools written, never run with `-live` |
+| Polymarket execution | — | not run | — | out of scope for this run |
 
 **Not tested at any level**
 - Fee tiers beyond the observed fees above. Only one fill per side was observed.

@@ -1,0 +1,8 @@
+{
+  "id": "e2a85d9f-07a5-4f94-8d5f-789dc3deb097",
+  "status": 400,
+  "error": {
+    "code": -2010,
+    "msg": "Account has insufficient balance for requested action."
+  }
+}
