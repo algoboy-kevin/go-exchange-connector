@@ -90,7 +90,9 @@ Date: 2026-11-05. Evidence is the run output recorded in this section.
 | HL market data WS (existing) | 853074b | L1 | mainnet | existing `pkg/hyperliquid` tests; no fresh live run this session |
 | HL HIP-3 / DEX-scoped execution | wt | L0 | none | unit tests only |
 | HL user stream (userFills, orderUpdates) | wt | L2 | testnet | fill test read userFills; the WS fill event itself was not checked |
-| Binance / Aster / Polymarket execution | — | not run | — | out of scope for this run |
+| Aster perps execution (REST place/batch/cancel/countdown, user stream) | d6ab3d9 | L0 | none | unit tests with httptest only (signing, routes, caps, error classes, `/ws/<key>` dial) |
+| Aster perps public market WS | d6ab3d9 | L1 | mainnet | 20 s read-only probe 2026-11-05: bookTicker 272, aggTrade 6, depth 190, kline 6 events for BTCUSDT/ETHUSDT |
+| Binance / Polymarket execution | — | not run | — | out of scope for this run |
 
 **Not tested at any level**
 - Fee tiers beyond the observed fees above. Only one fill per side was observed.
@@ -103,3 +105,12 @@ Date: 2026-11-05. Evidence is the run output recorded in this section.
 - Testnet: the account held an open BTC long (0.00047) and ETH long (0.0115) from earlier runs. Both were closed on request before the fill test, so the account is flat.
 - Mainnet: the account is flat, with 101.76 USDC in spot and 0 perp equity.
 - Mainnet request quota: each live run consumes address request weight. Reserve was not used on mainnet.
+
+## Aster perps notes (d6ab3d9, 2026-11-05)
+
+- **Design:** `pkg/aster/futures` is configuration over `pkg/binance/futures` (Aster serves the legacy Binance futures layout), not a fork. Differences: host `fapi.asterdex.com`, positions at `/fapi/v2/positionRisk`, user stream at `wss://fstream.asterdex.com/ws/<listenKey>` with no events filter. The Binance package gained two additive options for this (`Config.PositionRiskPath`, `UserStreamConfig.KeyInPath`).
+- **Not tested live:** order place, batch, cancel, countdown, positions, user-stream events. `cmd/test_aster_orders` is written and its refusal paths and dry run ran, but it has never run with `-live`.
+- **Assumptions to confirm on the first live run:** Aster echoes `clientOrderId` in batch place/cancel responses; the `/ws/<listenKey>` ORDER_TRADE_UPDATE payload matches the Binance shape (it matches the doc, not yet seen live); `countdownTime` 0 stops the timer.
+- **No testnet** is documented, so every live run is mainnet and needs `-live -confirm-mainnet` plus `ASTER_API_KEY` / `ASTER_API_SECRET` in the environment.
+- **Not built:** cancel by exchange order id (same gap as Binance futures), Aster spot (`sapi.asterdex.com`, v3 wallet signing), WS order placement (none in the docs checked).
+- **Limits from the docs, not enforced in code beyond what the shared client does:** WS connection 24 h, 10 inbound msg/s, 200 streams per connection; 429 backs off, repeated 429 leads to a 418 IP ban.

@@ -158,3 +158,9 @@ contracts.
 All five Polymarket perps and RTDS v2 sources are verified in the catalog (`94f93706…` for
 the RTDS v2 AsyncAPI). The RTDS v2 spec is not yet read in full, so RTDS cells that depend
 on it stay `?` until it is.
+
+## Notes: Aster perps (2026-11-05, d6ab3d9)
+
+- AS-perp `R` cells mean implemented and unit-tested only. `P` cells (market WS subscribe, book, trades) were seen live in a read-only 20 s probe. No AS-perp order operation has run against the venue.
+- AS-perp reuses `pkg/binance/futures` through configuration; a Binance-side change can therefore change Aster behaviour. Both packages' tests must pass together.
+- Still `D` or `?` for AS-perp: cancel by exchange id, balances, fees, order status query, fills REST. AS-spot is not started.
