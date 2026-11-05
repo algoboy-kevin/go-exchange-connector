@@ -6,12 +6,12 @@ The `testnet` alias was tested against `demo-api.binance.com` using the existing
 
 The first Demo WS subscription failed -1104 because the optional server-side `filter` was not accepted. The smoke tool now subscribes without that optional filter and dispatches executionReport locally, with regression coverage. This confirms the existing demo key was valid; the historical -2015 was against the other environment. No fill, batch, reconnect or soak claim follows from this single place/cancel check.
 
-## Binance spot "testnet" remap — 2026-11-05 (no live run)
+## Binance spot "testnet" remap — 2026-11-05 (historical implementation checkpoint)
 
 - Project `testnet` for Binance spot now maps to Binance **Spot Demo Mode** (REST `https://demo-api.binance.com`, WS API `wss://demo-ws-api.binance.com/ws-api/v3`, market WS `wss://demo-stream.binance.com`). Source: official Demo Mode doc, cached llms-full line 132362; `https://developers.binance.com/en/docs/llms-full.txt`, sha256 `7fe8634d231eacc5564bef1995fe45c1bbc52ea7b7072cc50e3b0d06ad05c68e`. "testnet" here is a project alias; legacy Spot Testnet (`testnet.binance.vision`) is no longer used by this repo. Binance's own legacy testnet is not claimed removed.
-- The 2026-11-05 "Spot testnet: BLOCKED" entry below (-2015) was measured against the legacy testnet host. It does NOT establish that a Demo Mode key is invalid. No new live rerun was performed for Demo Mode.
+- The 2026-11-05 "Spot testnet: BLOCKED" entry below (-2015) was measured against the legacy testnet host. It does NOT establish that a Demo Mode key is invalid. No live rerun had occurred at this checkpoint; the later successful Demo run is recorded above.
 
-## Binance validation — November 5, 2026
+## Initial Binance validation — November 5, 2026 (before Spot Demo remap)
 
 - Local Mac egress through the approved Tokyo Tailscale exit node was verified before every run. All four public dry runs passed; no credentials are recorded here.
 - **Futures testnet (L2): PASS.** One BTCUSDT post-only single place/cancel, then a batch of two place/cancel orders; NEW/CANCELED WS events matched by order id. Independent GET order queries confirmed all three CANCELED with executedQty zero, and open orders empty. Single-sample REST place 142.0 ms, cancel 206.9 ms. Cancel WS event arrived 32.2 ms before REST ack; negative ack-to-WS is arrival ordering, not negative network latency. These are one-sample observations, not percentile estimates or a soak test.
@@ -22,7 +22,7 @@ The first Demo WS subscription failed -1104 because the optional server-side `fi
 - A shared WebSocket INFO log printed credential-bearing URLs. Connection logging now omits URLs, with a regression test; ephemeral listen keys from the runs were verified invalidated (-1125). Saved validation logs are redacted.
 - No authenticated spot order round trip or accepted mainnet futures order is proven by this run. Prior notes below are historical evidence, not current claims.
 
-Audited 2026-11-05 against the `exchange-integration` skill. Evidence: code read in this repo, `go build`/`go vet` (clean), `go test -count=1 ./...` (all packages ok). Nothing was run against a live venue in this audit.
+Audited 2026-11-05 against the `exchange-integration` skill. Evidence: code read in this repo, `go build`/`go vet` (clean), `go test -count=1 ./...` (all packages ok). That initial inspection was offline; subsequent venue runs are recorded above and in the verification table.
 
 Target bar: **market-making speed, lightweight**. That means the order path does not add retries or sleeps on the hot path, the feed never stalls silently, and every order has a measured latency.
 
@@ -30,13 +30,13 @@ Target bar: **market-making speed, lightweight**. That means the order path does
 
 | Exchange | Market WS | Orders | Order transport | Verdict for MM |
 |---|---|---|---|---|
-| Hyperliquid | ✅ | ✅ place/cancel/schedule/leverage (uncommitted) | REST (`/exchange`) | Closest to ready. Needs WS-post, latency metric, testnet live test |
-| Binance USDS-M | ✅ | ✅ place/batch/cancel/countdown | REST only | Ready for REST MM after live test. No WS-order path |
+| Hyperliquid | ✅ | ✅ native execution + adapter | REST (`/exchange`) | Historical L2/L3 place/cancel and IOC-fill evidence below; signed WS actions and soak unproven |
+| Binance USDS-M | ✅ | ✅ native execution + adapter | REST only | L2 single + batch place/cancel and WS order events passed; mainnet execution blocked by insufficient margin (-2019). No production-soak claim |
 | Polymarket | ✅ | ✅ place/cancel (live cmd exists) | REST (CLOB) | Live test is **ungated** and places real orders. Auth must be checked against V2 |
-| Binance spot | ✅ (market WS in `pkg/binance`) | ✅ place/cancel/cancel-all/queries (L0 only) | REST; no batch on spot | `pkg/binance/spot` + `bnspot` adapter. WS API order path not built |
-| Aster perps | ✅ (public streams probed live) | ✅ place/batch/cancel/countdown (L0 only) | REST (same client as Binance futures) | `pkg/aster/futures` + `asfutures` adapter. No live order test run; no testnet documented. Spot not built |
+| Binance spot | ✅ (market WS in `pkg/binance`) | ✅ native execution + `bnspot` adapter | REST; adapter batches are sequential, not native batches | L2 Demo post-only place/cancel, account/order reads and WS events passed; mainnet placement blocked by low USDT. WS order path unbuilt |
+| Aster perps | ✅ (public streams probed live) | ✅ place/batch/cancel/countdown (L0 only) | REST (same client as Binance futures) | `pkg/aster/futures` + `asfutures` adapter. No authenticated order run. Tool is mainnet-only; venue testnet exists but API/auth/WS and wallet warning remain unresolved. Spot unbuilt |
 
-## Per-exchange audit
+## Initial offline code inspection (historical; superseded where noted above)
 
 | Check | Hyperliquid | Binance USDS-M (`pkg/binance/futures`) | Polymarket (`pkg/polymarket`) |
 |---|---|---|---|
@@ -62,7 +62,7 @@ Target bar: **market-making speed, lightweight**. That means the order path does
 | Working-tree state | ⚠️ 8 modified + 9 untracked files, not committed | ✅ committed (branch `feat/mm-exec`) | ✅ committed |
 | Hot-path cost | Signing via sonirico per action; no retry on writes | Plain `net/http`, HMAC per request, no alloc audit | Not audited |
 
-## Findings, ranked
+## Original findings, ranked (historical, not the current backlog)
 
 1. **Polymarket live test places real orders with no gate.** `cmd/test_ws/main.go` calls `PlaceLimitOrders` on the live CLOB with flags only for side, price, size. Add `-live` plus an env confirmation, and a dry-run default. Do this before anyone runs it again.
 2. **No order-latency metric on any exchange.** Add send→ack and ack→WS-event timestamps for every order, with p50/p95 in the live cmd. Nothing measures this today.
@@ -74,7 +74,7 @@ Target bar: **market-making speed, lightweight**. That means the order path does
 8. **Binance user-data stream has no fill cross-check.** Confirm `ORDER_TRADE_UPDATE` fills match REST `userTrades` on testnet.
 9. **Binance spot and Aster are absent.** Not a defect, but the build list below depends on it.
 
-## What to build next (ordered)
+## Original build plan (historical; several items now completed)
 
 1. **Shared order-latency and gated-live harness** in `internal/`: one timer type, one gate (`-live` + env var), testnet default. Used by every exchange cmd. Covers Finding 1 and 2.
 2. **Hyperliquid: commit and harden.** Review the uncommitted diff, commit by explicit path, make read retries configurable (Finding 5), add `cmd/test_hl_orders` (testnet place → read → cancel, prints latency).
@@ -87,7 +87,7 @@ Target bar: **market-making speed, lightweight**. That means the order path does
 ## Notes
 
 - The audit used my own reading of the code, not a separate model. I did not run `gpt-6-astra` (listed in `~/.hermes/config.yaml` on Codex OAuth) because the delegation tool does not let me pin a model for one task. If you want an independent second pass, run it with that model and diff the table.
-- This file is untracked. AGENTS.md says to commit only with explicit paths and not to stage untracked user files. Nothing was committed.
+- The original audit was untracked. This document is now tracked; original working-tree and no-commit statements refer only to that initial inspection.
 
 ## Verification status (per feature, per network)
 
@@ -96,7 +96,7 @@ Levels: **L0** unit test (no network). **L1** read-only live. **L2** live on tes
 "Tested" below means the level named, on the commit named. Working-tree claims are
 marked `wt` until the work is committed, then replaced with the SHA.
 
-Commit basis: `853074b` (HEAD at the time of this run) plus working-tree changes (`wt`).
+Historical HL basis: `853074b` plus then-working-tree changes (`wt`), later included in `a1e63af` / v0.8.1. New Binance rows identify their own validation commits.
 Date: 2026-11-05. Evidence is the run output recorded in this section.
 
 | Feature | Commit | Level | Network | Evidence |
@@ -115,18 +115,21 @@ Date: 2026-11-05. Evidence is the run output recorded in this section.
 | Aster perps execution (REST place/batch/cancel/countdown, user stream) | d6ab3d9 | L0 | none | unit tests with httptest only (signing, routes, caps, error classes, `/ws/<key>` dial) |
 | Aster perps public market WS | d6ab3d9 | L1 | mainnet | 20 s read-only probe 2026-11-05: bookTicker 272, aggTrade 6, depth 190, kline 6 events for BTCUSDT/ETHUSDT |
 | Binance futures cancel/get by order id | eee4f03 | L0 | none | httptest unit tests |
-| Binance spot REST + user stream | (this commit) | L0 | none | httptest and fake WS tests; public dry run of `test_binance_spot_orders` only |
-| Binance futures and spot live order tests | — | not run | — | tools written, never run with `-live` |
+| Binance spot REST + user stream implementation | abb6b66 | L0 | none | unit/fake WS coverage; subsequent Demo validation below |
+| Binance futures single/batch place/cancel, matching WS events, order reads | f3717c4 | L2 | futures testnet (demo-fapi) | 3 orders independently CANCELED, zero executed quantity, openOrders=0; single place/cancel 142.0/206.9 ms, N=1 |
+| Binance spot LIMIT_MAKER place/cancel, WS events, account/order reads | bfe375e | L2 | Spot Demo (`testnet` alias) | order 80473354479 independently CANCELED, executedQty=0, openOrders=0; place/cancel 91.5/94.8 ms, N=1 |
+| Binance futures mainnet signed reads + private WS | f3717c4 | L1; execution blocked | mainnet | reads/WS passed; order rejected -2019, none accepted |
+| Binance spot mainnet account/open-order reads | f3717c4 | L1; execution blocked | mainnet | signed reads passed; 0.35720904 USDT below planned ~7.05 USDT; no placement |
 | Polymarket execution | — | not run | — | out of scope for this run |
 
-**Not tested at any level**
+**Remaining validation gaps (per venue)**
 - Fee tiers beyond the observed fees above. Only one fill per side was observed.
 - Partial fills, cancel races with a fill, and a rejected reduce-only order.
 - Reconnect during an order, and WS-only fill events (the fill test checks REST userFills).
 - Batch size cap (50). Still unverified in the docs.
 - L4 anything: no production soak has run.
 
-**Test-state notes**
+**Historical Hyperliquid test-state notes (not current balances or Binance balances)**
 - Testnet: the account held an open BTC long (0.00047) and ETH long (0.0115) from earlier runs. Both were closed on request before the fill test, so the account is flat.
 - Mainnet: the account is flat, with 101.76 USDC in spot and 0 perp equity.
 - Mainnet request quota: each live run consumes address request weight. Reserve was not used on mainnet.
@@ -136,6 +139,6 @@ Date: 2026-11-05. Evidence is the run output recorded in this section.
 - **Design:** `pkg/aster/futures` is configuration over `pkg/binance/futures` (Aster serves the legacy Binance futures layout), not a fork. Differences: host `fapi.asterdex.com`, positions at `/fapi/v2/positionRisk`, user stream at `wss://fstream.asterdex.com/ws/<listenKey>` with no events filter. The Binance package gained two additive options for this (`Config.PositionRiskPath`, `UserStreamConfig.KeyInPath`).
 - **Not tested live:** order place, batch, cancel, countdown, positions, user-stream events. `cmd/test_aster_orders` is written and its refusal paths and dry run ran, but it has never run with `-live`.
 - **Assumptions to confirm on the first live run:** Aster echoes `clientOrderId` in batch place/cancel responses; the `/ws/<listenKey>` ORDER_TRADE_UPDATE payload matches the Binance shape (it matches the doc, not yet seen live); `countdownTime` 0 stops the timer.
-- **No testnet** is documented, so every live run is mainnet and needs `-live -confirm-mainnet` plus `ASTER_API_KEY` / `ASTER_API_SECRET` in the environment.
-- **Not built:** cancel by exchange order id (same gap as Binance futures), Aster spot (`sapi.asterdex.com`, v3 wallet signing), WS order placement (none in the docs checked).
+- **Correction:** Aster has a documented testnet website. Signed API and WS behavior have not been validated here and the wallet security warning remains unresolved. The current tool is mainnet-only and requires `-live -confirm-mainnet` plus `ASTER_API_KEY` / `ASTER_API_SECRET`. Do not bypass the warning.
+- **Inherited implementation:** cancel/get by exchange order id now exist in the shared futures client, but have not been exercised against Aster. **Not built:** Aster spot (`sapi.asterdex.com`, v3 wallet signing) and WS order placement (none in the docs checked).
 - **Limits from the docs, not enforced in code beyond what the shared client does:** WS connection 24 h, 10 inbound msg/s, 200 streams per connection; 429 backs off, repeated 429 leads to a 418 IP ban.
