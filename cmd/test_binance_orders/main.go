@@ -543,6 +543,10 @@ func (a *app) cleanup() {
 // privateWS is the Binance USDⓈ-M private stream base for the network.
 func privateWS(env bnnet.Env) string { return env.WSURL + "/private" }
 
+func userStreamConfig(a *app) bn.UserStreamConfig {
+	return bn.UserStreamConfig{Client: a.c, WSURL: privateWS(a.env), KeyInPath: true}
+}
+
 // ---------- run ----------
 
 func run() int {
@@ -723,7 +727,7 @@ func runLive(ctx context.Context, a *app, symbol, px, qty string) int {
 	// From here on, any exit cancels all open orders on the symbol.
 	defer a.cleanup()
 
-	us, err := bn.NewUserStream(bn.UserStreamConfig{Client: a.c, WSURL: privateWS(a.env)})
+	us, err := bn.NewUserStream(userStreamConfig(a))
 	if err != nil {
 		a.check("user stream new", false, err.Error())
 		return 1

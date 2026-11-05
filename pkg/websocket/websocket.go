@@ -144,7 +144,8 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 	go b.reconnLoop(ctx)
 	go b.dataStaleWatchdog(ctx)
 
-	slog.Info("websocket: connected", "url", url)
+	// URLs may contain private stream credentials in the path or query.
+	slog.Info("websocket: connected")
 	return nil
 }
 

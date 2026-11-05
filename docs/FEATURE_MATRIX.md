@@ -1,5 +1,12 @@
 # Exchange feature matrix (venue × market)
 
+## Latest Binance validation — November 5, 2026
+
+- BN-perp: place single, place batch (2), cancel by client id and batch cancel, open-order reads, and matching NEW/CANCELED user-stream events are **P on testnet only (L2)**. Three order-status queries confirmed canceled with zero executed quantity. Mainnet signed reads and user-stream connection worked, but an order was rejected for insufficient margin (-2019); mainnet execution is not proven.
+- BN-spot: signed mainnet open-order/account reads worked, but insufficient quote funds prevented placement. Testnet authentication failed with -2015. Neither spot environment has a proven order round trip.
+- Futures checker uses the proven path-style private stream `/private/ws/<listenKey>` via `KeyInPath: true`; the query URL returned 404. Native default remains query-style for backward compatibility, so configure this explicitly in other consumers.
+- All requested runs used verified EC2 egress. Full detail and the historical evidence boundary are in `EXCHANGE_AUDIT.md`.
+
 Helicopter view of operations per venue and market, for the shared-contract design.
 Built 2026-11-05 from the docs hub (`exchange-docs-hub/catalog.json`, 20 sources). Every
 downloaded file matched its recorded `content_sha256`, or was baselined on this run.

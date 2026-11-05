@@ -1,5 +1,16 @@
 # Exchange connector audit (per exchange)
 
+## Binance validation — November 5, 2026
+
+- Local Mac egress through the approved Tokyo Tailscale exit node was verified before every run. All four public dry runs passed; no credentials are recorded here.
+- **Futures testnet (L2): PASS.** One BTCUSDT post-only single place/cancel, then a batch of two place/cancel orders; NEW/CANCELED WS events matched by order id. Independent GET order queries confirmed all three CANCELED with executedQty zero, and open orders empty. Single-sample REST place 142.0 ms, cancel 206.9 ms. Cancel WS event arrived 32.2 ms before REST ack; negative ack-to-WS is arrival ordering, not negative network latency. These are one-sample observations, not percentile estimates or a soak test.
+- **Futures mainnet: BLOCKED.** Signed account reads and private WS connection passed, but place was rejected with -2019 (insufficient margin). No mainnet futures order accepted; final BTCUSDT open orders empty. No balances transferred or leverage changed.
+- **Spot testnet: BLOCKED.** First signed openOrders read returned HTTP 401/-2015 (invalid key, IP or permissions). No order sent.
+- **Spot mainnet: BLOCKED.** Signed reads passed; only 0.35720904 USDT free versus the planned approximately 7.05 USDT order. Safety gate refused before placement; final BTCUSDT open orders empty.
+- The futures checker originally used `/private/ws?listenKey=...`, which returned 404 on both networks. Probing the official documented `/private/ws/<listenKey>` route returned 101 on both; the checker now explicitly selects `KeyInPath: true`, with regression coverage. The native client's query-layout default is retained for compatibility; consumers needing the proven route must select KeyInPath.
+- A shared WebSocket INFO log printed credential-bearing URLs. Connection logging now omits URLs, with a regression test; ephemeral listen keys from the runs were verified invalidated (-1125). Saved validation logs are redacted.
+- No authenticated spot order round trip or accepted mainnet futures order is proven by this run. Prior notes below are historical evidence, not current claims.
+
 Audited 2026-11-05 against the `exchange-integration` skill. Evidence: code read in this repo, `go build`/`go vet` (clean), `go test -count=1 ./...` (all packages ok). Nothing was run against a live venue in this audit.
 
 Target bar: **market-making speed, lightweight**. That means the order path does not add retries or sleeps on the hot path, the feed never stalls silently, and every order has a measured latency.
