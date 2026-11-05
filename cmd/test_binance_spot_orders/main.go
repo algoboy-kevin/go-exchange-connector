@@ -581,6 +581,10 @@ func run() int {
 	return runLive(ctx, a, p)
 }
 
+func smokeUserStreamConfig(a *app) spot.UserStreamConfig {
+	return spot.UserStreamConfig{Client: a.c, Network: a.network}
+}
+
 func runLive(ctx context.Context, a *app, p plan) int {
 	if err := a.c.SyncTime(ctx); err != nil {
 		a.noteErr(err)
@@ -628,7 +632,7 @@ func runLive(ctx context.Context, a *app, p plan) int {
 	}
 	a.check("test order (POST /api/v3/order/test)", true, "accepted, nothing placed")
 
-	us, err := spot.NewUserStream(spot.UserStreamConfig{Client: a.c, Network: a.network, EventTypes: []string{"executionReport"}})
+	us, err := spot.NewUserStream(smokeUserStreamConfig(a))
 	if err != nil {
 		a.check("user stream new", false, err.Error())
 		return 1

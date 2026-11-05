@@ -1,5 +1,9 @@
 # Exchange feature matrix (venue × market)
 
+## Spot Demo validation — November 5, 2026
+
+BN-spot `testnet` (project alias for Demo Mode): **P / L2** for single post-only LIMIT_MAKER place, cancel by client id, open-order/account reads, order query and WS executionReport NEW/CANCELED. One approximately 7 USDT BTCUSDT order was independently verified canceled, executed quantity zero, no open orders left. Existing demo credentials worked. Optional server-side subscription filtering returned -1104, so the checker omits it and filters callbacks locally. No new mainnet order run, fills, batch or soak claim. Historical no-run/blocked notes below predate this successful rerun; see EXCHANGE_AUDIT.md for evidence.
+
 ## Binance spot "testnet" remap — 2026-11-05 (no live run)
 
 - Project `testnet` for Binance spot now means Binance **Spot Demo Mode** (`demo-api.binance.com`, `demo-ws-api.binance.com`, `demo-stream.binance.com`; official doc cached line 132362, llms-full sha256 `7fe8634d231eacc5564bef1995fe45c1bbc52ea7b7072cc50e3b0d06ad05c68e`). The label is a project alias; legacy Spot Testnet is not used by this repo.

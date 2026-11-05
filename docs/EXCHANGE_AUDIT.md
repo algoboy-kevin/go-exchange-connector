@@ -1,5 +1,11 @@
 # Exchange connector audit (per exchange)
 
+## Spot Demo validation — November 5, 2026 (L2 PASS)
+
+The `testnet` alias was tested against `demo-api.binance.com` using the existing demo key, with local public egress verified as the intended Elastic IP. Authentication, account reads, `/api/v3/order/test`, HMAC WS subscription, BTCUSDT LIMIT_MAKER placement, open-order read-back, cancel by client id, and matching NEW/CANCELED executionReport events all passed. Independent GetOrder confirmed order 80473354479 CANCELED with executedQty 0.00000000; final BTCUSDT open orders zero. One-sample REST place 91.5 ms and cancel 94.8 ms; WS events arrived just before REST acks. No mainnet orders were submitted in this rerun.
+
+The first Demo WS subscription failed -1104 because the optional server-side `filter` was not accepted. The smoke tool now subscribes without that optional filter and dispatches executionReport locally, with regression coverage. This confirms the existing demo key was valid; the historical -2015 was against the other environment. No fill, batch, reconnect or soak claim follows from this single place/cancel check.
+
 ## Binance spot "testnet" remap — 2026-11-05 (no live run)
 
 - Project `testnet` for Binance spot now maps to Binance **Spot Demo Mode** (REST `https://demo-api.binance.com`, WS API `wss://demo-ws-api.binance.com/ws-api/v3`, market WS `wss://demo-stream.binance.com`). Source: official Demo Mode doc, cached llms-full line 132362; `https://developers.binance.com/en/docs/llms-full.txt`, sha256 `7fe8634d231eacc5564bef1995fe45c1bbc52ea7b7072cc50e3b0d06ad05c68e`. "testnet" here is a project alias; legacy Spot Testnet (`testnet.binance.vision`) is no longer used by this repo. Binance's own legacy testnet is not claimed removed.
