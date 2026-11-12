@@ -15,6 +15,8 @@
 //	defer ws.Close()
 package websocket
 
+import "context"
+
 // ─────────────────────────────────────────────────────────────
 // Connection status
 // ─────────────────────────────────────────────────────────────
@@ -97,6 +99,55 @@ type WSOptions struct {
 	// large frames (e.g. Binance @depth@100ms diffs), which exceed 32KB and
 	// force-close the connection with StatusMessageTooBig.
 	ReadLimit int64 `json:"read_limit_bytes,omitempty"`
+
+	// ── Optional control hooks (nil / false = historical behaviour) ──
+
+	// DialGate, if non-nil, is consulted before EVERY dial attempt: the
+	// initial Connect and every reconnect. It may block (a rate limiter's
+	// Take) and must respect ctx — Close() cancels it. A non-nil error means
+	// "do not dial now":
+	//
+	//   - Connect returns the error wrapped, so errors.Is(err, sentinel)
+	//     matches the gate's own error;
+	//   - the reconnect loop treats it as a failed attempt: it logs, escalates
+	//     the backoff exactly like a failed dial (see ReconnectMaxInterval) and
+	//     waits before trying again, so a persistent refusal can never spin
+	//     into a tight loop. Cancelling ctx stops the loop.
+	//
+	// Use it to keep one shared IP/connection budget across every venue the
+	// process talks to, and to hold redials while an upstream supervisor is
+	// restarting.
+	//
+	// The field is a func, so it is excluded from JSON.
+	DialGate func(ctx context.Context) error `json:"-"`
+
+	// SendGate, if non-nil, is consulted before every outbound frame this
+	// package writes: WebSocket ping frames (see PingInterval) and the
+	// SendText/SendJSON helpers. n is the payload size in bytes of the frame
+	// about to be written (0 for control frames such as ping).
+	// The gate is called exactly once per outbound frame, so a message-count
+	// budget (for example a per-IP messages/minute limiter) should count calls
+	// and treat n as informational.
+	//
+	// A non-nil error SKIPS that frame only — it never closes the connection
+	// and never stops the ping loop by itself. The denial is reported through
+	// OnError, and SendText/SendJSON also return it to the caller (a write
+	// helper must not claim success for a frame it never wrote).
+	//
+	// Writes made directly on the connection returned by Conn() (every
+	// exchange package's own subscribe/replay/ping code) are NOT covered by
+	// this gate.
+	//
+	// The field is a func, so it is excluded from JSON.
+	SendGate func(ctx context.Context, n int) error `json:"-"`
+
+	// NoReconnect disables automatic reconnection: after a drop the status
+	// becomes (and stays) disconnected, OnDisconnect fires once with the read
+	// error and nothing redials. Close() still returns promptly and stops the
+	// remaining goroutines. Use it when the caller owns the supervisor
+	// (go-mm-driver, GMS: stop the adapter, back off, dial a new one) and a
+	// second reconnect policy underneath that one would fight it.
+	NoReconnect bool `json:"no_reconnect,omitempty"`
 }
 
 // DefaultWSOptions returns sensible defaults for a production WebSocket connection.

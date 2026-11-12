@@ -57,18 +57,21 @@ type BaseWebSocket struct {
 	// If nil, defaults to always true.
 	ShouldConnect func() bool
 
-	// ── Config (set by Connect) ─────────────────────────────
-
-	url  string
-	opts WSOptions
-
 	// ── Internal state ──────────────────────────────────────
 
 	mu     sync.RWMutex
 	conn   *coderws.Conn
 	status ConnectionStatus
-	cancel context.CancelFunc // cancels the entire WS goroutine tree
-	done   chan struct{}      // closed when all goroutines exit
+
+	// url and opts are written by Connect and read by the dial/reauth paths;
+	// they are guarded by mu so a Close racing a Connect is -race clean.
+	url  string
+	opts WSOptions
+
+	// life is the current connection generation: its context, goroutines and
+	// done channel. nil when no Connect has succeeded and after Close. See
+	// lifecycle.go.
+	life *wsLife
 
 	// lastDataAt is the wall-clock time of the last DATA message received,
 	// used by the data-staleness watchdog. Empty text heartbeat frames are
@@ -96,9 +99,6 @@ const defaultMinStableConnectionMs = 5000
 // If the connection drops, BaseWebSocket automatically re-dials after
 // opts.ReconnectInterval. Call Close() to permanently shut it down.
 func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions) error {
-	// Store the URL for reconnection.
-	b.url = url
-
 	// Sanitise options.
 	if opts.ReconnectInterval <= 0 {
 		opts.ReconnectInterval = 2000 // 2s default
@@ -122,15 +122,46 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 	if opts.MinStableConnectionMs == 0 {
 		opts.MinStableConnectionMs = defaultMinStableConnectionMs
 	}
+
+	life := newWSLife(ctx)
+
+	b.mu.Lock()
+	b.url = url
 	b.opts = opts
+	b.life = life
+	b.mu.Unlock()
 
-	ctx, cancel := context.WithCancel(ctx)
-	b.cancel = cancel
-	b.done = make(chan struct{})
-
-	if err := b.dialSync(ctx); err != nil {
-		cancel()
+	if err := b.dialSync(life); err != nil {
+		// The dial (or its OnConnect hook, or the DialGate) failed. This
+		// generation owns no live connection, so end it here: cancel and
+		// close done. Closing done on this path is what makes Close() after a
+		// failed first dial return immediately instead of blocking forever on
+		// a channel nothing would ever close. It also leaves the object ready
+		// for a retry — Connect installs a fresh generation next time.
+		life.cancel()
+		life.finish()
+		b.mu.Lock()
+		if b.life == life {
+			b.life = nil
+		}
+		b.mu.Unlock()
 		return err
+	}
+
+	// Close() may have run while the dial was in flight. Then this generation
+	// is already orphaned: nobody will wait for its goroutines and nobody owns
+	// the socket we just opened, so drop both instead of starting loops that
+	// Close can no longer stop.
+	b.mu.Lock()
+	abandoned := b.life != life
+	b.mu.Unlock()
+	if abandoned {
+		life.cancel()
+		if conn := b.detachConn(); conn != nil {
+			conn.CloseNow()
+		}
+		life.finish()
+		return fmt.Errorf("websocket: connect aborted, closed while dialling: %w", context.Canceled)
 	}
 
 	// Initialize the data-staleness clock so a freshly-connected socket isn't
@@ -140,9 +171,20 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 	b.setLastData(time.Now())
 
 	// Start the read loop, reconnection watcher, and data-staleness watchdog.
-	go b.readLoop(ctx)
-	go b.reconnLoop(ctx)
-	go b.dataStaleWatchdog(ctx)
+	life.goRun(func() { b.readLoop(life) })
+	if opts.NoReconnect {
+		// No supervisor underneath the caller's: after a drop nothing
+		// redials, the status stays disconnected and Close() only has to
+		// stop the read loop and the watchdog (both select on life.ctx).
+		slog.Debug("websocket: NoReconnect set, reconnect loop not started")
+	} else {
+		life.goRun(func() { b.reconnLoop(life) })
+	}
+	life.goRun(func() { b.dataStaleWatchdog(life.ctx) })
+
+	// Close done once every goroutine above (and every goroutine a reconnect
+	// adds later) has exited.
+	go life.finish()
 
 	// URLs may contain private stream credentials in the path or query.
 	slog.Info("websocket: connected")
@@ -151,18 +193,62 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 
 // Close permanently shuts down the WebSocket, stops all goroutines, and
 // cancels any pending reconnection. Safe to call multiple times.
+//
+// It returns promptly even against a half-open peer and after a failed
+// Connect: the connection and the generation are detached under the lock, the
+// graceful close handshake runs outside the lock with a bounded wait
+// (closeGraceTimeout, then CloseNow), and the wait for the goroutines is
+// bounded as well.
 func (b *BaseWebSocket) Close() {
 	b.mu.Lock()
-	hasCancel := b.cancel != nil
-	if b.conn != nil {
-		b.conn.Close(coderws.StatusNormalClosure, "shutdown")
-		b.conn = nil
+	life := b.life
+	b.life = nil
+	conn := b.conn
+	b.conn = nil
+	if life != nil {
+		b.status = StatusDisconnected
 	}
 	b.mu.Unlock()
 
-	if hasCancel {
-		b.cancel()
-		<-b.done
+	if life == nil && conn == nil {
+		// Never connected, or closed already: nothing to stop.
+		return
+	}
+
+	if life != nil {
+		// Mark the generation as closing BEFORE the handshake below: the
+		// handshake makes our own read loop exit ("connection closed"), which
+		// must not look like a drop that wakes the reconnect loop, and no dial
+		// may start on a generation being torn down.
+		life.closing.Store(true)
+	}
+
+	if conn != nil {
+		// Bounded graceful attempt, OUTSIDE b.mu, and BEFORE the context is
+		// cancelled: cancelling first makes coder/websocket's timeoutLoop close
+		// the socket outright (a cancelled read ctx is a hard close), so the
+		// peer never receives a close frame and, in turn, never tears its side
+		// down. Writing the frame first lets both ends finish the handshake.
+		// The timeout only bounds the wait for the peer's echo: coder/websocket
+		// needs up to 10s for that and shutdown must not depend on the peer's
+		// courtesy.
+		closeGracefully(conn, closeGraceTimeout)
+	}
+
+	if life != nil {
+		// Stop every goroutine of the generation (read loop, reconnect loop,
+		// ping loop, watchdog).
+		life.cancel()
+	}
+
+	if life == nil {
+		return
+	}
+	go life.finish()
+	select {
+	case <-life.done:
+	case <-time.After(closeDrainTimeout):
+		slog.Warn("websocket: close timed out waiting for websocket goroutines to exit")
 	}
 }
 
@@ -211,6 +297,10 @@ func (b *BaseWebSocket) SendText(ctx context.Context, data string) error {
 	if conn == nil {
 		return ErrNotConnected
 	}
+	if err := b.checkSendGate(ctx, len(data)); err != nil {
+		b.safeCallOnError(err)
+		return err
+	}
 	return conn.Write(ctx, coderws.MessageText, []byte(data))
 }
 
@@ -224,6 +314,10 @@ func (b *BaseWebSocket) SendJSON(ctx context.Context, v any) error {
 	if err != nil {
 		return err
 	}
+	if err := b.checkSendGate(ctx, len(data)); err != nil {
+		b.safeCallOnError(err)
+		return err
+	}
 	return conn.Write(ctx, coderws.MessageText, data)
 }
 
@@ -232,11 +326,37 @@ func (b *BaseWebSocket) SendJSON(ctx context.Context, v any) error {
 // ─────────────────────────────────────────────────────────────
 
 // dialSync performs a single dial attempt and fires the OnConnect hook.
-func (b *BaseWebSocket) dialSync(ctx context.Context) error {
+func (b *BaseWebSocket) dialSync(life *wsLife) error {
+	ctx := life.ctx
+	opts := b.currentOpts()
+
+	// The DialGate is consulted before EVERY dial attempt: the initial
+	// Connect and each reconnect. It may block (a rate limiter's Take), so it
+	// gets the generation context — Close() cancels it and this returns.
+	if opts.DialGate != nil {
+		if err := opts.DialGate(ctx); err != nil {
+			b.setStatus(StatusDisconnected)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return fmt.Errorf("websocket: dial gate refused: %w", err)
+		}
+	}
+	// Close() while the gate was blocking, or a generation that is being torn
+	// down: do not dial at all.
+	if err := ctx.Err(); err != nil {
+		b.setStatus(StatusDisconnected)
+		return err
+	}
+	if life.closing.Load() {
+		b.setStatus(StatusDisconnected)
+		return fmt.Errorf("websocket: connect aborted: %w", context.Canceled)
+	}
+
 	b.setStatus(StatusConnecting)
 
-	dialCtx, dialCancel := context.WithTimeout(ctx, time.Duration(b.opts.ConnectionTimeout)*time.Millisecond)
-	conn, _, err := coderws.Dial(dialCtx, b.url, nil)
+	dialCtx, dialCancel := context.WithTimeout(ctx, time.Duration(opts.ConnectionTimeout)*time.Millisecond)
+	conn, _, err := coderws.Dial(dialCtx, b.urlString(), nil)
 	dialCancel()
 
 	if err != nil {
@@ -252,17 +372,17 @@ func (b *BaseWebSocket) dialSync(ctx context.Context) error {
 	// Apply the configured message read limit before the read loop starts.
 	// coder/websocket's default (32KB) is too small for some exchange
 	// payloads and would force-close the connection with StatusMessageTooBig.
-	if b.opts.ReadLimit != 0 {
-		conn.SetReadLimit(b.opts.ReadLimit)
+	if opts.ReadLimit != 0 {
+		conn.SetReadLimit(opts.ReadLimit)
 	}
 
 	// Start keepalive pings.
-	b.startPingLoop(ctx, conn)
+	b.startPingLoop(life, conn)
 
 	// Fire the OnConnect hook.
 	if b.OnConnect != nil {
 		if err := b.OnConnect(ctx, conn); err != nil {
-			b.closeConn()
+			b.closeConnNow()
 			b.setStatus(StatusDisconnected)
 			return err
 		}
@@ -278,7 +398,8 @@ func (b *BaseWebSocket) dialSync(ctx context.Context) error {
 // Internal: read loop
 // ─────────────────────────────────────────────────────────────
 
-func (b *BaseWebSocket) readLoop(ctx context.Context) {
+func (b *BaseWebSocket) readLoop(life *wsLife) {
+	ctx := life.ctx
 	// Capture the connection at the start so cleanup only closes this
 	// specific connection — not a replacement set by a concurrent dialSync.
 	conn := b.Conn()
@@ -287,14 +408,22 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 	}
 	cleanup := func() {
 		b.mu.Lock()
-		if b.conn == conn {
-			conn.Close(coderws.StatusNormalClosure, "readloop-exit")
+		current := b.conn == conn
+		if current {
 			b.conn = nil
 			if b.status != StatusDisconnected {
 				b.status = StatusDisconnected
 			}
 		}
 		b.mu.Unlock()
+		if current {
+			// CloseNow, not Close: this loop is exiting because the socket
+			// failed or was shut down, and a close handshake on such a socket
+			// blocks for up to ~5s (coder/websocket's own timeout, the reason
+			// Disconnect() uses CloseNow too). On the drop path that would
+			// delay the reconnect this loop's exit is meant to trigger.
+			conn.CloseNow()
+		}
 	}
 	defer cleanup()
 
@@ -306,6 +435,7 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 	// subscription re-queue) always fires when the connection drops.
 	var exitErr error
 	var shutdown bool
+	var stableAtExit bool
 	defer func() {
 		if shutdown {
 			return // deliberate Close() — no disconnect event
@@ -316,6 +446,14 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 		b.mu.RUnlock()
 		if connIsCurrent && !alreadyDisconnected {
 			b.safeCallOnDisconnect(exitErr)
+		}
+		if stableAtExit && !life.closing.Load() {
+			// A connection that outlived MinStableConnectionMs just dropped:
+			// wake the reconnect loop instead of letting it sit out the
+			// ReconnectInterval poll (measured ~970ms of dead time with a 1s
+			// interval). Short-lived connections do NOT signal, so the flap
+			// backoff keeps its exact historical pacing.
+			life.notifyDrop()
 		}
 	}()
 
@@ -343,6 +481,10 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 			}
 
 			exitErr = err
+			// Decide stability here, while this connection's
+			// connEstablishedAt is still ours: reconnLoop clears it as soon as
+			// it accounts for the drop.
+			stableAtExit = b.connectionWasStable()
 			return
 		}
 
@@ -371,18 +513,25 @@ func (b *BaseWebSocket) readLoop(ctx context.Context) {
 // Internal: reconnection loop
 // ─────────────────────────────────────────────────────────────
 
-func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
-	defer close(b.done)
+func (b *BaseWebSocket) reconnLoop(life *wsLife) {
+	ctx := life.ctx
+	opts := b.currentOpts()
 
-	baseDelay := time.Duration(b.opts.ReconnectInterval) * time.Millisecond
-	maxDelay := time.Duration(b.opts.ReconnectMaxInterval) * time.Millisecond
-	minStable := time.Duration(b.opts.MinStableConnectionMs) * time.Millisecond
+	baseDelay := time.Duration(opts.ReconnectInterval) * time.Millisecond
+	maxDelay := time.Duration(opts.ReconnectMaxInterval) * time.Millisecond
+	minStable := time.Duration(opts.MinStableConnectionMs) * time.Millisecond
 	delay := baseDelay
 
 	for {
-		// While connected, poll at the base interval so a drop is redialled
-		// promptly. The backoff state itself is not reset here — it is decided
-		// below, from how long the connection actually lived.
+		// While connected, wait at the base interval so a drop is redialled
+		// promptly — but wake at once when the read loop reports that a
+		// connection outlived MinStableConnectionMs dropped. Without that
+		// signal a drop was redialled only after the next poll, i.e. after a
+		// uniformly random 0..baseDelay of dead time (measured: ~970ms mean
+		// with ReconnectInterval=1s). Short-lived connections never signal, so
+		// the flap pacing below is unchanged. The backoff state itself is not
+		// reset here — it is decided below, from how long the connection
+		// actually lived.
 		wait := delay
 		if b.Status() == StatusConnected {
 			wait = baseDelay
@@ -390,7 +539,13 @@ func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-life.drop:
+			// A tracked connection dropped: no point waiting out the poll.
 		case <-time.After(wait):
+		}
+
+		if life.closing.Load() {
+			return
 		}
 
 		if b.Status() == StatusConnected {
@@ -412,7 +567,7 @@ func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
 			delay, flapped = nextDelayAfterDrop(delay, baseDelay, maxDelay, minStable, lived)
 			if flapped {
 				slog.Warn("websocket: connection flapping, backing off",
-					"url", b.url,
+					"url", b.urlString(),
 					"lived", lived.Round(time.Millisecond).String(),
 					"next_backoff", delay.String(),
 				)
@@ -423,8 +578,8 @@ func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
 			}
 		}
 
-		slog.Debug("websocket: reconnecting", "url", b.url, "delay", delay.String())
-		if err := b.dialSync(ctx); err != nil {
+		slog.Debug("websocket: reconnecting", "url", b.urlString(), "delay", delay.String())
+		if err := b.dialSync(life); err != nil {
 			delay = nextBackoff(delay, maxDelay)
 			slog.Warn("websocket: reconnection failed", "error", err, "next_backoff", delay.String())
 			continue
@@ -433,7 +588,7 @@ func (b *BaseWebSocket) reconnLoop(ctx context.Context) {
 		// The dial succeeded and OnConnect ran. Restart the read loop; the
 		// delay for the next drop is decided above, from this connection's
 		// lifetime.
-		go b.readLoop(ctx)
+		life.goRun(func() { b.readLoop(life) })
 	}
 }
 
@@ -475,13 +630,15 @@ func nextBackoff(d, max time.Duration) time.Duration {
 // The loop exits when the context is cancelled (shutdown) or when a ping
 // fails (connection dropped). A new ping loop is started automatically
 // after each successful reconnection.
-func (b *BaseWebSocket) startPingLoop(ctx context.Context, conn *coderws.Conn) {
-	if b.opts.PingInterval <= 0 {
+func (b *BaseWebSocket) startPingLoop(life *wsLife, conn *coderws.Conn) {
+	opts := b.currentOpts()
+	if opts.PingInterval <= 0 {
 		return
 	}
+	ctx := life.ctx
 
-	go func() {
-		ticker := time.NewTicker(time.Duration(b.opts.PingInterval) * time.Millisecond)
+	life.goRun(func() {
+		ticker := time.NewTicker(time.Duration(opts.PingInterval) * time.Millisecond)
 		defer ticker.Stop()
 
 		for {
@@ -489,10 +646,19 @@ func (b *BaseWebSocket) startPingLoop(ctx context.Context, conn *coderws.Conn) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// The SendGate covers every frame this package writes, and a
+				// ping is such a frame. A denial skips this ping only: the
+				// connection is not failed and the loop keeps ticking, so a
+				// caller that gains budget again resumes keepalive without a
+				// reconnect.
+				if err := b.checkSendGate(ctx, 0); err != nil {
+					b.safeCallOnError(err)
+					continue
+				}
 				// Per-ping deadline: coder/websocket's Ping waits on its ctx for
 				// a pong. Without a deadline this blocks forever on a dead/
 				// half-open socket, so the connection would never reconnect.
-				pingCtx, cancel := context.WithTimeout(ctx, time.Duration(b.opts.PongTimeout)*time.Millisecond)
+				pingCtx, cancel := context.WithTimeout(ctx, time.Duration(opts.PongTimeout)*time.Millisecond)
 				err := conn.Ping(pingCtx)
 				cancel()
 				if err != nil {
@@ -509,7 +675,7 @@ func (b *BaseWebSocket) startPingLoop(ctx context.Context, conn *coderws.Conn) {
 				}
 			}
 		}
-	}()
+	})
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -545,13 +711,69 @@ func (b *BaseWebSocket) establishedAt() time.Time {
 	return b.connEstablishedAt
 }
 
-func (b *BaseWebSocket) closeConn() {
+func (b *BaseWebSocket) closeConnNow() {
+	if conn := b.detachConn(); conn != nil {
+		// CloseNow outside b.mu: a close handshake here could block for
+		// seconds and would stall every reader.
+		conn.CloseNow()
+	}
+}
+
+// detachConn removes and returns the current connection, so the caller can
+// close it without holding b.mu. Returns nil when there is none.
+func (b *BaseWebSocket) detachConn() *coderws.Conn {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.conn != nil {
-		b.conn.Close(coderws.StatusGoingAway, "close")
-		b.conn = nil
+	conn := b.conn
+	b.conn = nil
+	return conn
+}
+
+// currentOpts returns the options installed by the latest Connect.
+func (b *BaseWebSocket) currentOpts() WSOptions {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.opts
+}
+
+// urlString returns the URL installed by the latest Connect.
+func (b *BaseWebSocket) urlString() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.url
+}
+
+// connectionWasStable reports whether the current connection has outlived
+// MinStableConnectionMs, i.e. whether it counts as a success rather than a
+// flap. A connection that was never established (zero time) is not stable.
+func (b *BaseWebSocket) connectionWasStable() bool {
+	established := b.establishedAt()
+	if established.IsZero() {
+		return false
 	}
+	minStable := time.Duration(b.currentOpts().MinStableConnectionMs) * time.Millisecond
+	if minStable <= 0 {
+		return true // the flap check is disabled: every connection counts
+	}
+	return time.Since(established) >= minStable
+}
+
+// checkSendGate consults WSOptions.SendGate before a frame this package is
+// about to write. n is the frame's payload size in bytes (0 for control
+// frames). A nil gate allows the write; an error must SKIP the frame without
+// failing the connection.
+func (b *BaseWebSocket) checkSendGate(ctx context.Context, n int) error {
+	opts := b.currentOpts()
+	if opts.SendGate == nil {
+		return nil
+	}
+	if err := opts.SendGate(ctx, n); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("websocket: send gate refused a %d-byte frame: %w", n, err)
+	}
+	return nil
 }
 
 func (b *BaseWebSocket) safeCallOnDisconnect(err error) {
@@ -602,14 +824,15 @@ func (b *BaseWebSocket) dataStaleWatchdog(ctx context.Context) {
 	// catches genuinely dead sockets, so the staleness watchdog is only a
 	// heuristic for streaming feeds with a regular cadence — skip it entirely
 	// when the caller opts out.
-	if b.opts.DisableDataStaleWatchdog {
+	opts := b.currentOpts()
+	if opts.DisableDataStaleWatchdog {
 		return
 	}
-	interval := time.Duration(b.opts.PingInterval) * time.Millisecond
+	interval := time.Duration(opts.PingInterval) * time.Millisecond
 	if interval <= 0 {
 		interval = 15 * time.Second
 	}
-	timeout := time.Duration(b.opts.DataStaleTimeout) * time.Millisecond
+	timeout := time.Duration(opts.DataStaleTimeout) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
