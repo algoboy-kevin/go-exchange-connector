@@ -287,6 +287,11 @@ type AssetInfo struct {
 	MarginTableID int    `json:"marginTableId"`
 	OnlyIsolated  bool   `json:"onlyIsolated"`
 	IsDelisted    bool   `json:"isDelisted"`
+
+	// HIP-3 (builder-deployed dex) fields; empty on the default dex.
+	GrowthMode             string `json:"growthMode,omitempty"`
+	LastFeeScaleChangeTime string `json:"lastFeeScaleChangeTime,omitempty"`
+	DeployerFeeScale       Num    `json:"deployerFeeScale,omitempty"`
 }
 
 // PerpDex is one entry of POST /info {"type":"perpDexs"}. The response is a
@@ -366,4 +371,94 @@ func (m *PerpMeta) AssetID(coin string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// ─────────────────────────────────────────────────────────────
+// Funding types
+// ─────────────────────────────────────────────────────────────
+
+// FundingPoint is one settled funding entry of POST /info
+// {"type":"fundingHistory"}. Time is the settlement timestamp in ms; the
+// venue stamps it a few milliseconds after the hour boundary.
+type FundingPoint struct {
+	Coin        string `json:"coin"`
+	FundingRate Num    `json:"fundingRate"`
+	Premium     Num    `json:"premium"`
+	Time        int64  `json:"time"`
+}
+
+// Venue names used by predictedFundings.
+const (
+	PredictedVenueHyperliquid = "HlPerp"
+	PredictedVenueBinance     = "BinPerp"
+	PredictedVenueBybit       = "BybitPerp"
+)
+
+// VenueFunding is one venue's predicted funding for a coin.
+// FundingIntervalHours is 0 when the venue response did not report it (seen
+// for some BinPerp entries).
+type VenueFunding struct {
+	Venue                string
+	FundingRate          Num
+	NextFundingTime      int64
+	FundingIntervalHours int
+}
+
+// PredictedFunding is one entry of {"type":"predictedFundings"}: a coin and
+// its per-venue predictions. The wire shape is [coin, [[venue, {...}|null],
+// ...]]; venues with a null object are dropped.
+type PredictedFunding struct {
+	Coin   string
+	Venues []VenueFunding
+}
+
+// UnmarshalJSON decodes the venue's nested-array encoding.
+func (p *PredictedFunding) UnmarshalJSON(b []byte) error {
+	var tuple []json.RawMessage
+	if err := json.Unmarshal(b, &tuple); err != nil || len(tuple) != 2 {
+		return fmt.Errorf("hyperliquid: predictedFundings entry: want [coin, venues], got %s", truncate(string(b), 80))
+	}
+	if err := json.Unmarshal(tuple[0], &p.Coin); err != nil {
+		return fmt.Errorf("hyperliquid: predictedFundings coin: %w", err)
+	}
+	var venues []json.RawMessage
+	if err := json.Unmarshal(tuple[1], &venues); err != nil {
+		return fmt.Errorf("hyperliquid: predictedFundings venues of %s: %w", p.Coin, err)
+	}
+	p.Venues = p.Venues[:0]
+	for _, v := range venues {
+		var pair []json.RawMessage
+		if err := json.Unmarshal(v, &pair); err != nil || len(pair) != 2 {
+			return fmt.Errorf("hyperliquid: predictedFundings venue entry of %s: want [venue, {...}]", p.Coin)
+		}
+		var vf VenueFunding
+		if err := json.Unmarshal(pair[0], &vf.Venue); err != nil {
+			return fmt.Errorf("hyperliquid: predictedFundings venue name of %s: %w", p.Coin, err)
+		}
+		if nullOrEmpty(pair[1]) {
+			continue
+		}
+		var body struct {
+			FundingRate          Num   `json:"fundingRate"`
+			NextFundingTime      int64 `json:"nextFundingTime"`
+			FundingIntervalHours int   `json:"fundingIntervalHours"`
+		}
+		if err := json.Unmarshal(pair[1], &body); err != nil {
+			return fmt.Errorf("hyperliquid: predictedFundings %s/%s: %w", p.Coin, vf.Venue, err)
+		}
+		vf.FundingRate, vf.NextFundingTime, vf.FundingIntervalHours = body.FundingRate, body.NextFundingTime, body.FundingIntervalHours
+		p.Venues = append(p.Venues, vf)
+	}
+	return nil
+}
+
+// Venue returns the prediction of the named venue (see the PredictedVenue*
+// constants).
+func (p PredictedFunding) Venue(name string) (VenueFunding, bool) {
+	for _, v := range p.Venues {
+		if v.Venue == name {
+			return v, true
+		}
+	}
+	return VenueFunding{}, false
 }

@@ -122,6 +122,17 @@ type Options struct {
 	// user channels, with DefaultOptions (this stays 0); the market-data
 	// instance may enable the watchdog for the l2Book stream it carries.
 	DataStaleTimeoutMs int64
+
+	// SubscribePaceMs is the minimum gap between consecutive subscribe frames
+	// sent by Subscribe, SubscribeMany and the reconnect replay. Zero — the
+	// default — leaves subscribe frames unpaced (and the reconnect replay
+	// inline in the connect hook, as before).
+	//
+	// The venue caps WS traffic at 2000 messages/min per IP; 40 (=1500
+	// msgs/min) is the recommended value for a consumer that subscribes
+	// hundreds of channels. When positive, the reconnect replay runs on its
+	// own goroutine so reading starts immediately; see SubscribeMany.
+	SubscribePaceMs int64
 }
 
 // DefaultOptions returns the transport defaults.
@@ -282,7 +293,14 @@ func (h *WSHyperliquid) Stop() {
 		c.dispatchCancel()
 		c.dispatchCancel = nil
 	}
+	// Cancel a paced reconnect replay before closing the socket, and again
+	// after: a dial racing Close can still run onConnect once. Close waits for
+	// the reconnect loop, so after it returns no further onConnect can run.
+	first := c.dropConnState(nil)
 	c.Close()
+	second := c.dropConnState(nil)
+	waitConnState(first)
+	waitConnState(second)
 	c.clearSubscriptions()
 }
 
@@ -309,34 +327,47 @@ func (h *WSHyperliquid) Subscriptions() []Subscription {
 // request (unknown channel, malformed coin or user address, bad parameters),
 // not about the transport.
 func (h *WSHyperliquid) Subscribe(ctx context.Context, subs ...Subscription) error {
-	// Normalize user addresses (trim + lowercase) so one account collapses to
-	// one canonical key. Done on a copy: the caller's slice is not mutated.
+	norm, err := normalizeSubscriptions(subs)
+	if err != nil {
+		return err
+	}
+	for _, sub := range h.conn.addSubs(norm) {
+		h.conn.writeSub(ctx, sub, false)
+	}
+	return nil
+}
+
+// normalizeSubscriptions validates subs and returns a normalized copy: user
+// addresses are trimmed and lowercased so one account collapses to one
+// canonical key. The caller's slice is not mutated. Any invalid subscription
+// fails the whole batch.
+func normalizeSubscriptions(subs []Subscription) ([]Subscription, error) {
 	norm := make([]Subscription, len(subs))
 	copy(norm, subs)
 	for i := range norm {
 		sub := &norm[i]
 		if !IsSubscribable(sub.Type) {
-			return fmt.Errorf("hyperliquid: unknown channel %q (subscribable: %s)", sub.Type, channelList())
+			return nil, fmt.Errorf("hyperliquid: unknown channel %q (subscribable: %s)", sub.Type, channelList())
 		}
 		switch {
 		case isUserChannel(sub.Type):
 			// Keyed by user, not coin: a coin would be a caller mixing the two
 			// shapes.
 			if sub.Coin != "" {
-				return fmt.Errorf("hyperliquid: channel %s takes no coin (got %q)", sub.Type, sub.Coin)
+				return nil, fmt.Errorf("hyperliquid: channel %s takes no coin (got %q)", sub.Type, sub.Coin)
 			}
 			user, err := NormalizeUser(sub.User)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			sub.User = user
 		case sub.Type == ChannelAllMids:
 			if sub.Coin != "" {
-				return fmt.Errorf("hyperliquid: channel %s takes no coin (got %q)", sub.Type, sub.Coin)
+				return nil, fmt.Errorf("hyperliquid: channel %s takes no coin (got %q)", sub.Type, sub.Coin)
 			}
 		default:
 			if err := ValidateCoin(sub.Coin); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		if err := (SubParams{
@@ -346,14 +377,10 @@ func (h *WSHyperliquid) Subscribe(ctx context.Context, subs ...Subscription) err
 			Fast:     sub.Fast,
 			User:     sub.User,
 		}).validate(sub.Type); err != nil {
-			return err
+			return nil, err
 		}
 	}
-
-	for _, sub := range h.conn.addSubs(norm) {
-		h.conn.writeSub(ctx, sub, false)
-	}
-	return nil
+	return norm, nil
 }
 
 // Unsubscribe removes subscriptions and sends the unsubscribe frames. The
@@ -510,14 +537,21 @@ type hlConn struct {
 
 	eventCh        chan frame
 	dispatchCancel context.CancelFunc
+
+	// sm is the C4 subscription machinery: connection id, per-connection
+	// sent set + paced replay, the shared pacing gate and the ack trackers
+	// (subscribe.go).
+	sm subState
 }
 
 // frame is a raw venue frame plus the local receive time. rx is sampled on the
 // read-loop goroutine, before the frame is queued, so queueing delay cannot
-// pollute ReceivedAt.
+// pollute ReceivedAt. connID is the connection generation the frame arrived
+// on (see WSHyperliquid.ConnID).
 type frame struct {
-	data []byte
-	rx   time.Time
+	data   []byte
+	rx     time.Time
+	connID uint64
 }
 
 func newHLConn(owner *WSHyperliquid) *hlConn {
@@ -625,34 +659,55 @@ func (h *WSHyperliquid) subscribed(ch Channel, coin, interval string) bool {
 // is not an error: the registry is the source of truth and OnConnect re-sends
 // everything on the next successful dial.
 //
+// Subscribe frames go through the pacing gate (Options.SubscribePaceMs) and
+// the per-connection sent set, so a subscription is sent at most once per
+// connection even while a reconnect replay is running.
+//
 // Concurrent writes are safe: coder/websocket serializes frames internally.
 func (c *hlConn) writeSub(ctx context.Context, sub Subscription, unsubscribe bool) {
-	conn := c.Conn()
-	if conn == nil {
+	if unsubscribe {
+		c.writeUnsubscribe(ctx, sub)
+		return
+	}
+	out, err := c.sendSubscribe(ctx, nil, sub, nil)
+	switch {
+	case err != nil:
+		slog.Warn("hyperliquid: write subscription frame",
+			"subscription", sub.Key(), "unsubscribe", false, "err", err)
+	case out == sendDeferred:
 		slog.Debug("hyperliquid: subscription deferred (not connected)",
-			"subscription", sub.Key(), "unsubscribe", unsubscribe)
+			"subscription", sub.Key(), "unsubscribe", false)
+	case out == sendSent:
+		slog.Debug("hyperliquid: subscription frame sent", "subscription", sub.Key(), "unsubscribe", false)
+	}
+}
+
+// writeUnsubscribe sends one unsubscribe frame on the current connection and
+// forgets that the subscription was sent on it.
+func (c *hlConn) writeUnsubscribe(ctx context.Context, sub Subscription) {
+	c.mu.Lock()
+	st := c.sm.cur
+	if st != nil {
+		delete(st.sent, sub.Key())
+	}
+	c.mu.Unlock()
+	if st == nil {
+		slog.Debug("hyperliquid: subscription deferred (not connected)",
+			"subscription", sub.Key(), "unsubscribe", true)
 		return
 	}
 
-	var (
-		data []byte
-		err  error
-	)
-	if unsubscribe {
-		data, err = UnsubscribeFrame(sub)
-	} else {
-		data, err = SubscribeFrame(sub)
-	}
+	data, err := UnsubscribeFrame(sub)
 	if err != nil {
 		slog.Warn("hyperliquid: build subscription frame", "subscription", sub.Key(), "err", err)
 		return
 	}
-	if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
+	if err := st.conn.Write(ctx, coderws.MessageText, data); err != nil {
 		slog.Warn("hyperliquid: write subscription frame",
-			"subscription", sub.Key(), "unsubscribe", unsubscribe, "err", err)
+			"subscription", sub.Key(), "unsubscribe", true, "err", err)
 		return
 	}
-	slog.Debug("hyperliquid: subscription frame sent", "subscription", sub.Key(), "unsubscribe", unsubscribe)
+	slog.Debug("hyperliquid: subscription frame sent", "subscription", sub.Key(), "unsubscribe", true)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -660,19 +715,34 @@ func (c *hlConn) writeSub(ctx context.Context, sub Subscription, unsubscribe boo
 // ─────────────────────────────────────────────────────────────
 
 func (c *hlConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
-	// Re-send every registered subscription. One frame per subscription: the
-	// venue takes a single subscription object per frame.
-	subs := c.allSubscriptions()
-	for _, sub := range subs {
-		data, err := SubscribeFrame(sub)
-		if err != nil {
-			return fmt.Errorf("hyperliquid: build subscribe frame for %s: %w", sub.Key(), err)
-		}
-		if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
-			return fmt.Errorf("hyperliquid: subscribe %s: %w", sub.Key(), err)
+	// New connection generation first: frames read on this socket are
+	// stamped with it, so acks can be attributed to the right connection.
+	st, subs := c.installConnState(ctx, conn)
+
+	if c.paceGap() > 0 {
+		// Paced replay on its own goroutine: this hook runs before
+		// BaseWebSocket starts the read loop, so sleeping here would stall
+		// reading while the venue is already pushing data.
+		go c.replay(st, subs)
+	} else {
+		// Unpaced: re-send every registered subscription inline, as before.
+		// One frame per subscription: the venue takes a single subscription
+		// object per frame.
+		close(st.done)
+		for _, sub := range subs {
+			data, err := SubscribeFrame(sub)
+			if err != nil {
+				c.dropConnState(st)
+				return fmt.Errorf("hyperliquid: build subscribe frame for %s: %w", sub.Key(), err)
+			}
+			if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
+				c.dropConnState(st)
+				return fmt.Errorf("hyperliquid: subscribe %s: %w", sub.Key(), err)
+			}
 		}
 	}
-	slog.Info("hyperliquid: connected", "url", c.owner.opts.URL, "subscriptions", len(subs))
+	slog.Info("hyperliquid: connected", "url", c.owner.opts.URL, "subscriptions", len(subs),
+		"conn_id", st.id, "paced", c.paceGap() > 0)
 
 	c.startPing(ctx, conn)
 
@@ -684,10 +754,11 @@ func (c *hlConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 
 // onDisconnect fires on an unexpected drop, but not on a deliberate Close():
 // BaseWebSocket suppresses the hook during shutdown. So this is exactly the
-// "connection lost" path — stop the ping ticker and drop frames that belong to
-// the dead socket.
+// "connection lost" path — stop the ping ticker and the paced replay, and drop
+// frames that belong to the dead socket.
 func (c *hlConn) onDisconnect(err error) {
 	c.stopPing()
+	c.dropConnState(nil)
 	c.drainEvents()
 
 	if err != nil {
@@ -717,7 +788,7 @@ func (c *hlConn) onMessage(_ context.Context, data []byte) error {
 	}
 
 	select {
-	case c.eventCh <- frame{data: data, rx: rx}:
+	case c.eventCh <- frame{data: data, rx: rx, connID: c.sm.connID.Load()}:
 	default:
 		slog.Warn("hyperliquid: dropping frame, event queue full")
 	}
@@ -827,6 +898,7 @@ func (h *WSHyperliquid) processFrame(f frame) {
 		h.handleUserFills(env.Data, f.rx)
 	case ServerChannelSubscriptionResponse:
 		slog.Debug("hyperliquid: subscription acknowledged", "data", truncate(string(env.Data), 256))
+		h.handleSubscriptionResponse(env.Data, f)
 	case ServerChannelPong:
 		slog.Debug("hyperliquid: pong")
 	case ServerChannelError:
@@ -840,6 +912,7 @@ func (h *WSHyperliquid) processFrame(f frame) {
 			ReceivedAt: f.rx,
 			Message:    msg,
 		})
+		h.attributeErrorFrame(msg, f)
 	default:
 		slog.Debug("hyperliquid: ignoring channel", "channel", env.Channel)
 	}
