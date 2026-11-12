@@ -133,6 +133,17 @@ type Options struct {
 	// hundreds of channels. When positive, the reconnect replay runs on its
 	// own goroutine so reading starts immediately; see SubscribeMany.
 	SubscribePaceMs int64
+
+	// EventQueueSize is the depth of the decoded-frame queue between the read
+	// loop and the dispatcher. Zero (and any negative value) selects the
+	// default of 8192.
+	//
+	// The queue is the only place where market frames can be lost locally: a
+	// full queue drops the frame, counts it (Stats.FramesDropped), reports it
+	// to SetOnFrameDropped and — on an account-bearing connection — fails the
+	// connection so the reconnect and gap-event machinery can bound the damage.
+	// Size it for the slowest dispatcher you expect, not the average one.
+	EventQueueSize int
 }
 
 // DefaultOptions returns the transport defaults.
@@ -143,6 +154,7 @@ func DefaultOptions() Options {
 		ReadLimitBytes:      defaultReadLimitBytes,
 		AppPingIntervalMs:   defaultAppPingIntervalMs,
 		WSPingIntervalMs:    defaultWSPingIntervalMs,
+		EventQueueSize:      eventQueueSize,
 	}
 }
 
@@ -188,6 +200,12 @@ func NewWithOptions(base *connector.Connector, opts Options) *WSHyperliquid {
 	}
 	if opts.WSPingIntervalMs == 0 {
 		opts.WSPingIntervalMs = defaultWSPingIntervalMs
+	}
+	if opts.EventQueueSize <= 0 {
+		// Negative is a caller bug, not a request for an unbuffered queue: an
+		// unbuffered queue would drop nearly every frame, so fall back to the
+		// default rather than silently disabling the stream.
+		opts.EventQueueSize = eventQueueSize
 	}
 
 	h := &WSHyperliquid{base: base, opts: opts}
@@ -242,6 +260,32 @@ func (h *WSHyperliquid) SetRawFrameHandler(fn func(frame []byte, rx time.Time)) 
 	h.conn.rawMu.Lock()
 	h.conn.rawHandler = fn
 	h.conn.rawMu.Unlock()
+}
+
+// SetOnFrameDropped registers a callback invoked once for every frame that
+// never reaches the dispatcher: the queue was full (DropQueueFull, called on
+// the read-loop goroutine) or the connection dropped with frames still queued
+// (DropDrainedOnDisconnect, called from the disconnect path). Set it before
+// Start, like the other hooks.
+//
+// The hook is the per-frame signal; Stats() is the aggregate. On a market-only
+// connection a drop is survivable and only needs counting (FrameID gaps in the
+// delivered events show it too). On an account-bearing connection a queue-full
+// drop fails the connection and the reconnect is announced by a
+// HyperliquidGapEvent.
+//
+// Keep it cheap: it runs on the read loop (a blocking or I/O-bound hook
+// throttles frame reads, which is how a connector talks itself into a drop) and
+// it runs once per drained frame during disconnect handling.
+func (h *WSHyperliquid) SetOnFrameDropped(fn func(DroppedFrame)) {
+	h.conn.fa.setOnDrop(fn)
+}
+
+// Stats returns the frame accounting snapshot: frames read, dropped and
+// drained, the decode queue's depth/capacity/high-water, the current connection
+// generation and the disconnect count. Lock-free and safe from any goroutine.
+func (h *WSHyperliquid) Stats() Stats {
+	return h.conn.fa.snapshot(h.conn.sm.connID.Load())
 }
 
 // Start dials the venue and starts the event dispatcher. reconnectIntervalMs,
@@ -538,6 +582,11 @@ type hlConn struct {
 	eventCh        chan frame
 	dispatchCancel context.CancelFunc
 
+	// fa is the frame accounting and the drop hook (provenance.go): FrameIDs,
+	// FramesRead/Dropped/Drained, queue depth and high-water, the drop hook and
+	// the loss accumulated since the last gap event.
+	fa frameAccounting
+
 	// sm is the C4 subscription machinery: connection id, per-connection
 	// sent set + paced replay, the shared pacing gate and the ack trackers
 	// (subscribe.go).
@@ -552,6 +601,11 @@ type frame struct {
 	data   []byte
 	rx     time.Time
 	connID uint64
+	id     uint64 // FrameID stamped in onMessage before the queue (0 when built by tests)
+
+	// gap is non-nil for the synthetic frame that carries a HyperliquidGapEvent
+	// through this same queue (never a wire frame; consumes no FrameID).
+	gap *gapFrame
 }
 
 func newHLConn(owner *WSHyperliquid) *hlConn {
@@ -559,8 +613,9 @@ func newHLConn(owner *WSHyperliquid) *hlConn {
 		BaseWebSocket: &ws.BaseWebSocket{},
 		owner:         owner,
 		subs:          make(map[string]Subscription),
-		eventCh:       make(chan frame, eventQueueSize),
+		eventCh:       make(chan frame, owner.opts.EventQueueSize),
 	}
+	c.fa.queueCap = owner.opts.EventQueueSize
 	// ShouldConnect only gates the reconnect loop: with nothing subscribed
 	// there is no reason to re-dial after a drop.
 	c.ShouldConnect = func() bool {
@@ -719,6 +774,13 @@ func (c *hlConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 	// stamped with it, so acks can be attributed to the right connection.
 	st, subs := c.installConnState(ctx, conn)
 
+	// No-silent-loss ordering: this hook runs before BaseWebSocket starts the
+	// read loop, so a gap event enqueued here is ahead of every frame of the new
+	// generation in the dispatcher's FIFO. It is enqueued after the connection
+	// generation is installed (so it carries the new ConnID) and before the
+	// subscription replay (which only writes; nothing is read yet).
+	c.enqueueGap(st.id)
+
 	if c.paceGap() > 0 {
 		// Paced replay on its own goroutine: this hook runs before
 		// BaseWebSocket starts the read loop, so sleeping here would stall
@@ -752,6 +814,51 @@ func (c *hlConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 	return nil
 }
 
+// enqueueGap queues the synthetic HyperliquidGapEvent frame for a reconnected
+// account-bearing connection. It is a no-op for the first connection (nothing
+// has been lost yet) and for market-only connections (where loss is counted but
+// the stream self-heals: the next snapshot supersedes it).
+//
+// If the queue is full at this instant — possible when the dispatcher is still
+// working through the previous generation — it is drained first. Those frames
+// belong to a dead socket and are counted as drained on the way out, so
+// discarding them here cannot hide a loss: it is added to the gap event's
+// LostFrames. Making room guarantees the gap notice is never the thing that
+// gets dropped.
+func (c *hlConn) enqueueGap(connID uint64) {
+	if connID <= 1 || !c.accountBearing() {
+		return
+	}
+	if len(c.eventCh) >= cap(c.eventCh) {
+		c.drainEvents()
+	}
+	prev := connID - 1
+	cause := connector.HyperliquidGapDisconnect
+	if c.fa.overflowed.Swap(false) {
+		cause = connector.HyperliquidGapQueueOverflow
+	}
+	f := frame{
+		rx:     time.Now(),
+		connID: connID,
+		gap: &gapFrame{
+			prevConnID:      prev,
+			lostFrames:      c.fa.lostSinceGap.Swap(0),
+			cause:           cause,
+			accountChannels: true,
+		},
+	}
+	select {
+	case c.eventCh <- f:
+		c.fa.enqueued()
+	default:
+		// Unreachable in practice: the queue was just emptied and only this
+		// goroutine enqueues before the read loop starts. Count it anyway rather
+		// than lose the notice silently.
+		slog.Error("hyperliquid: could not enqueue gap event, event queue full",
+			"conn_id", connID, "lost_frames", f.gap.lostFrames)
+	}
+}
+
 // onDisconnect fires on an unexpected drop, but not on a deliberate Close():
 // BaseWebSocket suppresses the hook during shutdown. So this is exactly the
 // "connection lost" path — stop the ping ticker and the paced replay, and drop
@@ -759,7 +866,13 @@ func (c *hlConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 func (c *hlConn) onDisconnect(err error) {
 	c.stopPing()
 	c.dropConnState(nil)
+	// Frames that were read but never decoded die here, account frames
+	// included. Count them (and report each to the drop hook) so the reconnect
+	// can tell the consumer how much it lost; the store below lets onConnect
+	// label the next gap event. The drain runs before the disconnect is counted
+	// so an observer that sees Disconnects grow also sees FramesDrained settled.
 	c.drainEvents()
+	c.fa.disc.Add(1)
 
 	if err != nil {
 		slog.Info("hyperliquid: disconnected", "reason", err)
@@ -779,6 +892,13 @@ func (c *hlConn) onDisconnect(err error) {
 // coder/websocket and is owned by us; no copy is needed.
 func (c *hlConn) onMessage(_ context.Context, data []byte) error {
 	rx := time.Now()
+	// FrameID is stamped here, on the read loop and before the queue, so a
+	// frame that is later dropped still consumes an ID: the gaps a consumer
+	// sees in delivered FrameIDs are exactly the frames that never made it, and
+	// FramesRead stays the count of everything the socket delivered.
+	id := c.fa.frameSeq.Add(1)
+	c.fa.read.Add(1)
+	connID := c.sm.connID.Load()
 
 	c.rawMu.RLock()
 	raw := c.rawHandler
@@ -787,18 +907,59 @@ func (c *hlConn) onMessage(_ context.Context, data []byte) error {
 		raw(data, rx)
 	}
 
+	f := frame{data: data, rx: rx, connID: connID, id: id}
 	select {
-	case c.eventCh <- frame{data: data, rx: rx, connID: c.sm.connID.Load()}:
+	case c.eventCh <- f:
+		c.fa.enqueued()
+		return nil
 	default:
-		slog.Warn("hyperliquid: dropping frame, event queue full")
 	}
+
+	c.fa.noteDrop(f, DropQueueFull)
+	if !c.accountBearing() {
+		// Market data: losing a frame is bad but harmless (the next l2Book
+		// snapshot supersedes it), and the drop is counted and reported.
+		slog.Warn("hyperliquid: dropping frame, event queue full",
+			"frame_id", id, "conn_id", connID, "queue_cap", c.fa.cap())
+		return nil
+	}
+
+	// Account channel: a dropped frame is a lost fill or order update, and the
+	// next frame does not repair it. Do not keep reading into a queue that
+	// cannot keep up — fail the connection so the reconnect loop re-establishes
+	// it, and let onConnect announce the loss with a gap event before any frame
+	// of the new generation is decoded.
+	c.fa.overflowed.Store(true)
+	slog.Warn("hyperliquid: failing account connection, event queue full",
+		"frame_id", id, "conn_id", connID, "queue_cap", c.fa.cap(),
+		"dropped", c.fa.dropped.Load(), "drained", c.fa.drained.Load())
+	c.Disconnect()
 	return nil
 }
 
+// accountBearing reports whether any account channel (orderUpdates, userFills)
+// is registered, i.e. whether a lost frame is a lost account event rather than
+// a superseded market snapshot.
+func (c *hlConn) accountBearing() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, sub := range c.subs {
+		if isUserChannel(sub.Type) {
+			return true
+		}
+	}
+	return false
+}
+
+// drainEvents discards every queued frame, counting each one and reporting it to
+// the drop hook. Called on the disconnect path (and by the connect path when it
+// must make room for a gap event), so nothing here may block.
 func (c *hlConn) drainEvents() {
 	for {
 		select {
-		case <-c.eventCh:
+		case f := <-c.eventCh:
+			c.fa.dequeued()
+			c.fa.noteDrop(f, DropDrainedOnDisconnect)
 		default:
 			return
 		}
@@ -862,6 +1023,7 @@ func (h *WSHyperliquid) eventDispatcher(ctx context.Context, c *hlConn) {
 		case <-ctx.Done():
 			return
 		case f := <-c.eventCh:
+			c.fa.dequeued()
 			h.processFrame(f)
 		}
 	}
@@ -870,6 +1032,23 @@ func (h *WSHyperliquid) eventDispatcher(ctx context.Context, c *hlConn) {
 // processFrame routes one venue frame by its `channel` field. Every public
 // channel is {"channel":"<name>","data":<payload>}.
 func (h *WSHyperliquid) processFrame(f frame) {
+	if f.gap != nil {
+		// Synthetic: the reconnect notice of an account-bearing connection. It
+		// travels this FIFO so it is dispatched before any frame of the new
+		// connection generation (enqueueGap runs before the read loop starts).
+		h.base.DispatchEvent(&connector.HyperliquidGapEvent{
+			SeqID:           h.base.NextSeqID(),
+			ReceivedAt:      f.rx,
+			FrameID:         f.id, // 0: no wire frame behind it
+			ConnID:          f.connID,
+			PrevConnID:      f.gap.prevConnID,
+			Cause:           f.gap.cause,
+			LostFrames:      f.gap.lostFrames,
+			AccountChannels: f.gap.accountChannels,
+		})
+		return
+	}
+
 	var env struct {
 		Channel string          `json:"channel"`
 		Data    json.RawMessage `json:"data"`
@@ -881,21 +1060,21 @@ func (h *WSHyperliquid) processFrame(f frame) {
 
 	switch Channel(env.Channel) {
 	case ChannelL2Book:
-		h.handleL2Book(env.Data, f.rx)
+		h.handleL2Book(env.Data, f)
 	case ChannelTrades:
-		h.handleTrades(env.Data, f.rx)
+		h.handleTrades(env.Data, f)
 	case ChannelBBO:
-		h.handleBBO(env.Data, f.rx)
+		h.handleBBO(env.Data, f)
 	case ChannelActiveAssetCtx:
-		h.handleActiveAssetCtx(env.Data, f.rx)
+		h.handleActiveAssetCtx(env.Data, f)
 	case ChannelAllMids:
-		h.handleAllMids(env.Data, f.rx)
+		h.handleAllMids(env.Data, f)
 	case ChannelCandle:
-		h.handleCandle(env.Data, f.rx)
+		h.handleCandle(env.Data, f)
 	case ChannelOrderUpdates:
-		h.handleOrderUpdates(env.Data, f.rx)
+		h.handleOrderUpdates(env.Data, f)
 	case ChannelUserFills:
-		h.handleUserFills(env.Data, f.rx)
+		h.handleUserFills(env.Data, f)
 	case ServerChannelSubscriptionResponse:
 		slog.Debug("hyperliquid: subscription acknowledged", "data", truncate(string(env.Data), 256))
 		h.handleSubscriptionResponse(env.Data, f)
@@ -910,6 +1089,8 @@ func (h *WSHyperliquid) processFrame(f frame) {
 		h.base.DispatchEvent(&connector.HyperliquidErrorEvent{
 			SeqID:      h.base.NextSeqID(),
 			ReceivedAt: f.rx,
+			FrameID:    f.id,
+			ConnID:     f.connID,
 			Message:    msg,
 		})
 		h.attributeErrorFrame(msg, f)
@@ -918,7 +1099,7 @@ func (h *WSHyperliquid) processFrame(f frame) {
 	}
 }
 
-func (h *WSHyperliquid) handleL2Book(data json.RawMessage, rx time.Time) {
+func (h *WSHyperliquid) handleL2Book(data json.RawMessage, f frame) {
 	var book L2BookSnapshot
 	if err := json.Unmarshal(data, &book); err != nil {
 		slog.Warn("hyperliquid: l2Book decode failed", "err", err, "data", truncate(string(data), 256))
@@ -928,43 +1109,59 @@ func (h *WSHyperliquid) handleL2Book(data json.RawMessage, rx time.Time) {
 		slog.Debug("hyperliquid: l2Book frame for unsubscribed coin", "coin", book.Coin)
 		return
 	}
+	ts, synth := msTimeSynth(book.Time, f.rx)
 	h.base.DispatchEvent(&connector.HyperliquidBookEvent{
-		SeqID:      h.base.NextSeqID(),
-		ReceivedAt: rx,
-		Coin:       book.Coin,
-		Timestamp:  msTime(book.Time, rx),
-		Bids:       eventLevels(book.Bids()),
-		Asks:       eventLevels(book.Asks()),
+		SeqID:                h.base.NextSeqID(),
+		ReceivedAt:           f.rx,
+		FrameID:              f.id,
+		ConnID:               f.connID,
+		Coin:                 book.Coin,
+		Timestamp:            ts,
+		TimestampSynthesized: synth,
+		Bids:                 eventLevels(book.Bids()),
+		Asks:                 eventLevels(book.Asks()),
 	})
 }
 
-func (h *WSHyperliquid) handleTrades(data json.RawMessage, rx time.Time) {
+func (h *WSHyperliquid) handleTrades(data json.RawMessage, f frame) {
 	var trades []Trade
 	if err := json.Unmarshal(data, &trades); err != nil {
 		slog.Warn("hyperliquid: trades decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
+	// BatchIndex is the print's position in the frame's array and BatchLen the
+	// array's length, so a consumer can tell "these N prints are one venue
+	// event" from "these N prints are N events" — the difference between a
+	// batch that is complete and one whose tail was cut off by a decode error
+	// or an unsubscribed coin (indexes then skip).
+	batchLen := len(trades)
 	for i := range trades {
 		t := trades[i]
 		if !h.subscribed(ChannelTrades, t.Coin, "") {
 			continue
 		}
+		ts, synth := msTimeSynth(t.Time, f.rx)
 		h.base.DispatchEvent(&connector.HyperliquidTradeEvent{
-			SeqID:      h.base.NextSeqID(),
-			ReceivedAt: rx,
-			Coin:       t.Coin,
-			Side:       t.Side,
-			Price:      t.Price.String(),
-			Size:       t.Size.String(),
-			TradeID:    t.TradeID,
-			Hash:       t.Hash,
-			Users:      t.Users,
-			Timestamp:  msTime(t.Time, rx),
+			SeqID:                h.base.NextSeqID(),
+			ReceivedAt:           f.rx,
+			FrameID:              f.id,
+			ConnID:               f.connID,
+			Coin:                 t.Coin,
+			Side:                 t.Side,
+			Price:                t.Price.String(),
+			Size:                 t.Size.String(),
+			TradeID:              t.TradeID,
+			Hash:                 t.Hash,
+			Users:                t.Users,
+			Timestamp:            ts,
+			TimestampSynthesized: synth,
+			BatchIndex:           i,
+			BatchLen:             batchLen,
 		})
 	}
 }
 
-func (h *WSHyperliquid) handleBBO(data json.RawMessage, rx time.Time) {
+func (h *WSHyperliquid) handleBBO(data json.RawMessage, f frame) {
 	var bbo BBO
 	if err := json.Unmarshal(data, &bbo); err != nil {
 		slog.Warn("hyperliquid: bbo decode failed", "err", err, "data", truncate(string(data), 256))
@@ -974,11 +1171,15 @@ func (h *WSHyperliquid) handleBBO(data json.RawMessage, rx time.Time) {
 		slog.Debug("hyperliquid: bbo frame for unsubscribed coin", "coin", bbo.Coin)
 		return
 	}
+	ts, synth := msTimeSynth(bbo.Time, f.rx)
 	ev := &connector.HyperliquidBBOEvent{
-		SeqID:      h.base.NextSeqID(),
-		ReceivedAt: rx,
-		Coin:       bbo.Coin,
-		Timestamp:  msTime(bbo.Time, rx),
+		SeqID:                h.base.NextSeqID(),
+		ReceivedAt:           f.rx,
+		FrameID:              f.id,
+		ConnID:               f.connID,
+		Coin:                 bbo.Coin,
+		Timestamp:            ts,
+		TimestampSynthesized: synth,
 	}
 	if bid := bbo.Bid(); bid != nil {
 		lvl := eventLevel(*bid)
@@ -991,7 +1192,7 @@ func (h *WSHyperliquid) handleBBO(data json.RawMessage, rx time.Time) {
 	h.base.DispatchEvent(ev)
 }
 
-func (h *WSHyperliquid) handleActiveAssetCtx(data json.RawMessage, rx time.Time) {
+func (h *WSHyperliquid) handleActiveAssetCtx(data json.RawMessage, f frame) {
 	var msg struct {
 		Coin string          `json:"coin"`
 		Ctx  json.RawMessage `json:"ctx"`
@@ -1009,16 +1210,19 @@ func (h *WSHyperliquid) handleActiveAssetCtx(data json.RawMessage, rx time.Time)
 		slog.Warn("hyperliquid: activeAssetCtx context decode failed", "coin", msg.Coin, "err", err)
 		return
 	}
-	// The channel carries the perp context for perps and the spot context for
-	// spot assets (docs: WsActiveAssetCtx | WsActiveSpotAssetCtx), and the spot
-	// variant has neither funding nor an oracle price. The payload itself
-	// carries no discriminator, so probe the fields that only the perp variant
-	// has.
+	// The venue documents one activeAssetCtx subscription serving both
+	// variants, with ctx typed PerpsAssetCtx (funding, openInterest, oraclePx)
+	// or SpotAssetCtx (the spot-only circulatingSupply). Classify from the
+	// positive spot marker; absence of perp fields is not evidence of anything
+	// (GMS ledger D6: a perp ctx that omits funding/oraclePx used to be
+	// misfiled as spot).
 	h.base.DispatchEvent(&connector.HyperliquidAssetCtxEvent{
 		SeqID:        h.base.NextSeqID(),
-		ReceivedAt:   rx,
+		ReceivedAt:   f.rx,
+		FrameID:      f.id,
+		ConnID:       f.connID,
 		Coin:         msg.Coin,
-		Timestamp:    rx, // the venue sends no timestamp on this channel
+		Timestamp:    f.rx, // the venue sends no timestamp on this channel
 		IsSpot:       ctxIsSpot(msg.Ctx),
 		Funding:      ctx.Funding.String(),
 		OpenInterest: ctx.OpenInterest.String(),
@@ -1033,7 +1237,7 @@ func (h *WSHyperliquid) handleActiveAssetCtx(data json.RawMessage, rx time.Time)
 	})
 }
 
-func (h *WSHyperliquid) handleAllMids(data json.RawMessage, rx time.Time) {
+func (h *WSHyperliquid) handleAllMids(data json.RawMessage, f frame) {
 	var mids AllMids
 	if err := json.Unmarshal(data, &mids); err != nil {
 		slog.Warn("hyperliquid: allMids decode failed", "err", err, "data", truncate(string(data), 256))
@@ -1048,13 +1252,15 @@ func (h *WSHyperliquid) handleAllMids(data json.RawMessage, rx time.Time) {
 	}
 	h.base.DispatchEvent(&connector.HyperliquidAllMidsEvent{
 		SeqID:      h.base.NextSeqID(),
-		ReceivedAt: rx,
-		Timestamp:  rx, // this channel carries no timestamp either
+		ReceivedAt: f.rx,
+		FrameID:    f.id,
+		ConnID:     f.connID,
+		Timestamp:  f.rx, // this channel carries no timestamp either
 		Mids:       out,
 	})
 }
 
-func (h *WSHyperliquid) handleCandle(data json.RawMessage, rx time.Time) {
+func (h *WSHyperliquid) handleCandle(data json.RawMessage, f frame) {
 	candles, err := decodeCandles(data)
 	if err != nil {
 		slog.Warn("hyperliquid: candle decode failed", "err", err, "data", truncate(string(data), 256))
@@ -1066,18 +1272,20 @@ func (h *WSHyperliquid) handleCandle(data json.RawMessage, rx time.Time) {
 		}
 		h.base.DispatchEvent(&connector.HyperliquidCandleEvent{
 			SeqID:      h.base.NextSeqID(),
-			ReceivedAt: rx,
+			ReceivedAt: f.rx,
+			FrameID:    f.id,
+			ConnID:     f.connID,
 			Coin:       c.Coin,
 			Interval:   c.Interval,
-			OpenTime:   msTime(c.OpenTime, rx),
-			CloseTime:  msTime(c.CloseTime, rx),
+			OpenTime:   msTime(c.OpenTime, f.rx),
+			CloseTime:  msTime(c.CloseTime, f.rx),
 			Open:       c.Open.String(),
 			High:       c.High.String(),
 			Low:        c.Low.String(),
 			Close:      c.Close.String(),
 			Volume:     c.Volume.String(),
 			TradeCount: c.TradeCount,
-			Timestamp:  rx,
+			Timestamp:  f.rx,
 		})
 	}
 }
@@ -1093,7 +1301,7 @@ func (h *WSHyperliquid) handleCandle(data json.RawMessage, rx time.Time) {
 // is always decoded, unlike the coin channels where an unsubscribed coin is
 // dropped. A user-channel socket is dedicated to a single account, so a frame
 // that arrives on it belongs to that account.
-func (h *WSHyperliquid) handleOrderUpdates(data json.RawMessage, rx time.Time) {
+func (h *WSHyperliquid) handleOrderUpdates(data json.RawMessage, f frame) {
 	if nullOrEmpty(data) {
 		return
 	}
@@ -1106,7 +1314,9 @@ func (h *WSHyperliquid) handleOrderUpdates(data json.RawMessage, rx time.Time) {
 		u := updates[i]
 		h.base.DispatchEvent(&connector.HyperliquidOrderUpdateEvent{
 			SeqID:           h.base.NextSeqID(),
-			ReceivedAt:      rx,
+			ReceivedAt:      f.rx,
+			FrameID:         f.id,
+			ConnID:          f.connID,
 			Coin:            u.Order.Coin,
 			Side:            u.Order.Side,
 			LimitPx:         u.Order.LimitPx.String(),
@@ -1125,7 +1335,7 @@ func (h *WSHyperliquid) handleOrderUpdates(data json.RawMessage, rx time.Time) {
 // the whole batch. The first frame after subscribing is the account's fill
 // snapshot (IsSnapshot=true); later frames are incremental. Like orderUpdates
 // the frame is always decoded, never gated on the subscription registry.
-func (h *WSHyperliquid) handleUserFills(data json.RawMessage, rx time.Time) {
+func (h *WSHyperliquid) handleUserFills(data json.RawMessage, f frame) {
 	if nullOrEmpty(data) {
 		return
 	}
@@ -1156,7 +1366,9 @@ func (h *WSHyperliquid) handleUserFills(data json.RawMessage, rx time.Time) {
 	}
 	h.base.DispatchEvent(&connector.HyperliquidUserFillsEvent{
 		SeqID:      h.base.NextSeqID(),
-		ReceivedAt: rx,
+		ReceivedAt: f.rx,
+		FrameID:    f.id,
+		ConnID:     f.connID,
 		User:       msg.User,
 		IsSnapshot: msg.IsSnapshot,
 		Fills:      fills,
@@ -1193,16 +1405,19 @@ func decodeCandles(raw json.RawMessage) ([]Candle, error) {
 	return []Candle{one}, nil
 }
 
-// ctxIsSpot reports whether an asset context is the spot variant, i.e. it
-// carries neither of the perp-only fields.
+// ctxIsSpot reports whether an asset context is the spot variant, from the
+// positive spot marker the venue documents: SpotAssetCtx carries
+// circulatingSupply, PerpsAssetCtx does not (see the H2 report for the docs
+// provenance). Anything without the marker is reported as perp — the previous
+// heuristic ("no funding and no oraclePx therefore spot") silently mislabelled
+// perp contexts that omitted those fields.
 func ctxIsSpot(raw json.RawMessage) bool {
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return false
 	}
-	_, hasFunding := probe["funding"]
-	_, hasOraclePx := probe["oraclePx"]
-	return !hasFunding && !hasOraclePx
+	_, hasSpotMarker := probe["circulatingSupply"]
+	return hasSpotMarker
 }
 
 // decodeErrorFrame renders an {"channel":"error"} payload, which the venue
@@ -1218,10 +1433,18 @@ func decodeErrorFrame(raw json.RawMessage) string {
 // msTime converts a millisecond epoch into a time.Time, falling back to the
 // local receive time when the venue omitted the field.
 func msTime(ms int64, fallback time.Time) time.Time {
+	t, _ := msTimeSynth(ms, fallback)
+	return t
+}
+
+// msTimeSynth is msTime plus the provenance flag: synthesized is true exactly
+// when the fallback was used, so a consumer can tell an exchange timestamp from
+// a local receive time without comparing clocks.
+func msTimeSynth(ms int64, fallback time.Time) (t time.Time, synthesized bool) {
 	if ms <= 0 {
-		return fallback
+		return fallback, true
 	}
-	return time.UnixMilli(ms)
+	return time.UnixMilli(ms), false
 }
 
 func eventLevel(l L2Level) connector.HyperliquidLevel {

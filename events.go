@@ -221,6 +221,23 @@ type BinanceMarkPriceEvent struct {
 // Every price, size and volume is a decimal string exactly as the venue sent
 // it, never a float, so no precision is lost on the way through.
 
+// Frame provenance (H2) — every event below carries FrameID and ConnID.
+//
+// FrameID is a per-WSHyperliquid monotonic counter stamped on every frame read
+// from the socket, before the internal decode queue, and never reset across
+// reconnects. It is NOT the number of events: pongs, subscribe acks, error
+// frames and frames for unsubscribed coins all consume an ID without producing
+// a typed event, and a frame that is dropped (queue full) or drained
+// (disconnect) consumes an ID and produces none by definition. Use
+// WSHyperliquid.Stats() for the totals and SetOnFrameDropped for the drop
+// signal; do not infer "no loss" from a contiguous run of FrameIDs.
+//
+// ConnID is the connection generation the frame arrived on, matching
+// WSHyperliquid.ConnID() and SubscriptionAck.ConnID. A reconnect bumps it; a
+// FrameID gap *within* one ConnID is local loss, a ConnID change is a gap whose
+// size the connector cannot know (frames missed while the socket was down are
+// invisible to it).
+//
 // HyperliquidLevel is one price level of a Hyperliquid order book. Count is
 // the number of resting orders at that price (the venue's "n").
 type HyperliquidLevel struct {
@@ -235,12 +252,15 @@ type HyperliquidLevel struct {
 // anything changed. Bids and Asks are best-first, in the venue's order, and as
 // deep as the subscription asked for (5 levels with fast, 20 otherwise).
 type HyperliquidBookEvent struct {
-	SeqID      int64              `json:"seq_id"`      // monotonic sequence for ordered DES replay
-	ReceivedAt time.Time          `json:"received_at"` // local arrival timestamp
-	Coin       string             `json:"coin"`
-	Bids       []HyperliquidLevel `json:"bids"`      // best (highest price) first
-	Asks       []HyperliquidLevel `json:"asks"`      // best (lowest price) first
-	Timestamp  time.Time          `json:"timestamp"` // exchange time (ms epoch on the wire)
+	SeqID                int64              `json:"seq_id"`      // monotonic sequence for ordered DES replay
+	ReceivedAt           time.Time          `json:"received_at"` // local arrival timestamp
+	FrameID              uint64             `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID               uint64             `json:"conn_id"`     // connection generation the frame arrived on
+	Coin                 string             `json:"coin"`
+	Bids                 []HyperliquidLevel `json:"bids"`                            // best (highest price) first
+	Asks                 []HyperliquidLevel `json:"asks"`                            // best (lowest price) first
+	Timestamp            time.Time          `json:"timestamp"`                       // exchange time (ms epoch on the wire)
+	TimestampSynthesized bool               `json:"timestamp_synthesized,omitempty"` // Timestamp was the local receive time: the venue omitted its time field
 }
 
 // HyperliquidTradeEvent is one trade print from the trades channel. The venue
@@ -252,28 +272,36 @@ type HyperliquidBookEvent struct {
 // 50-bit hash of (buyer order id, seller order id): it is not globally unique,
 // so a unique trade key is (Timestamp, Coin, TradeID).
 type HyperliquidTradeEvent struct {
-	SeqID      int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
-	ReceivedAt time.Time `json:"received_at"` // local arrival timestamp
-	Coin       string    `json:"coin"`
-	Side       string    `json:"side"` // "B" or "A"
-	Price      string    `json:"price"`
-	Size       string    `json:"size"`
-	TradeID    int64     `json:"trade_id"`
-	Hash       string    `json:"hash,omitempty"`  // L1 transaction hash
-	Users      []string  `json:"users,omitempty"` // [buyer, seller] addresses
-	Timestamp  time.Time `json:"timestamp"`       // exchange trade time
+	SeqID                int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
+	ReceivedAt           time.Time `json:"received_at"` // local arrival timestamp
+	FrameID              uint64    `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID               uint64    `json:"conn_id"`     // connection generation the frame arrived on
+	Coin                 string    `json:"coin"`
+	Side                 string    `json:"side"` // "B" or "A"
+	Price                string    `json:"price"`
+	Size                 string    `json:"size"`
+	TradeID              int64     `json:"trade_id"`
+	Hash                 string    `json:"hash,omitempty"`                  // L1 transaction hash
+	Users                []string  `json:"users,omitempty"`                 // [buyer, seller] addresses
+	Timestamp            time.Time `json:"timestamp"`                       // exchange trade time
+	BatchIndex           int       `json:"batch_index"`                     // 0-based index of this print in its wire frame
+	BatchLen             int       `json:"batch_len"`                       // number of prints the wire frame carried (1 for a lone print)
+	TimestampSynthesized bool      `json:"timestamp_synthesized,omitempty"` // Timestamp was the local receive time: the venue omitted its time field
 }
 
 // HyperliquidBBOEvent is a best bid/offer update from the bbo channel. The
 // venue sends one only on a block where the bbo changed, and either side may
 // be absent (nil) when there is no resting order on that side.
 type HyperliquidBBOEvent struct {
-	SeqID      int64             `json:"seq_id"`      // monotonic sequence for ordered DES replay
-	ReceivedAt time.Time         `json:"received_at"` // local arrival timestamp
-	Coin       string            `json:"coin"`
-	Bid        *HyperliquidLevel `json:"bid,omitempty"`
-	Ask        *HyperliquidLevel `json:"ask,omitempty"`
-	Timestamp  time.Time         `json:"timestamp"` // exchange time
+	SeqID                int64             `json:"seq_id"`      // monotonic sequence for ordered DES replay
+	ReceivedAt           time.Time         `json:"received_at"` // local arrival timestamp
+	FrameID              uint64            `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID               uint64            `json:"conn_id"`     // connection generation the frame arrived on
+	Coin                 string            `json:"coin"`
+	Bid                  *HyperliquidLevel `json:"bid,omitempty"`
+	Ask                  *HyperliquidLevel `json:"ask,omitempty"`
+	Timestamp            time.Time         `json:"timestamp"`                       // exchange time
+	TimestampSynthesized bool              `json:"timestamp_synthesized,omitempty"` // Timestamp was the local receive time: the venue omitted its time field
 }
 
 // HyperliquidAssetCtxEvent is a perp asset context update from the
@@ -281,10 +309,20 @@ type HyperliquidBBOEvent struct {
 // prices, pushed once per block. IsSpot marks the spot variant of the channel,
 // which carries none of the perp fields.
 //
+// IsSpot is derived from positive evidence in the payload, not from the
+// absence of perp fields: the venue documents the same activeAssetCtx
+// subscription serving both variants, with ctx typed as PerpsAssetCtx
+// (funding, openInterest, oraclePx) or SpotAssetCtx (spot-only
+// circulatingSupply). A ctx that carries circulatingSupply is spot; anything
+// else is perp, so a perp frame that happens to omit funding and oraclePx is
+// still reported as perp (see the H2 report for the docs provenance).
+//
 // This channel has no venue timestamp, so Timestamp mirrors ReceivedAt.
 type HyperliquidAssetCtxEvent struct {
 	SeqID        int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt   time.Time `json:"received_at"` // local arrival timestamp
+	FrameID      uint64    `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID       uint64    `json:"conn_id"`     // connection generation the frame arrived on
 	Coin         string    `json:"coin"`
 	IsSpot       bool      `json:"is_spot,omitempty"`
 	Funding      string    `json:"funding,omitempty"`       // hourly rate, decimal string
@@ -309,6 +347,8 @@ type HyperliquidAssetCtxEvent struct {
 type HyperliquidAllMidsEvent struct {
 	SeqID      int64             `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt time.Time         `json:"received_at"` // local arrival timestamp
+	FrameID    uint64            `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID     uint64            `json:"conn_id"`     // connection generation the frame arrived on
 	Mids       map[string]string `json:"mids"`        // coin → mid price (decimal string)
 	Timestamp  time.Time         `json:"timestamp"`
 }
@@ -320,6 +360,8 @@ type HyperliquidAllMidsEvent struct {
 type HyperliquidCandleEvent struct {
 	SeqID      int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt time.Time `json:"received_at"` // local arrival timestamp
+	FrameID    uint64    `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID     uint64    `json:"conn_id"`     // connection generation the frame arrived on
 	Coin       string    `json:"coin"`
 	Interval   string    `json:"interval"`   // "1m", "5m", "1h", …
 	OpenTime   time.Time `json:"open_time"`  // candle open (exchange, ms epoch)
@@ -340,6 +382,8 @@ type HyperliquidCandleEvent struct {
 type HyperliquidErrorEvent struct {
 	SeqID      int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt time.Time `json:"received_at"` // local arrival timestamp
+	FrameID    uint64    `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID     uint64    `json:"conn_id"`     // connection generation the frame arrived on
 	Message    string    `json:"message"`
 }
 
@@ -360,6 +404,8 @@ type HyperliquidErrorEvent struct {
 type HyperliquidOrderUpdateEvent struct {
 	SeqID           int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt      time.Time `json:"received_at"` // local arrival timestamp
+	FrameID         uint64    `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID          uint64    `json:"conn_id"`     // connection generation the frame arrived on
 	Coin            string    `json:"coin"`
 	Side            string    `json:"side"` // "A" or "B"
 	LimitPx         string    `json:"limit_px"`
@@ -379,10 +425,50 @@ type HyperliquidOrderUpdateEvent struct {
 type HyperliquidUserFillsEvent struct {
 	SeqID      int64             `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt time.Time         `json:"received_at"` // local arrival timestamp
+	FrameID    uint64            `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID     uint64            `json:"conn_id"`     // connection generation the frame arrived on
 	User       string            `json:"user"`
 	IsSnapshot bool              `json:"is_snapshot,omitempty"`
 	Fills      []HyperliquidFill `json:"fills"`
 }
+
+// HyperliquidGapEvent says "events may be missing before this point: reconcile
+// via REST". It is dispatched only on an ACCOUNT-BEARING connection (one that
+// carries an orderUpdates or userFills subscription) immediately after a
+// reconnect, ahead of every frame of the new connection generation, so a
+// consumer never sees new-generation account events before it learns that the
+// previous generation lost some.
+//
+// Cause is "queue_overflow" (the read loop could not keep up and the frame
+// queue filled, so the connection was failed and re-established) or
+// "disconnect" (the socket dropped; anything queued was discarded). LostFrames
+// counts the frames the connector knows were dropped or drained on that
+// connection since the last delivered event. It is a LOWER BOUND: frames lost
+// on the wire while the socket was down are invisible to the connector, and so
+// is anything the venue never sent. PrevConnID is the generation that was lost,
+// ConnID the one that is live; a consumer that missed more than one generation
+// sees only the latest gap, so compare ConnID against the last event it
+// processed and use PrevConnID as the floor of the missing range.
+//
+// FrameID is 0: the gap is synthetic, produced by the connector rather than by
+// a wire frame, so it consumes no frame ID. SeqID still orders it against the
+// other events of this stream.
+type HyperliquidGapEvent struct {
+	SeqID           int64     `json:"seq_id"`
+	ReceivedAt      time.Time `json:"received_at"` // when the gap was enqueued (the reconnect)
+	FrameID         uint64    `json:"frame_id"`    // always 0: synthetic event
+	ConnID          uint64    `json:"conn_id"`     // new generation
+	PrevConnID      uint64    `json:"prev_conn_id"`
+	Cause           string    `json:"cause"`            // "queue_overflow" or "disconnect"
+	LostFrames      uint64    `json:"lost_frames"`      // lower bound; see above
+	AccountChannels bool      `json:"account_channels"` // true: orderUpdates/userFills were subscribed
+}
+
+// Gap causes carried by HyperliquidGapEvent.Cause.
+const (
+	HyperliquidGapQueueOverflow = "queue_overflow"
+	HyperliquidGapDisconnect    = "disconnect"
+)
 
 // HyperliquidFill is one fill inside a HyperliquidUserFillsEvent. Every decimal
 // is the venue's text (Px, Sz, ClosedPnl, Fee, StartPosition); Fee is negative
