@@ -42,7 +42,7 @@ type WSPolymarketMarket struct {
 	base *connector.Connector
 
 	subMu                 sync.RWMutex
-	pendingMu             sync.Mutex
+	pendingMu             sync.RWMutex
 	subscribedAssetIDs    map[string]struct{}
 	pendingSubscribeIDs   map[string]struct{}
 	pendingUnsubscribeIDs map[string]struct{}
@@ -597,10 +597,12 @@ func (pm *WSPolymarketMarket) handlePriceChange(f marketFrame, raw json.RawMessa
 
 	exchangeTS := utils.SafeParseTimestamp(ev.Timestamp)
 
-	pm.subMu.RLock()
+	// Judged per item through isSubscribed, not by raw membership of the live
+	// subscribed set: a frame of ours handled inside a reconnect window is still
+	// ours (see isSubscribed).
 	items := make([]connector.PriceChangeItem, 0, len(ev.PriceChanges))
 	for _, pc := range ev.PriceChanges {
-		if _, ok := pm.subscribedAssetIDs[pc.AssetID]; ok {
+		if pm.isSubscribed(pc.AssetID) {
 			items = append(items, connector.PriceChangeItem{
 				AssetID: pc.AssetID,
 				Price:   pc.Price,
@@ -612,7 +614,6 @@ func (pm *WSPolymarketMarket) handlePriceChange(f marketFrame, raw json.RawMessa
 			})
 		}
 	}
-	pm.subMu.RUnlock()
 
 	if len(items) == 0 {
 		return
@@ -739,11 +740,33 @@ func (pm *WSPolymarketMarket) handleMarketResolved(f marketFrame, raw json.RawMe
 // Helpers
 // ─────────────────────────────────────────────────────────────
 
+// isSubscribed reports whether a dispatched frame's asset is one this manager
+// intends to hold: it is subscribed now, OR it is awaiting re-subscribe (in
+// pendingSubscribeIDs) and not pending removal.
+//
+// The second clause matters across a reconnect. onDisconnect moves every
+// subscribed asset into pendingSubscribeIDs and empties subscribedAssetIDs, so
+// for the length of the disconnect window (until onConnect restores the set) a
+// plain membership test is false for an asset that is still ours. Frames are
+// judged at DISPATCH time, and the queue deliberately keeps frames read before
+// the drop (H3), so without this clause every queued frame that the dispatcher
+// handles inside that window was discarded with no event, no counter and no
+// hook — H4a measured 18/20/22 such frames per 60 s run.
+//
+// Lock order is subMu then pendingMu, as in onDisconnect and flushPending.
 func (pm *WSPolymarketMarket) isSubscribed(assetID string) bool {
 	pm.subMu.RLock()
 	defer pm.subMu.RUnlock()
-	_, ok := pm.subscribedAssetIDs[assetID]
-	return ok
+	if _, ok := pm.subscribedAssetIDs[assetID]; ok {
+		return true
+	}
+	pm.pendingMu.RLock()
+	defer pm.pendingMu.RUnlock()
+	if _, ok := pm.pendingSubscribeIDs[assetID]; !ok {
+		return false
+	}
+	_, removing := pm.pendingUnsubscribeIDs[assetID]
+	return !removing
 }
 
 func (pm *WSPolymarketMarket) clearSubscriptions() {

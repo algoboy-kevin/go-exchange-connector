@@ -506,12 +506,16 @@ func runMarketSoak(t *testing.T, rng *soakRNG, label string, reconnectOn bool, d
 	// reported rather than hidden:
 	//   queuedAtStop — frames still queued when Stop() cancels the dispatchers
 	//                  (this stream has no drain path);
-	//   noEvent      — frames dispatched while the subscription set was empty,
-	//                  i.e. queued frames of the dead generation processed
-	//                  between onDisconnect (which clears the set) and onConnect
-	//                  (which restores it). handlePriceChange/handleBook treat
-	//                  them as "for an asset I do not hold" and return without an
-	//                  event, without a counter.
+	//   noEvent      — frames the dispatcher handled without producing an event.
+	//
+	// H4c (D2): this scenario's venue writes frames for ONE asset, and that asset
+	// is subscribed for the whole run, so the allowance for no-event frames is
+	// ZERO — not even the frames handled inside a disconnect window (where
+	// subscribedAssetIDs is empty until onConnect restores it) may be dropped.
+	// Before this change that window silently swallowed 18-22 frames per 60 s
+	// run. The zero allowance replaces the old reconnects x (queue + 2) bound;
+	// the case of a genuinely filtered, never-subscribed asset is covered by
+	// TestMarketDeliversQueuedFramesAcrossDisconnect.
 	noEvent := int(st.FramesRead) - framesSeen - int(st.FramesDropped) - queuedAtStop
 	if noEvent < 0 {
 		t.Fatalf("%s: negative unexplained term (%d): frames were counted twice", label, noEvent)
@@ -519,16 +523,14 @@ func runMarketSoak(t *testing.T, rng *soakRNG, label string, reconnectOn bool, d
 	if got, want := int(st.FramesRead), framesSeen+int(st.FramesDropped)+queuedAtStop+noEvent; got != want {
 		t.Fatalf("%s: FramesRead %d != delivered %d + dropped %d + queued_at_stop %d + no_event %d", label, got, framesSeen, st.FramesDropped, queuedAtStop, noEvent)
 	}
+	if noEvent != 0 {
+		t.Fatalf("%s: %d frames of a subscribed asset produced no event (no counter, no hook): they were dropped at the asset gate", label, noEvent)
+	}
 	reconnects := len(accepts) - 1
 	if reconnects == 0 && noEvent != 0 {
 		t.Fatalf("%s: %d frames produced no event without a reconnect — a subscription was lost on a live connection", label, noEvent)
 	}
-	// A race can push one frame past the window boundary on each side, hence
-	// the queue depth plus a small margin per reconnect.
-	if noEvent > reconnects*10 {
-		t.Fatalf("%s: %d no-event frames exceed one queue's worth plus margin (%d) per reconnect (%d reconnects)", label, reconnects*10, 10, reconnects)
-	}
-	t.Logf("%s: no_event_frames=%d (dispatched while the subscription set was empty) queued_at_stop=%d", label, noEvent, queuedAtStop)
+	t.Logf("%s: no_event_frames=%d queued_at_stop=%d reconnects=%d", label, noEvent, queuedAtStop, reconnects)
 	if queueFull != int(st.FramesDropped) {
 		t.Fatalf("%s: drop hook queue_full %d != Stats.FramesDropped %d", label, queueFull, st.FramesDropped)
 	}

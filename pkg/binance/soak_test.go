@@ -138,13 +138,19 @@ const snapshotLookback = 3
 type soakDepthREST struct {
 	seq   atomic.Int64
 	calls atomic.Int64
-	url   string
-	srv   *httptest.Server
+	// lookback is how far behind the leading edge the fake snapshot sits. It
+	// starts at snapshotLookback (a venue snapshot that lags the stream) and is
+	// set to 0 for the convergence phase, where the stream must be able to
+	// continue contiguously from the snapshot.
+	lookback atomic.Int64
+	url      string
+	srv      *httptest.Server
 }
 
 func newSoakDepthREST(t *testing.T) *soakDepthREST {
 	t.Helper()
 	d := &soakDepthREST{}
+	d.lookback.Store(snapshotLookback)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		d.calls.Add(1)
 		// A real snapshot lags the leading edge of the stream by a few
@@ -152,7 +158,7 @@ func newSoakDepthREST(t *testing.T) *soakDepthREST {
 		// diff stale and the connector would re-seed on every one of them; a
 		// small lookback keeps the documented flow (snapshot at S, diffs S+1..
 		// applied) intact while still leaving a few frames to be coalesced.
-		s := d.seq.Load() - snapshotLookback
+		s := d.seq.Load() - d.lookback.Load()
 		if s < 0 {
 			s = 0
 		}
@@ -390,39 +396,41 @@ func TestSoakBinanceDepth(t *testing.T) {
 		prev = stats
 		time.Sleep(100 * time.Millisecond)
 	}
-	// The venue keeps streaming a little longer (paced) until the consumer's
-	// applied sequence reaches the leading edge: a diff dropped at the tail of
-	// the chaotic phase is only detected on the NEXT diff, so "the venue stops"
-	// has to mean "it stopped after the consumer caught up" — otherwise the
-	// stale-book residual H3 documents is what would be measured.
+	// Convergence after the chaos. Pre-H4c every gap frame re-seeded instantly,
+	// so the book tracked the leading edge while the venue kept publishing; the
+	// gate now allows ONE gap repair per minimum interval, and a venue that keeps
+	// publishing faster than this (deliberately slow) consumer re-gaps the book
+	// faster than the gate may heal it. So the phase is split in two:
+	//
+	//   1. repair: keep triggering with paced diffs until the gate admits a
+	//      re-seed (at most one minimum interval of waiting);
+	//   2. converge: stop publishing, let the queue drain, then send the tail one
+	//      diff at a time and require each to be delivered and applied — every
+	//      diff after a seed is contiguous with it, so the consumer's book must
+	//      reach the venue's final book.
+	//
 	// The reconnect backoff is exponential up to ReconnectMaxInterval (30 s
 	// default) and only resets after a connection that survives; a run with ten
 	// drops can legitimately be waiting most of half a minute for the next dial,
 	// during which no frame can be published at all. 45 s covers that cap.
 	recoverDeadline := time.Now().Add(45 * time.Second)
-	nextRecoverLog := time.Now().Add(5 * time.Second)
-	for {
+	appliedSeq := func() int64 {
 		mu.Lock()
-		applied := int64(-1)
+		defer mu.Unlock()
 		if n := len(events); n > 0 {
-			applied = events[n-1].LastUpdateID
+			return events[n-1].LastUpdateID
 		}
-		mu.Unlock()
-		muSeq.Lock()
-		leading := seq
-		muSeq.Unlock()
-		if applied == leading {
-			break
-		}
-		if time.Now().After(nextRecoverLog) {
-			nextRecoverLog = time.Now().Add(5 * time.Second)
-			stNow, _ := b.Stats(MarketPerp)
-			t.Logf("depth: recovery waiting: applied=%d published=%d conns=%d connID=%d (backoff)", applied, leading, v.numConns(), stNow.ConnID)
+		return -1
+	}
+	seedCalls := rest.calls.Load()
+	for {
+		if rest.calls.Load() > seedCalls {
+			break // a gap repair was admitted after the burst
 		}
 		if time.Now().After(recoverDeadline) {
 			stNow, _ := b.Stats(MarketPerp)
-			t.Fatalf("consumer's book never caught up: applied=%d leading=%d conns=%d connID=%d reads=%d dropped=%d rest=%d",
-				applied, leading, v.numConns(), stNow.ConnID, stNow.FramesRead, stNow.FramesDropped, rest.calls.Load())
+			t.Fatalf("no re-seed was admitted after the burst within 45s: applied=%d conns=%d connID=%d reads=%d dropped=%d rest=%d gate=%+v",
+				appliedSeq(), v.numConns(), stNow.ConnID, stNow.FramesRead, stNow.FramesDropped, rest.calls.Load(), b.DepthReseedStats())
 		}
 		gen := v.numConns() - 1
 		if gen < 0 {
@@ -442,7 +450,75 @@ func TestSoakBinanceDepth(t *testing.T) {
 		}
 		muSeq.Unlock()
 		publish(u)
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Drain: nothing new is published, so the consumer reaches the last frame it
+	// was sent (or the book is still unseeded and the gate needs another
+	// interval — the deadline allows for that).
+	drainDeadline := time.Now().Add(20 * time.Second)
+	for {
+		muSeq.Lock()
+		leading := seq
+		muSeq.Unlock()
+		if appliedSeq() == leading {
+			break
+		}
+		if time.Now().After(drainDeadline) {
+			stNow, _ := b.Stats(MarketPerp)
+			t.Logf("depth: drain stopped at applied=%d published=%d (queue=%d) — continuing with the paced tail",
+				appliedSeq(), leading, stNow.QueueLen)
+			break
+		}
 		time.Sleep(5 * time.Millisecond)
+	}
+	// From here on the venue's snapshot is the leading edge itself, so the diff
+	// stream can continue contiguously from whatever a seed returns.
+	rest.lookback.Store(0)
+
+	// Settle: a slow (100 ms) contiguous stream, which this consumer can absorb,
+	// until the applied sequence meets the leading edge. A dropped frame leaves
+	// one gap and the gate may defer its repair by up to the minimum interval
+	// (1 s default), so the loop allows 30 s — the claim is that the book
+	// converges once the flood stops, not that it converges frame for frame.
+	convergeDeadline := time.Now().Add(30 * time.Second)
+	nextConvergeLog := time.Now().Add(5 * time.Second)
+	for {
+		muSeq.Lock()
+		leading := seq
+		muSeq.Unlock()
+		if appliedSeq() == leading {
+			break
+		}
+		if time.Now().After(convergeDeadline) {
+			stNow, _ := b.Stats(MarketPerp)
+			t.Fatalf("consumer's book never caught up: applied=%d leading=%d conns=%d connID=%d reads=%d dropped=%d queue=%d rest=%d gate=%+v",
+				appliedSeq(), leading, v.numConns(), stNow.ConnID, stNow.FramesRead, stNow.FramesDropped, stNow.QueueLen, rest.calls.Load(), b.DepthReseedStats())
+		}
+		if time.Now().After(nextConvergeLog) {
+			nextConvergeLog = time.Now().Add(5 * time.Second)
+			stNow, _ := b.Stats(MarketPerp)
+			t.Logf("depth: converging: applied=%d published=%d conns=%d connID=%d queue=%d gate=%+v",
+				appliedSeq(), leading, v.numConns(), stNow.ConnID, stNow.QueueLen, b.DepthReseedStats())
+		}
+		gen := v.numConns() - 1
+		if gen < 0 {
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		muSeq.Lock()
+		u := seq + 1
+		muSeq.Unlock()
+		if !soakWrite(gen, depthDiff(u)) {
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		muSeq.Lock()
+		if u > seq {
+			seq = u
+		}
+		muSeq.Unlock()
+		publish(u)
+		time.Sleep(100 * time.Millisecond)
 	}
 	muSeq.Lock()
 	finalSeq := seq
@@ -452,6 +528,9 @@ func TestSoakBinanceDepth(t *testing.T) {
 	if !okStats {
 		t.Fatalf("Stats(MarketPerp) reported no connection")
 	}
+	// The re-seed gate's ledger, read before Stop so it describes the run: every
+	// gap-triggered re-seed the stream asked for and how it was resolved.
+	rs := b.DepthReseedStats()
 	stopStart := time.Now()
 	b.Stop()
 	stopTook := time.Since(stopStart)
@@ -529,8 +608,8 @@ func TestSoakBinanceDepth(t *testing.T) {
 
 	venueBook := &soakBook{bids: map[string]string{"1.0": strconv.FormatInt(finalSeq, 10), "0.5": "7"}, asks: map[string]string{"2.0": "3"}}
 
-	t.Logf("depth: dur=%v reads=%d delivered=%d seeds=%d reseeds=%d dropped=%d drained=%d no_event=%d gaps=%d rest_calls=%d disconnects=%d connID=%d accepts=%d drops=%d close=%v",
-		dur, read, delivered, seeds, reseeds, st.FramesDropped, st.FramesDrained, noEvent, gaps, rest.calls.Load(), st.Disconnects, st.ConnID, v.numConns(), injectedDrops, stopTook)
+	t.Logf("depth: dur=%v reads=%d delivered=%d seeds=%d reseeds=%d dropped=%d drained=%d no_event=%d gaps=%d rest_calls=%d disconnects=%d connID=%d accepts=%d drops=%d gate=%+v close=%v",
+		dur, read, delivered, seeds, reseeds, st.FramesDropped, st.FramesDrained, noEvent, gaps, rest.calls.Load(), st.Disconnects, st.ConnID, v.numConns(), injectedDrops, rs, stopTook)
 	t.Logf("depth: final venue book %s / consumer book %s", venueBook, gotBook)
 
 	// ── assertions ──
@@ -562,15 +641,44 @@ func TestSoakBinanceDepth(t *testing.T) {
 	if gaps != int(st.FramesDropped)+int(st.FramesDrained)+noEvent {
 		t.Fatalf("FrameID gaps %d != dropped %d + drained %d + no_event %d", gaps, st.FramesDropped, st.FramesDrained, noEvent)
 	}
-	// Each re-seed consumes at least its trigger frame and at most the trigger
-	// plus the frames the lagging snapshot coalesced (snapshotLookback of them);
-	// the +4 absorbs the boundary at the start/end of the run.
-	if noEvent > (snapshotLookback+1)*reseeds+4 {
-		t.Fatalf("no_event frames %d exceed the bound implied by %d re-seeds at lookback %d (%d)",
-			noEvent, reseeds, snapshotLookback, (snapshotLookback+1)*reseeds+4)
+	// H4c: the no-event frames are triggers plus stale skips, not re-seeds.
+	// Every frame that found the book unseeded or gapped is a trigger and
+	// produces no event, whether the gate spawned its fetch or deferred it; the
+	// only other no-event source is a diff the fresh snapshot had already
+	// overtaken (at most snapshotLookback per seed); the +4 absorbs the boundary
+	// at the start/end of the run. The gate's ledger is the authority here, so
+	// the identity is asserted against it.
+	if noEvent < int(rs.Triggers) {
+		t.Fatalf("no_event frames %d < %d gate triggers: a trigger frame must produce no event", noEvent, rs.Triggers)
 	}
-	if noEvent < reseeds {
-		t.Fatalf("no_event frames %d < %d re-seeds: a re-seed must have consumed at least its trigger frame", noEvent, reseeds)
+	if staleBound := int(rs.Triggers) + (snapshotLookback+1)*seeds + 4; noEvent > staleBound {
+		t.Fatalf("no_event frames %d exceed triggers %d + stale skips (%d seeds at lookback %d) + 4 = %d",
+			noEvent, rs.Triggers, seeds, snapshotLookback, staleBound)
+	}
+	// The gate's own ledger must balance, and every admitted fetch must be a
+	// REST call that actually happened (the initial per-connect seeding is not
+	// in the ledger, so it is added back from the number of accepts).
+	if rs.Triggers != rs.Fetched+rs.Coalesced+rs.Deferred {
+		t.Fatalf("gate ledger does not balance: %+v", rs)
+	}
+	// H4c D1: the REST call rate is bounded by the OPTIONS, not by the frame
+	// rate. Calls are: one initial seed per accept (ungated) + one per admitted
+	// gap-triggered re-seed, which the shared budget caps at DepthReseedPerMin
+	// per minute of run.
+	perMin := b.opts.DepthReseedPerMin
+	minInterval := b.opts.DepthReseedMinInterval
+	calls := rest.calls.Load()
+	if ident := int64(v.numConns()) + int64(rs.Fetched); calls > ident+2 {
+		t.Fatalf("%d REST calls but only %d accepts + %d admitted re-seeds (+2 slack): the gate did not account for every fetch",
+			calls, v.numConns(), rs.Fetched)
+	}
+	budgetBound := int64(v.numConns()) + int64(perMin)*(int64(dur/time.Minute)+1) + 2
+	if calls > budgetBound {
+		t.Fatalf("%d REST snapshots in %v exceed the options' bound %d (accepts %d + %d/min for %v)",
+			calls, dur, budgetBound, v.numConns(), perMin, dur)
+	}
+	if rs.Fetched > 0 && minInterval <= 0 {
+		t.Fatalf("gate counted %d gap-triggered re-seeds with a zero minimum interval: options were not resolved", rs.Fetched)
 	}
 	// Final convergence: the consumer's book equals the venue's final book.
 	if !gotBook.equal(venueBook) {

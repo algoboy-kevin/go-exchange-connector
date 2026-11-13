@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -73,6 +74,21 @@ type Options struct {
 	// Use it to tag one instance, e.g.
 	// opts.Logger = slog.Default().With("venue", "binance", "role", "market").
 	Logger *slog.Logger
+
+	// DepthReseedMinInterval is the floor between two GAP-TRIGGERED depth
+	// re-seeds of the same symbol (a diff whose FirstUpdateID skips past the
+	// local book, or a diff for a book that is not seeded yet). Zero selects
+	// 1 s. It does not apply to the per-connect initial seeding, which still
+	// runs once per subscribed symbol per connection.
+	DepthReseedMinInterval time.Duration
+	// DepthReseedPerMin caps gap-triggered depth re-seeds per minute, shared by
+	// ALL symbols and both market types of this manager (not per symbol). Zero
+	// selects 300. Set it to floor(IP weight budget / weight of one depth
+	// request): a spot or USDⓈ-M depth?limit=50 snapshot costs weight 2, so 300
+	// spends 600 of the 2,400/min IP budget and leaves headroom for the rest of
+	// the process's REST traffic on that IP. Several managers on one IP share
+	// that budget between them; each instance enforces only its own share.
+	DepthReseedPerMin int
 }
 
 // resolved fills in the production defaults for any empty field.
@@ -88,6 +104,12 @@ func (o Options) resolved() Options {
 	}
 	if o.EventQueueSize <= 0 {
 		o.EventQueueSize = defaultEventQueueSize
+	}
+	if o.DepthReseedMinInterval <= 0 {
+		o.DepthReseedMinInterval = defaultDepthReseedMinInterval
+	}
+	if o.DepthReseedPerMin <= 0 {
+		o.DepthReseedPerMin = defaultDepthReseedPerMin
 	}
 	return o
 }
@@ -171,6 +193,11 @@ type WSBinance struct {
 	// ConnID names exactly one connection instance across the whole manager —
 	// the two perp stream classes never share a generation number.
 	connSeq atomic.Uint64
+
+	// reseed gates GAP-TRIGGERED depth re-seeds (single-flight per book, a
+	// per-symbol minimum interval, a shared per-minute budget, a 429/418 pause);
+	// see reseed.go. The per-connect initial seeding does not go through it.
+	reseed *depthReseedGate
 }
 
 // binanceConn is one class's WebSocket connection plus its local stream
@@ -236,11 +263,12 @@ func New(base *connector.Connector) *WSBinance {
 // Options{}) is exactly New(base).
 func NewWithOptions(base *connector.Connector, opts Options) *WSBinance {
 	b := &WSBinance{
-		base:  base,
-		http:  &http.Client{Timeout: 10 * time.Second},
-		opts:  opts.resolved(),
-		conns: make(map[MarketType]map[streamClass]*binanceConn, 2),
-		books: make(map[MarketType]map[string]*binanceBook, 2),
+		base:   base,
+		http:   &http.Client{Timeout: 10 * time.Second},
+		opts:   opts.resolved(),
+		conns:  make(map[MarketType]map[streamClass]*binanceConn, 2),
+		books:  make(map[MarketType]map[string]*binanceBook, 2),
+		reseed: newDepthReseedGate(opts.DepthReseedMinInterval, opts.DepthReseedPerMin),
 	}
 	b.conns[MarketSpot] = map[streamClass]*binanceConn{
 		classSpot: newBinanceConn(b, MarketSpot, classSpot),
@@ -1150,9 +1178,9 @@ func (b *WSBinance) handleDepth(c *binanceConn, f binanceFrame) {
 	bk.mu.Lock()
 
 	if !bk.snapshotted {
-		// Book not seeded yet — trigger a snapshot and drop this diff.
+		// Book not seeded yet — trigger a (gated) snapshot and drop this diff.
 		bk.mu.Unlock()
-		go b.snapshotDepthBook(b.rootCx, c.mkt, symbol)
+		b.triggerDepthReseed(c.mkt, symbol)
 		return
 	}
 
@@ -1162,10 +1190,12 @@ func (b *WSBinance) handleDepth(c *binanceConn, f binanceFrame) {
 		return
 	}
 	if upd.FirstUpdateID > bk.lastUpdateID+1 {
-		// Gap detected — re-seed the book from a fresh snapshot.
+		// Gap detected — re-seed the book from a fresh snapshot, through the
+		// gate: one fetch in flight per book, one per minimum interval per
+		// symbol, a shared per-minute budget, and a pause after a 429/418.
 		bk.snapshotted = false
 		bk.mu.Unlock()
-		go b.snapshotDepthBook(b.rootCx, c.mkt, symbol)
+		b.triggerDepthReseed(c.mkt, symbol)
 		return
 	}
 
@@ -1277,8 +1307,49 @@ type binanceDepthSnapshot struct {
 	Asks         [][]string `json:"asks"`
 }
 
+// triggerDepthReseed asks the gate for permission to re-seed one book and
+// spawns the fetch only if it is granted. Refused triggers are counted by the
+// gate (coalesced behind an in-flight fetch, or deferred by the interval /
+// budget / pause) and change nothing else: the book stays unseeded and its
+// diffs are dropped exactly as before, so the next diff after the gate allows
+// one triggers the fetch.
+//
+// A failed fetch is not retried here: the gate's minimum interval holds the next
+// attempt until a later diff, which keeps a venue outage from becoming a retry
+// loop. A 429/418 pauses every gap-triggered re-seed for its Retry-After.
+func (b *WSBinance) triggerDepthReseed(mkt MarketType, symbol string) {
+	key := depthReseedKey{mkt: mkt, symbol: symbol}
+	if !b.reseed.admit(key) {
+		return
+	}
+	go func() {
+		err := b.snapshotDepthBook(b.rootCx, mkt, symbol)
+		var pause time.Duration
+		var httpErr *depthSnapshotHTTPError
+		if errors.As(err, &httpErr) {
+			pause = httpErr.RetryAfter
+		}
+		if err != nil {
+			b.log().Warn("binance: depth re-seed failed", "market", mkt, "symbol", symbol, "err", err)
+		}
+		if b.reseed.finish(key, err != nil, pause) {
+			b.log().Warn("binance: pausing depth re-seeds after a rate-limit response",
+				"market", mkt, "symbol", symbol, "retry_after", pause)
+		}
+	}()
+}
+
+// DepthReseedStats reports the gap-triggered depth re-seed gate's ledger: how
+// many triggers it saw and how each was resolved. Triggers always equals
+// Fetched+Coalesced+Deferred. The per-connect initial seeding is not counted.
+func (b *WSBinance) DepthReseedStats() DepthReseedStats {
+	return b.reseed.stats()
+}
+
 // snapshotDepthBooks seeds a fresh order book for every subscribed depth
-// symbol on a market. Used on (re)connect.
+// symbol on a market. Used on (re)connect; it does NOT pass through the reseed
+// gate — the gate bounds gap-triggered repairs only, so a connect still seeds
+// every subscribed symbol exactly once.
 func (b *WSBinance) snapshotDepthBooks(ctx context.Context, mkt MarketType) error {
 	var symbols []string
 	class := classSpot
@@ -1336,7 +1407,12 @@ func (b *WSBinance) snapshotDepthBook(ctx context.Context, mkt MarketType, symbo
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("binance %s depth snapshot %s: status %d", mkt, symbol, resp.StatusCode)
+		return &depthSnapshotHTTPError{
+			Market:     mkt,
+			Symbol:     symbol,
+			Status:     resp.StatusCode,
+			RetryAfter: retryAfterPause(resp.StatusCode, resp.Header),
+		}
 	}
 	var snap binanceDepthSnapshot
 	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
