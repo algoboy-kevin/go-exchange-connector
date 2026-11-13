@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"strings"
 
-	hlinfo "github.com/algoboy-kevin/go-exchange-connector/pkg/hyperliquid"
 	hl "github.com/algoboy-kevin/go-exchange-connector/internal/hlsdk"
+	hlinfo "github.com/algoboy-kevin/go-exchange-connector/pkg/hyperliquid"
 )
 
 // ActionError is a business rejection returned by the venue in a TOP-LEVEL

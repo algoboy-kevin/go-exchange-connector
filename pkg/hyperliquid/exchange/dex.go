@@ -12,8 +12,8 @@ import (
 	"strings"
 	"unicode"
 
-	hlinfo "github.com/algoboy-kevin/go-exchange-connector/pkg/hyperliquid"
 	hl "github.com/algoboy-kevin/go-exchange-connector/internal/hlsdk"
+	hlinfo "github.com/algoboy-kevin/go-exchange-connector/pkg/hyperliquid"
 )
 
 // ScopeError is a local routing/metadata failure. No action has been submitted.

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ethereum/go-ethereum/crypto"
 	hl "github.com/algoboy-kevin/go-exchange-connector/internal/hlsdk"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // ErrNotMaster is returned when the signing key does not control the account.

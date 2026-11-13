@@ -32,8 +32,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/crypto"
 	hl "github.com/algoboy-kevin/go-exchange-connector/internal/hlsdk"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 const (

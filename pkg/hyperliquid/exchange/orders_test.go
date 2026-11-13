@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethereum/go-ethereum/crypto"
 	hl "github.com/algoboy-kevin/go-exchange-connector/internal/hlsdk"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // placeResponse builds an /exchange order envelope with the given statuses.
