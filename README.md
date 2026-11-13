@@ -42,7 +42,7 @@ go-exchange-connector/
 | `docs/CONNECTOR_CHANGES.md` | Changes the go-collector needs from this connector |
 | `docs/PERP_COLLECTOR_SPEC.md` | Perp collector spec (open questions in §8) |
 | `docs/authentication.md`, `docs/ctf.md`, `docs/migrating.md` | Auth, CTF and migration notes |
-| CHANGELOG.md | Release notes; 0.10.0 hardening (unreleased) |
+| CHANGELOG.md | Release notes; 0.10.0 hardening |
 
 ## Verification
 

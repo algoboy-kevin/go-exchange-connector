@@ -1,9 +1,8 @@
 # Changelog
 
-All notable changes to this module. Format follows Keep a Changelog. Unreleased and untagged; no
-entry claims a date.
+All notable changes to this module. Format follows Keep a Changelog.
 
-## [0.10.0] — unreleased (branch feat/hardening)
+## [0.10.0] — 2026-11-13
 
 Baseline v0.9.0. `connector.Version` = `0.10.0`. Additive API: 174 new exported symbols, 0
 removed. One signature change: `hyperliquid.NewInfoClient` now takes
