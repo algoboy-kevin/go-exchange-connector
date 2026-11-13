@@ -2,6 +2,24 @@
 
 All notable changes to this module. Format follows Keep a Changelog.
 
+## [0.11.0] — 2026-11-13
+
+### Added
+
+- Hyperliquid: optional `Options.OnMarketFrameDecoded` with `FrameDecodeTiming`
+  and `DecodeOutcome`. Reports one observation per processed l2Book, trades, bbo,
+  or activeAssetCtx frame, plus malformed-envelope failures; never per trade print.
+- Original frame identity and receive time are preserved. The elapsed interval
+  starts before envelope decoding and ends after payload decoding, excluding queue
+  waiting and typed subscriber work. activeAssetCtx retains its intervening
+  subscription lookup; an early exit reports `DecodeSkipped`, not success.
+- Nil by default: no added clock samples, no queued-frame storage growth, and
+  existing event delivery is unchanged. The callback runs synchronously on the
+  decode path and must remain cheap, non-blocking and I/O-free.
+
+No dependency changes. Verification is offline with fake frames and loopback
+servers; this release does not claim live-venue latency or a production SLO.
+
 ## [0.10.0] — 2026-11-13
 
 Baseline v0.9.0. `connector.Version` = `0.10.0`. Additive API: 174 new exported symbols, 0
