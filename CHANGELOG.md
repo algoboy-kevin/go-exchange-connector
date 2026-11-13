@@ -63,7 +63,7 @@ the frame. The connection fails and reconnects, and a `HyperliquidGapEvent` (fie
 `HyperliquidGapQueueOverflow`, `HyperliquidGapDisconnect`) is delivered before any frame of the
 new generation. Market-only connections are unchanged: drops are counted, no gap event.
 Also `TimestampSynthesized`, `Trade` `BatchIndex`/`BatchLen`, `SubscribeMany` + `SubscribeReport` +
-`SubscriptionAck` + `SetOnSubscriptionAck` + `Options.SubscribePaceMs`.
+`SubscriptionAck` + `SetOnSubscriptionAck` + `Options.SubscribePaceMs`. Gates: `Options.DialGate`, `Options.SendGate`, `Options.NoReconnect` (same contract as `WSOptions`); `SendGate` sees every frame this manager writes.
 
 **binance** — gap-triggered depth re-seeds are gated: one re-seed in flight per book,
 `Options.DepthReseedMinInterval` (default 1s per symbol) and `Options.DepthReseedPerMin` (default
@@ -103,7 +103,7 @@ Behavior differs from v0.9.0, API-compatible. By design:
 ### Known limits
 
 - Polymarket market `Stop()` discards queued frames uncounted.
-- `WSOptions.SendGate` does not cover writes made directly on `Conn()` by the venue packages.
+- `SendGate` covers the websocket package's frames and every Hyperliquid frame; the Binance and Polymarket packages write directly on `Conn()` and are not covered.
 - `snapshotDepthBook` holds the book mutex across its REST GET; the dispatcher is blocked during a
   fetch.
 - User streams still apply inline backpressure: no queue, no counters.

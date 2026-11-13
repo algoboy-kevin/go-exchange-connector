@@ -50,6 +50,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -160,9 +161,14 @@ type Options struct {
 	// "do not dial now": Start returns it wrapped, and the reconnect loop treats it as a failed
 	// attempt (backoff escalates). Same contract as websocket.WSOptions.DialGate.
 	DialGate func(ctx context.Context) error `json:"-"`
-	// SendGate, if non-nil, is consulted before outbound frames; n is the payload size in bytes.
-	// Today it already covers the websocket layer's own pings; card H6b extends it to every frame
-	// this manager writes. Same contract as websocket.WSOptions.SendGate.
+	// SendGate, if non-nil, is consulted before EVERY frame this manager writes: subscribe,
+	// unsubscribe, the reconnect replay and the application ping (the websocket layer's own control
+	// pings too, with n = 0); n is the payload size in bytes. It may block (a rate limiter's Take)
+	// and must respect ctx. An error means "do not write now": a refused subscribe or replay write
+	// FAILS the connection so the reconnect replays the whole registry (a subscription is never
+	// silently dropped because of a gate); a refused application ping skips that tick; a refused
+	// unsubscribe is logged and not retried. With a blocking gate set SubscribePaceMs > 0 so the
+	// replay runs off the connect hook.
 	SendGate func(ctx context.Context, n int) error `json:"-"`
 	// NoReconnect disables the connector's own redial: after a drop the status stays
 	// disconnected and the supervisor owns the redial. Same as websocket.WSOptions.NoReconnect.
@@ -789,6 +795,11 @@ func (c *hlConn) writeSub(ctx context.Context, sub Subscription, unsubscribe boo
 	case err != nil:
 		c.log().Warn("hyperliquid: write subscription frame",
 			"subscription", sub.Key(), "unsubscribe", false, "err", err)
+		if failedByGate(err) {
+			// a refused live write leaves this subscription unsent: fail the connection so the
+			// reconnect replay carries it (never silently dropped because of a gate)
+			c.Disconnect()
+		}
 	case out == sendDeferred:
 		c.log().Debug("hyperliquid: subscription deferred (not connected)",
 			"subscription", sub.Key(), "unsubscribe", false)
@@ -817,7 +828,7 @@ func (c *hlConn) writeUnsubscribe(ctx context.Context, sub Subscription) {
 		c.log().Warn("hyperliquid: build subscription frame", "subscription", sub.Key(), "err", err)
 		return
 	}
-	if err := st.conn.Write(ctx, coderws.MessageText, data); err != nil {
+	if err := c.writeFrame(ctx, st.conn, data); err != nil {
 		c.log().Warn("hyperliquid: write subscription frame",
 			"subscription", sub.Key(), "unsubscribe", true, "err", err)
 		return
@@ -857,7 +868,7 @@ func (c *hlConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 				c.dropConnState(st)
 				return fmt.Errorf("hyperliquid: build subscribe frame for %s: %w", sub.Key(), err)
 			}
-			if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
+			if err := c.writeFrame(ctx, conn, data); err != nil {
 				c.dropConnState(st)
 				return fmt.Errorf("hyperliquid: subscribe %s: %w", sub.Key(), err)
 			}
@@ -1049,7 +1060,15 @@ func (c *hlConn) startPing(ctx context.Context, conn *coderws.Conn) {
 			case <-pingCtx.Done():
 				return
 			case <-ticker.C:
-				if err := conn.Write(pingCtx, coderws.MessageText, PingFrame()); err != nil {
+				err := c.writeFrame(pingCtx, conn, PingFrame())
+				if failedByGate(err) {
+					if pingCtx.Err() != nil {
+						return
+					}
+					c.log().Debug("hyperliquid: ping skipped by send gate", "err", err)
+					continue
+				}
+				if err != nil {
 					c.log().Warn("hyperliquid: ping write failed", "err", err)
 					// Only drop the connection if this is still the current
 					// one — a stale ticker must not kill a healthy reconnect.
@@ -1070,6 +1089,40 @@ func (c *hlConn) stopPing() {
 	c.pingMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+}
+
+// sendGateError marks an error that came from Options.SendGate. It wraps the gate's own error,
+// so errors.Is on the caller's sentinel still works.
+type sendGateError struct{ err error }
+
+func (e *sendGateError) Error() string { return "hyperliquid: send gate: " + e.err.Error() }
+func (e *sendGateError) Unwrap() error { return e.err }
+
+// failedByGate reports whether err was produced by Options.SendGate.
+func failedByGate(err error) bool {
+	var ge *sendGateError
+	return errors.As(err, &ge)
+}
+
+// writeFrame is the one place this manager writes a data frame: it consults Options.SendGate
+// (which may block) before the frame leaves. A refusal is returned as a *sendGateError and
+// nothing is written.
+func (c *hlConn) writeFrame(ctx context.Context, conn *coderws.Conn, data []byte) error {
+	if gate := c.owner.opts.SendGate; gate != nil {
+		if err := gate(ctx, len(data)); err != nil {
+			return &sendGateError{err: err}
+		}
+	}
+	return conn.Write(ctx, coderws.MessageText, data)
+}
+
+// failConnection drops st's socket if st is still the current connection, so the connector
+// reconnects and replays the whole registry. Used when a gate refusal left part of the registry
+// unsent: that is not a dying connection, and without this the rest would silently never be sent.
+func (c *hlConn) failConnection(st *connState) {
+	if c.Conn() == st.conn {
+		c.Disconnect()
 	}
 }
 

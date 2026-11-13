@@ -415,9 +415,8 @@ supervisor. `WSOptions.DialGate` is consulted before every dial attempt (initial
 must respect its context, and an error counts as a failed dial, so the backoff escalates and a
 persistent refusal cannot spin into a tight loop. `WSOptions.SendGate` is consulted once per outbound
 frame written by the websocket package (pings, `SendText`, `SendJSON`); `n` is the payload size in
-bytes (0 for control frames), so a message-count budget counts calls. A gate error skips that frame
-only: it never closes the connection. Writes the venue packages make directly on `Conn()` (their own
-subscribe, replay and ping code) are not covered by `SendGate`.
+bytes (0 for control frames), so a message-count budget counts calls. In the websocket package a gate error skips that frame
+only and never closes the connection. Hyperliquid exposes the same gates as `Options.DialGate`, `Options.SendGate` and `Options.NoReconnect` and routes EVERY frame it writes (subscribe, unsubscribe, reconnect replay, application ping) through `SendGate`: a gate error on a subscribe or replay write fails the connection so the next connect replays the whole registry (a subscription is never silently dropped), a gate error on an application ping skips that tick, and with a blocking gate set `SubscribePaceMs` > 0 so the replay runs off the connect hook. Binance and Polymarket write directly on `Conn()`; their own subscribe, replay and ping writes are not covered by `SendGate`.
 
 ### Binance depth re-seed budget
 
@@ -466,7 +465,7 @@ Native fuzz targets: `FuzzProcessFrame` (hyperliquid), `FuzzProcessMessage` (bin
 ### Known limits
 
 - Polymarket market `Stop()` discards queued frames uncounted.
-- `WSOptions.SendGate` does not cover writes made directly on `Conn()` by the venue packages.
+- `SendGate` covers the websocket package's frames and every Hyperliquid frame; the Binance and Polymarket packages write directly on `Conn()` and are not covered.
 - `snapshotDepthBook` holds the book mutex across its REST GET; the dispatcher is blocked during a
   fetch.
 - User streams still apply inline backpressure: no queue, no counters.

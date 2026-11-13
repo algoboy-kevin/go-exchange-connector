@@ -404,7 +404,7 @@ func (c *hlConn) sendSubscribe(ctx context.Context, want *connState, sub Subscri
 	}
 	c.mu.Unlock()
 
-	err = st.conn.Write(ctx, coderws.MessageText, data)
+	err = c.writeFrame(ctx, st.conn, data)
 	if gap > 0 {
 		c.sm.lastSend = time.Now()
 	}
@@ -436,6 +436,10 @@ func (c *hlConn) replay(st *connState, subs []Subscription) {
 			if st.ctx.Err() == nil {
 				c.log().Warn("hyperliquid: replay write failed, stopping replay",
 					"conn_id", st.id, "subscription", sub.Key(), "err", err)
+				if failedByGate(err) {
+					// not a dying connection: fail it so the next connect replays the whole registry
+					c.failConnection(st)
+				}
 			}
 			return
 		}

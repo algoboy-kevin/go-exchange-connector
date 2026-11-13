@@ -20,8 +20,12 @@ func newGatedHL(t *testing.T, url string, o Options) *WSHyperliquid {
 	t.Helper()
 	o.URL = url
 	o.ReconnectIntervalMs = 20
-	o.AppPingIntervalMs = -1
-	o.WSPingIntervalMs = -1
+	if o.AppPingIntervalMs == 0 {
+		o.AppPingIntervalMs = -1
+	}
+	if o.WSPingIntervalMs == 0 {
+		o.WSPingIntervalMs = -1
+	}
 	h := NewWithOptions(connector.New(false, nil), o)
 	t.Cleanup(h.Stop)
 	return h
