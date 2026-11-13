@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"channel\":\"subscriptionResponse\",\"data\":{\"method\":\"subscribe\",\"subscription\":{\"type\":\"l2Book\",\"coin\":\"BTC\"}}}")

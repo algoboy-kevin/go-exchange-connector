@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"channel\":\"userFills\",\"data\":{\"user\":\"0x8ba1f109551bd432803012645ac136ddd64dba72\",\"fills\":[{\"coin\":\"BTC\",\"px\":\"1\",\"sz\":\"1\",\"side\":\"B\",\"dir\":\"Open Long\",\"closedPnl\":\"0\",\"fee\":\"0\",\"startPosition\":\"0\",\"time\":1,\"oid\":1,\"tid\":1}]}}")

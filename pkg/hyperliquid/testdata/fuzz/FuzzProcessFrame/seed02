@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"channel\":\"bbo\",\"data\":{\"coin\":\"BTC\",\"time\":1,\"bbo\":[{\"px\":\"1\",\"sz\":\"1\",\"n\":1},null]}}")

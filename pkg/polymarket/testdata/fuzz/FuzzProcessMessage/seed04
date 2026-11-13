@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"event_type\":\"tick_size_change\",\"asset_id\":\"asset-a\",\"market\":\"m1\",\"old_tick_size\":\"0.01\",\"new_tick_size\":\"0.001\",\"timestamp\":\"1700000000000\"}")

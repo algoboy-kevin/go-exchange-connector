@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"id\":2,\"error\":{\"code\":-1121,\"msg\":\"Invalid symbol.\"}}")

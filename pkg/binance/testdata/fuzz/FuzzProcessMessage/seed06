@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"e\":\"depthUpdate\",\"s\":\"BTCUSDT\",\"U\":9,\"u\":9,\"b\":[[\"1.0\",\"9\"]],\"a\":[]}")

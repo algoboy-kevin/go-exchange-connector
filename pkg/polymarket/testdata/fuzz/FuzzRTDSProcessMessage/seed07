@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"topic\":\"equity_prices\",\"type\":\"update\",\"timestamp\":1700000000000,\"payload\":{\"symbol\":\"aapl\",\"timestamp\":1700000000000,\"value\":190.5}}")

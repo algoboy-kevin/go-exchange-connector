@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"channel\":\"activeAssetCtx\",\"data\":{\"coin\":\"BTC\",\"ctx\":{\"funding\":\"0.00001\",\"oraclePx\":\"1\",\"openInterest\":\"1\"}}}")

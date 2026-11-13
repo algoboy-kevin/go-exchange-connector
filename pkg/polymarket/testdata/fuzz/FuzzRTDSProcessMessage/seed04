@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"topic\":\"crypto_prices_chainlink\",\"type\":\"subscribe\",\"timestamp\":1700000000000,\"payload\":{\"symbol\":\"btc/usd\",\"timestamp\":1700000000000,\"value\":1.5}}")

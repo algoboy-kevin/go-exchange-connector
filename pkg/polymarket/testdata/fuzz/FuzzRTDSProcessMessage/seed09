@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"topic\":\"unknown_topic\",\"type\":\"update\",\"payload\":{\"symbol\":\"btcusdt\"}}")

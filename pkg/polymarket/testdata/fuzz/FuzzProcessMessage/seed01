@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("[{\"event_type\":\"book\",\"asset_id\":\"asset-a\",\"market\":\"m1\",\"bids\":[],\"asks\":[],\"timestamp\":\"1700000000000\",\"hash\":\"h2\"}]")

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"topic\":\"crypto_prices\",\"type\":\"update\",\"payload\":null}")
