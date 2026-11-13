@@ -14,6 +14,7 @@ import (
 	"time"
 
 	connector "github.com/algoboy-kevin/go-exchange-connector"
+	"github.com/algoboy-kevin/go-exchange-connector/internal/framestat"
 	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
 	coderws "github.com/coder/websocket"
 )
@@ -37,6 +38,10 @@ const (
 
 	rtdsActionSubscribe   = "subscribe"
 	rtdsActionUnsubscribe = "unsubscribe"
+
+	// defaultRTDSEventQueueSize is the depth of the RTDS decoded-frame queue
+	// (read loop -> dispatcher workers) when SetEventQueueSize is unused.
+	defaultRTDSEventQueueSize = 8192
 )
 
 // WSPolymarketRTDS manages a WebSocket connection to Polymarket's RTDS
@@ -60,13 +65,25 @@ type WSPolymarketRTDS struct {
 	subsMu sync.RWMutex
 	subs   map[string]*rtdsTopicState // key = topic
 
-	eventCh          chan []byte
+	eventCh          chan rtdsFrame
 	dispatcherCancel context.CancelFunc
+
+	// fa is the frame accounting: FrameID source, exact read/drop counters
+	// (this stream never drains, so FramesDrained stays 0), queue depth/high-
+	// water, connection generation, drop hook.
+	fa framestat.Accounting
 
 	// dispatcherWorkers is how many eventDispatcher goroutines drain eventCh.
 	// Multiple readers on the same channel are safe; each message is handled
 	// by exactly one worker. Default 4 — a single worker can be starved of
 	// CPU under load and silently fall behind.
+	//
+	// ORDERING: because the workers race for frames, delivery order is NOT
+	// FrameID order when dispatcherWorkers > 1. Two frames dequeued in ID
+	// order can finish decoding in the opposite order, so a consumer must not
+	// assume a CryptoPriceEvent with a higher FrameID arrived later — use the
+	// event's own (venue) Timestamp to order prices, and FrameID only to detect
+	// loss and to spot the reordering itself. The default is unchanged (4).
 	dispatcherWorkers int
 	connectAttempts   atomic.Int64
 
@@ -119,10 +136,11 @@ func NewWSPolymarketRTDS(base *connector.Connector) *WSPolymarketRTDS {
 		BaseWebSocket:     &ws.BaseWebSocket{},
 		base:              base,
 		subs:              make(map[string]*rtdsTopicState),
-		eventCh:           make(chan []byte, 8192),
+		eventCh:           make(chan rtdsFrame, defaultRTDSEventQueueSize),
 		dispatcherWorkers: 4,
 		readLimit:         defaultReadLimitBytes,
 	}
+	r.fa.SetQueueCap(defaultRTDSEventQueueSize)
 
 	r.ShouldConnect = func() bool {
 		r.subsMu.RLock()
@@ -159,6 +177,47 @@ func (r *WSPolymarketRTDS) SetOnStatusChange(fn func(ws.ConnectionStatus)) {
 // Start.
 func (r *WSPolymarketRTDS) SetOnDisconnect(fn func(err error)) {
 	r.onDisconnectHook = fn
+}
+
+// rtdsFrame is a raw venue frame plus its provenance, stamped on the read loop
+// before the queue so a frame that is later dropped still consumed a FrameID
+// and a read.
+type rtdsFrame struct {
+	data   []byte
+	id     uint64    // FrameID (never reset across reconnects)
+	connID uint64    // connection generation the frame arrived on
+	rx     time.Time // read time; reported as DroppedFrame.At
+}
+
+// SetEventQueueSize sets the depth of the RTDS decoded-frame queue. Zero or
+// negative restores the default 8192. Call it before Start: the dispatcher
+// workers are started by Start and would otherwise read a replaced channel.
+func (r *WSPolymarketRTDS) SetEventQueueSize(n int) {
+	if n <= 0 {
+		n = defaultRTDSEventQueueSize
+	}
+	r.eventCh = make(chan rtdsFrame, n)
+	r.fa.SetQueueCap(n)
+}
+
+// SetOnFrameDropped registers a callback invoked once for every frame that
+// never reached a dispatcher, on the goroutine that discarded it: the read loop
+// for a frame the queue could not hold (DropQueueFull). This stream never
+// discards queued frames on disconnect, so DropDrainedOnDisconnect is never
+// reported here and FramesDrained stays 0. It must be cheap: no blocking, no
+// I/O. Counters count drops whether or not a hook is set.
+func (r *WSPolymarketRTDS) SetOnFrameDropped(fn func(connector.DroppedFrame)) {
+	r.fa.SetOnDrop(fn)
+}
+
+// Stats returns the RTDS frame accounting. Note that the ordering guarantee is
+// the dispatcher workers' problem, not the counters': FramesRead counts every
+// frame the socket delivered, including heartbeats this adapter skips and
+// frames for unsubscribed symbols. FramesDrained is always 0 on this stream:
+// queued frames are never discarded on disconnect, they are dispatched after it
+// with the ConnID of the generation that read them.
+func (r *WSPolymarketRTDS) Stats() connector.FrameStats {
+	return r.fa.Snapshot()
 }
 
 // SetDispatcherWorkers configures how many eventDispatcher goroutines run.
@@ -506,6 +565,10 @@ func (r *WSPolymarketRTDS) onConnect(ctx context.Context, conn *coderws.Conn) er
 	// attempt 1 = initial connect; >1 = reconnect after a drop. Makes the
 	// reconnect path observable (collector's feed-health monitor keys off it).
 	attempt := r.connectAttempts.Add(1)
+	// The attempt number is the connection generation: every frame read from
+	// this socket is stamped with it, so a consumer can tell a FrameID gap
+	// (local loss) from a reconnect (an unknowable gap).
+	r.fa.SetConnID(uint64(attempt))
 	slog.Info("rtds: connected", "attempt", attempt)
 
 	if r.onStatusChange != nil {
@@ -569,6 +632,13 @@ func sortedSymbols(set map[string]struct{}) []string {
 }
 
 func (r *WSPolymarketRTDS) onDisconnect(err error) {
+	// Queued frames are NOT discarded here: frames already read from the socket
+	// are real venue samples that the dispatcher workers still deliver after the
+	// reconnect. They carry the ConnID of the generation that read them, so a
+	// consumer can tell them from the new generation's frames. FramesDrained
+	// therefore stays 0 on this stream.
+	r.fa.NoteDisconnect()
+
 	if closeCode := coderws.CloseStatus(err); closeCode != -1 {
 		slog.Info("rtds: disconnected", "reason", err, "close_code", closeCode)
 	} else {
@@ -583,14 +653,24 @@ func (r *WSPolymarketRTDS) onDisconnect(err error) {
 	}
 }
 
-func (r *WSPolymarketRTDS) onMessage(ctx context.Context, data []byte) error {
+// onMessage runs on the read-loop goroutine. FrameID and ConnID are stamped
+// here, before the queue, so a frame the queue cannot hold still consumes an
+// ID: FrameID gaps a consumer sees inside one ConnID are exactly the drops
+// reported by Stats()/the drop hook.
+func (r *WSPolymarketRTDS) onMessage(_ context.Context, data []byte) error {
+	id := r.fa.Stamp()
+	f := rtdsFrame{data: data, id: id, connID: r.fa.ConnID(), rx: time.Now()}
 	select {
-	case r.eventCh <- data:
+	case r.eventCh <- f:
+		r.fa.Enqueued()
 		return nil
 	default:
-		slog.Warn("rtds: dropping message, event channel full")
-		return nil
 	}
+	r.fa.NoteDrop(f.id, f.connID, f.rx, connector.DropQueueFull)
+	slog.Warn("rtds: dropping message, event channel full",
+		"frame_id", f.id, "conn_id", f.connID, "queue_cap", r.fa.QueueCap(),
+		"dropped", r.fa.Snapshot().FramesDropped)
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -602,13 +682,15 @@ func (r *WSPolymarketRTDS) eventDispatcher(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case data := <-r.eventCh:
-			r.processMessage(data)
+		case f := <-r.eventCh:
+			r.fa.Dequeued()
+			r.processMessage(f)
 		}
 	}
 }
 
-func (r *WSPolymarketRTDS) processMessage(data []byte) {
+func (r *WSPolymarketRTDS) processMessage(f rtdsFrame) {
+	data := f.data
 	// The server may send empty heartbeat frames — skip them quietly.
 	if len(bytes.TrimSpace(data)) == 0 {
 		return
@@ -624,28 +706,28 @@ func (r *WSPolymarketRTDS) processMessage(data []byte) {
 	case rtdsCryptoPriceTopic:
 		switch msg.MsgType {
 		case "update":
-			r.handleCryptoPrice(msg, "binance", rtdsCryptoPriceTopic)
+			r.handleCryptoPrice(msg, "binance", rtdsCryptoPriceTopic, f)
 		case "subscribe":
 			// Historical snapshot (chainlink feeds arrive here on subscribe).
-			r.handlePriceSnapshot(msg, "chainlink", rtdsChainlinkPriceTopic)
+			r.handlePriceSnapshot(msg, "chainlink", rtdsChainlinkPriceTopic, f)
 		}
 	case rtdsChainlinkPriceTopic:
-		r.handleCryptoPrice(msg, "chainlink", rtdsChainlinkPriceTopic)
+		r.handleCryptoPrice(msg, "chainlink", rtdsChainlinkPriceTopic, f)
 	case rtdsChainlinkTWAP30Topic, rtdsChainlinkTWAP60Topic:
-		r.handleChainlinkTWAP(msg)
+		r.handleChainlinkTWAP(msg, f)
 	case rtdsEquityPriceTopic:
 		switch msg.MsgType {
 		case "update":
-			r.handleEquityPrice(msg)
+			r.handleEquityPrice(msg, f)
 		case "subscribe":
-			r.handleEquitySnapshot(msg)
+			r.handleEquitySnapshot(msg, f)
 		}
 	default:
 		slog.Debug("rtds: ignoring topic", "topic", msg.Topic)
 	}
 }
 
-func (r *WSPolymarketRTDS) handleCryptoPrice(msg rtdsMessage, source, topic string) {
+func (r *WSPolymarketRTDS) handleCryptoPrice(msg rtdsMessage, source, topic string, f rtdsFrame) {
 	var payload rtdsCryptoPricePayload
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		slog.Warn("rtds: failed to parse crypto price payload", "err", err)
@@ -661,6 +743,8 @@ func (r *WSPolymarketRTDS) handleCryptoPrice(msg rtdsMessage, source, topic stri
 	r.base.DispatchEvent(&connector.CryptoPriceEvent{
 		SeqID:      r.base.NextSeqID(),
 		ReceivedAt: r.base.Now(),
+		FrameID:    f.id,
+		ConnID:     f.connID,
 		Symbol:     payload.Symbol,
 		Price:      rtdsPriceValue(payload.rtdsPricePayload, preferFullAccuracy),
 		Timestamp:  rtdsEventTime(payload.Timestamp, msg.Timestamp),
@@ -673,7 +757,7 @@ func (r *WSPolymarketRTDS) handleCryptoPrice(msg rtdsMessage, source, topic stri
 // topic encodes the window; value is an exact decimal string derived from
 // Chainlink's E18 fixed-point price and the payload timestamp is the Chainlink
 // observation time.
-func (r *WSPolymarketRTDS) handleChainlinkTWAP(msg rtdsMessage) {
+func (r *WSPolymarketRTDS) handleChainlinkTWAP(msg rtdsMessage, f rtdsFrame) {
 	window := twapWindow(msg.Topic)
 	if window == 0 {
 		return
@@ -690,6 +774,8 @@ func (r *WSPolymarketRTDS) handleChainlinkTWAP(msg rtdsMessage) {
 	r.base.DispatchEvent(&connector.CryptoPriceEvent{
 		SeqID:         r.base.NextSeqID(),
 		ReceivedAt:    r.base.Now(),
+		FrameID:       f.id,
+		ConnID:        f.connID,
 		Symbol:        payload.Symbol,
 		Price:         rtdsPriceValue(payload.rtdsPricePayload, false),
 		Timestamp:     rtdsEventTime(payload.Timestamp, msg.Timestamp),
@@ -698,7 +784,7 @@ func (r *WSPolymarketRTDS) handleChainlinkTWAP(msg rtdsMessage) {
 	})
 }
 
-func (r *WSPolymarketRTDS) handleEquityPrice(msg rtdsMessage) {
+func (r *WSPolymarketRTDS) handleEquityPrice(msg rtdsMessage, f rtdsFrame) {
 	var payload rtdsEquityPricePayload
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		slog.Warn("rtds: failed to parse equity price payload", "err", err)
@@ -711,6 +797,8 @@ func (r *WSPolymarketRTDS) handleEquityPrice(msg rtdsMessage) {
 	r.base.DispatchEvent(&connector.EquityPriceEvent{
 		SeqID:            r.base.NextSeqID(),
 		ReceivedAt:       r.base.Now(),
+		FrameID:          f.id,
+		ConnID:           f.connID,
 		Symbol:           payload.Symbol,
 		Price:            rtdsPriceValue(payload.rtdsPricePayload, true),
 		Timestamp:        rtdsEventTime(payload.Timestamp, msg.Timestamp),
@@ -719,7 +807,7 @@ func (r *WSPolymarketRTDS) handleEquityPrice(msg rtdsMessage) {
 }
 
 // handlePriceSnapshot dispatches the historical snapshot for chainlink feeds.
-func (r *WSPolymarketRTDS) handlePriceSnapshot(msg rtdsMessage, source, topic string) {
+func (r *WSPolymarketRTDS) handlePriceSnapshot(msg rtdsMessage, source, topic string, f rtdsFrame) {
 	var payload rtdsPriceSnapshotPayload
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		slog.Warn("rtds: failed to parse price snapshot payload", "err", err)
@@ -737,6 +825,8 @@ func (r *WSPolymarketRTDS) handlePriceSnapshot(msg rtdsMessage, source, topic st
 	r.base.DispatchEvent(&connector.PriceSnapshotEvent{
 		SeqID:      r.base.NextSeqID(),
 		ReceivedAt: r.base.Now(),
+		FrameID:    f.id,
+		ConnID:     f.connID,
 		Source:     source,
 		Symbol:     payload.Symbol,
 		Points:     points,
@@ -745,8 +835,8 @@ func (r *WSPolymarketRTDS) handlePriceSnapshot(msg rtdsMessage, source, topic st
 }
 
 // handleEquitySnapshot dispatches the historical snapshot for equity symbols.
-func (r *WSPolymarketRTDS) handleEquitySnapshot(msg rtdsMessage) {
-	r.handlePriceSnapshot(msg, "equity", rtdsEquityPriceTopic)
+func (r *WSPolymarketRTDS) handleEquitySnapshot(msg rtdsMessage, f rtdsFrame) {
+	r.handlePriceSnapshot(msg, "equity", rtdsEquityPriceTopic, f)
 }
 
 // rtdsEventTime prefers the payload timestamp, falling back to the envelope.

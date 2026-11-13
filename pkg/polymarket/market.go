@@ -10,6 +10,7 @@ import (
 	"time"
 
 	connector "github.com/algoboy-kevin/go-exchange-connector"
+	"github.com/algoboy-kevin/go-exchange-connector/internal/framestat"
 	"github.com/algoboy-kevin/go-exchange-connector/internal/utils"
 	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
 	coderws "github.com/coder/websocket"
@@ -19,6 +20,17 @@ const (
 	defaultReconnectIntervalMs = 500
 	defaultPendingFlushMs      = 100
 	marketWSSURL               = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+	// defaultMarketEventQueueSize is the depth of the market channel's decoded
+	// frame queue (read loop -> dispatchers) when SetEventQueueSize is unused.
+	defaultMarketEventQueueSize = 16384
+
+	// reconnectOnDropMinInterval is the floor between two drop-triggered
+	// reconnects. A queue-full burst fires one reconnect per window, never a
+	// loop: the reconnect itself is only useful if the rebuilt handshake
+	// snapshot can be consumed, so hammering the venue would be counter-
+	// productive.
+	reconnectOnDropMinInterval = 10 * time.Second
 )
 
 // WSPolymarketMarket manages a WebSocket connection to the Polymarket CLOB
@@ -39,12 +51,27 @@ type WSPolymarketMarket struct {
 	flushTicker          *time.Ticker
 	flushCancel          context.CancelFunc
 
-	eventCh           chan []byte
+	eventCh           chan marketFrame
 	dispatcherCancel  context.CancelFunc
 	dispatcherWorkers int
 
+	// fa is the frame accounting: FrameID source, exact read/drop counters
+	// (this stream never drains, so FramesDrained stays 0), queue depth/high-
+	// water, connection generation, drop hook.
+	fa framestat.Accounting
+
+	// connSeq hands out connection generations for ConnID.
+	connSeq atomic.Uint64
+
+	// reconnectOnDrop (opt-in, SetReconnectOnDrop) makes a queue-full drop
+	// force one reconnect so the consumer's book is rebuilt from the handshake
+	// snapshot; lastReconnectDrop rate-limits it to one per
+	// reconnectOnDropMinInterval.
+	reconnectOnDrop   bool
+	lastReconnectDrop atomic.Int64 // unix ms of the last drop-triggered reconnect
+
 	eventCount  atomic.Int64
-	dropped     atomic.Int64 // total dropped messages (eventCh full)
+	dropped     atomic.Int64 // total dropped messages (queue full); mirrors Stats().FramesDropped
 	lastDropLog atomic.Int64 // unix ms of last rate-limited drop warning
 
 	onStatusChange func(ws.ConnectionStatus)
@@ -62,6 +89,65 @@ type WSPolymarketMarket struct {
 	readLimit int64
 
 	writeMu sync.Mutex // serializes WS writes (onConnect + flushPending)
+}
+
+// marketFrame is a raw venue frame plus its provenance, stamped on the read
+// loop before the queue so a frame that is later dropped still consumed a
+// FrameID and a read.
+type marketFrame struct {
+	data   []byte
+	id     uint64    // FrameID (never reset across reconnects)
+	connID uint64    // connection generation the frame arrived on
+	rx     time.Time // read time; reported as DroppedFrame.At
+}
+
+// SetEventQueueSize sets the depth of the market channel's decoded-frame queue
+// (read loop -> dispatchers). Zero or negative restores the default 16384. Call
+// it before Start; changing the queue while dispatchers are running would race
+// with them.
+func (pm *WSPolymarketMarket) SetEventQueueSize(n int) {
+	if n <= 0 {
+		n = defaultMarketEventQueueSize
+	}
+	pm.eventCh = make(chan marketFrame, n)
+	pm.fa.SetQueueCap(n)
+}
+
+// SetReconnectOnDrop is the OPT-IN recovery for a queue-full drop (default
+// off). The market channel's price_change frames are incremental deltas: a
+// dropped delta leaves the consumer's book silently wrong, and nothing in the
+// stream re-sends a delta. With this on, one drop forces one reconnect (the
+// existing ReconnectMarket path) so the handshake re-delivers a full `book`
+// snapshot for every subscribed asset, at most once per 10s
+// (reconnectOnDropMinInterval) so a sustained overload cannot become a
+// reconnect loop. Call it before Start.
+//
+// Residual risk that remains with the option on: a delta that was already lost
+// is not re-sent, so a consumer must reconcile its book against the
+// BookSnapshotEvent the new connection's handshake delivers.
+func (pm *WSPolymarketMarket) SetReconnectOnDrop(on bool) {
+	pm.reconnectOnDrop = on
+}
+
+// SetOnFrameDropped registers a callback invoked once for every frame that
+// never reached a dispatcher, on the goroutine that discarded it: the read loop
+// for a frame the queue could not hold (DropQueueFull). This stream never
+// discards queued frames on disconnect, so DropDrainedOnDisconnect is never
+// reported here and FramesDrained stays 0. It must be cheap (no blocking, no
+// I/O): the call runs on the read loop. Counters count drops whether or not a
+// hook is set.
+func (pm *WSPolymarketMarket) SetOnFrameDropped(fn func(connector.DroppedFrame)) {
+	pm.fa.SetOnDrop(fn)
+}
+
+// Stats returns the market channel's frame accounting. FramesDropped counts the
+// same queue-full drops as the internal dropped counter (they are incremented
+// together); FramesRead counts every frame the socket delivered, including
+// frames this adapter did not turn into a typed event. FramesDrained is always
+// 0 on this stream: queued frames are never discarded on disconnect, they are
+// dispatched after it with the ConnID of the generation that read them.
+func (pm *WSPolymarketMarket) Stats() connector.FrameStats {
+	return pm.fa.Snapshot()
 }
 
 // SetOnStatusChange registers a callback that fires whenever the WebSocket
@@ -95,9 +181,10 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 		pendingSubscribeIDs:   make(map[string]struct{}),
 		pendingUnsubscribeIDs: make(map[string]struct{}),
 		pendingFlushInterval:  time.Duration(flushMs) * time.Millisecond,
-		eventCh:               make(chan []byte, 16384),
+		eventCh:               make(chan marketFrame, defaultMarketEventQueueSize),
 		readLimit:             resolveReadLimit(cfg.ReadLimitBytes),
 	}
+	pm.fa.SetQueueCap(defaultMarketEventQueueSize)
 
 	pm.ShouldConnect = func() bool {
 		pm.pendingMu.Lock()
@@ -339,6 +426,11 @@ func writeOp(ctx context.Context, conn *coderws.Conn, operation string, ids []st
 // ─────────────────────────────────────────────────────────────
 
 func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn) error {
+	// A new generation: every frame read from this socket is stamped with it,
+	// so a consumer can tell a FrameID gap (local loss) from a reconnect (an
+	// unknowable gap) and can discard events of a generation it abandoned.
+	pm.fa.SetConnID(pm.connSeq.Add(1))
+
 	if pm.onStatusChange != nil {
 		pm.onStatusChange(ws.StatusConnected)
 	}
@@ -380,6 +472,14 @@ func (pm *WSPolymarketMarket) onConnect(ctx context.Context, conn *coderws.Conn)
 }
 
 func (pm *WSPolymarketMarket) onDisconnect(err error) {
+	// Queued frames are NOT discarded here: frames already read from the socket
+	// are real venue data that the dispatchers still deliver, in order, after
+	// the reconnect. A price_change of the dead generation then arrives before
+	// the next connection's handshake `book` snapshot, which resets the
+	// consumer's book anyway; losing it instead would be a silent loss of
+	// already-received data. FramesDrained therefore stays 0 on this stream.
+	pm.fa.NoteDisconnect()
+
 	pm.subMu.Lock()
 	pm.pendingMu.Lock()
 	for id := range pm.subscribedAssetIDs {
@@ -408,28 +508,62 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 	}
 }
 
-func (pm *WSPolymarketMarket) onMessage(ctx context.Context, data []byte) error {
+// onMessage runs on the read-loop goroutine. FrameID and ConnID are stamped
+// here, before the queue, so a frame the queue cannot hold still consumes an
+// ID: FrameID gaps a consumer sees inside one ConnID are exactly the drops
+// reported by Stats()/the drop hook.
+func (pm *WSPolymarketMarket) onMessage(_ context.Context, data []byte) error {
+	id := pm.fa.Stamp()
+	f := marketFrame{data: data, id: id, connID: pm.fa.ConnID(), rx: time.Now()}
 	select {
-	case pm.eventCh <- data:
+	case pm.eventCh <- f:
+		pm.fa.Enqueued()
 		return nil
 	default:
-		// Queue full — the "slow consumer" precursor. Track a total and
-		// rate-limit the warning so a sustained overload doesn't spam logs.
-		pm.dropped.Add(1)
-		if now := time.Now().UnixMilli(); now-pm.lastDropLog.Load() >= 5000 {
-			pm.lastDropLog.Store(now)
-			slog.Warn("market WS: queue full, dropping messages",
-				"dropped_total", pm.dropped.Load())
-		}
-		return nil
 	}
+	// Queue full — the "slow consumer" precursor. Track a total and rate-limit
+	// the warning so a sustained overload doesn't spam logs. pm.dropped stays
+	// the legacy counter and is incremented alongside the shared accounting, so
+	// Stats().FramesDropped and pm.dropped always agree.
+	pm.dropped.Add(1)
+	pm.fa.NoteDrop(f.id, f.connID, f.rx, connector.DropQueueFull)
+	if now := time.Now().UnixMilli(); now-pm.lastDropLog.Load() >= 5000 {
+		pm.lastDropLog.Store(now)
+		slog.Warn("market WS: queue full, dropping frames",
+			"frame_id", f.id, "conn_id", f.connID,
+			"queue_cap", pm.fa.QueueCap(), "dropped_total", pm.dropped.Load())
+	}
+	if pm.reconnectOnDrop {
+		pm.reconnectAfterDrop(f)
+	}
+	return nil
+}
+
+// reconnectAfterDrop runs the ReconnectOnDrop recovery: at most one reconnect
+// per reconnectOnDropMinInterval (10s), decided with a CAS so two drops racing
+// in the same window cannot both trigger one. The reconnect is the same
+// primitive ReconnectMarket uses (Disconnect -> re-dial -> handshake), so the
+// next connection re-sends the full subscription set and the venue answers with
+// a fresh `book` snapshot per asset.
+func (pm *WSPolymarketMarket) reconnectAfterDrop(f marketFrame) {
+	now := time.Now().UnixMilli()
+	last := pm.lastReconnectDrop.Load()
+	if last != 0 && now-last < reconnectOnDropMinInterval.Milliseconds() {
+		return
+	}
+	if !pm.lastReconnectDrop.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Warn("market WS: queue full, reconnecting so the book is rebuilt from the handshake snapshot",
+		"frame_id", f.id, "conn_id", f.connID, "dropped_total", pm.dropped.Load())
+	pm.Disconnect()
 }
 
 // ─────────────────────────────────────────────────────────────
 // Event handlers — parse Polymarket JSON → dispatch typed events
 // ─────────────────────────────────────────────────────────────
 
-func (pm *WSPolymarketMarket) handlePriceChange(raw json.RawMessage) {
+func (pm *WSPolymarketMarket) handlePriceChange(f marketFrame, raw json.RawMessage) {
 	var ev PriceChangeWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		slog.Warn("market WS: failed to parse price_change", "err", err)
@@ -465,13 +599,15 @@ func (pm *WSPolymarketMarket) handlePriceChange(raw json.RawMessage) {
 	pm.base.DispatchEvent(&connector.PriceChangeEvent{
 		SeqID:      pm.base.NextSeqID(),
 		ReceivedAt: now,
+		FrameID:    f.id,
+		ConnID:     f.connID,
 		Market:     ev.Market,
 		Timestamp:  exchangeTS,
 		Changes:    items,
 	})
 }
 
-func (pm *WSPolymarketMarket) handleBook(raw json.RawMessage) {
+func (pm *WSPolymarketMarket) handleBook(f marketFrame, raw json.RawMessage) {
 	var ev BookWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		slog.Warn("market WS: failed to parse book", "err", err)
@@ -497,6 +633,8 @@ func (pm *WSPolymarketMarket) handleBook(raw json.RawMessage) {
 	pm.base.DispatchEvent(&connector.BookSnapshotEvent{
 		SeqID:      pm.base.NextSeqID(),
 		ReceivedAt: now,
+		FrameID:    f.id,
+		ConnID:     f.connID,
 		Market:     ev.Market,
 		AssetID:    ev.AssetID,
 		Timestamp:  exchangeTS,
@@ -506,7 +644,7 @@ func (pm *WSPolymarketMarket) handleBook(raw json.RawMessage) {
 	})
 }
 
-func (pm *WSPolymarketMarket) handleLastTradePrice(raw json.RawMessage) {
+func (pm *WSPolymarketMarket) handleLastTradePrice(f marketFrame, raw json.RawMessage) {
 	var ev LastTradePriceWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		slog.Warn("market WS: failed to parse last_trade_price", "err", err)
@@ -519,6 +657,8 @@ func (pm *WSPolymarketMarket) handleLastTradePrice(raw json.RawMessage) {
 	pm.base.DispatchEvent(&connector.TradeEvent{
 		SeqID:      pm.base.NextSeqID(),
 		ReceivedAt: pm.base.Now(),
+		FrameID:    f.id,
+		ConnID:     f.connID,
 		AssetID:    ev.AssetID,
 		Side:       ev.Side,
 		Size:       ev.Size,
@@ -527,7 +667,7 @@ func (pm *WSPolymarketMarket) handleLastTradePrice(raw json.RawMessage) {
 	})
 }
 
-func (pm *WSPolymarketMarket) handleTickSizeChange(raw json.RawMessage) {
+func (pm *WSPolymarketMarket) handleTickSizeChange(f marketFrame, raw json.RawMessage) {
 	var ev TickSizeChangeWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		slog.Warn("market WS: failed to parse tick_size_change", "err", err)
@@ -540,6 +680,8 @@ func (pm *WSPolymarketMarket) handleTickSizeChange(raw json.RawMessage) {
 	pm.base.DispatchEvent(&connector.TickChangeEvent{
 		SeqID:       pm.base.NextSeqID(),
 		ReceivedAt:  pm.base.Now(),
+		FrameID:     f.id,
+		ConnID:      f.connID,
 		AssetID:     ev.AssetID,
 		Market:      ev.Market,
 		OldTickSize: ev.OldTickSize,
@@ -548,7 +690,7 @@ func (pm *WSPolymarketMarket) handleTickSizeChange(raw json.RawMessage) {
 	})
 }
 
-func (pm *WSPolymarketMarket) handleMarketResolved(raw json.RawMessage) {
+func (pm *WSPolymarketMarket) handleMarketResolved(f marketFrame, raw json.RawMessage) {
 	var ev MarketResolvedWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		slog.Warn("market WS: failed to parse market_resolved", "err", err)
@@ -558,6 +700,8 @@ func (pm *WSPolymarketMarket) handleMarketResolved(raw json.RawMessage) {
 	pm.base.DispatchEvent(&connector.MarketResolvedEvent{
 		SeqID:          pm.base.NextSeqID(),
 		ReceivedAt:     pm.base.Now(),
+		FrameID:        f.id,
+		ConnID:         f.connID,
 		MarketID:       ev.ID,
 		ConditionID:    ev.Market,
 		WinningAssetID: ev.WinningAssetID,
@@ -653,8 +797,9 @@ func (pm *WSPolymarketMarket) eventDispatcher(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case data := <-pm.eventCh:
-			pm.processMessage(data)
+		case f := <-pm.eventCh:
+			pm.fa.Dequeued()
+			pm.processMessage(f)
 		}
 	}
 }
@@ -672,7 +817,8 @@ func truncateBytes(b []byte) string {
 	return string(b[:max]) + "..."
 }
 
-func (pm *WSPolymarketMarket) processMessage(data []byte) {
+func (pm *WSPolymarketMarket) processMessage(f marketFrame) {
+	data := f.data
 	var raw []json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		var single json.RawMessage
@@ -695,17 +841,17 @@ func (pm *WSPolymarketMarket) processMessage(data []byte) {
 
 		switch envelope.EventType {
 		case "price_change":
-			pm.handlePriceChange(r)
+			pm.handlePriceChange(f, r)
 		case "book":
-			pm.handleBook(r)
+			pm.handleBook(f, r)
 		case "last_trade_price":
-			pm.handleLastTradePrice(r)
+			pm.handleLastTradePrice(f, r)
 		case "tick_size_change":
-			pm.handleTickSizeChange(r)
+			pm.handleTickSizeChange(f, r)
 		case "new_market":
 			slog.Debug("market WS: new_market event ignored")
 		case "market_resolved":
-			pm.handleMarketResolved(r)
+			pm.handleMarketResolved(f, r)
 		default:
 			slog.Debug("market WS: unknown event type", "type", envelope.EventType)
 		}

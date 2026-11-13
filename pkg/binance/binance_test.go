@@ -130,8 +130,8 @@ func TestBinanceParseKlineDeliversNonFinalUpdates(t *testing.T) {
 	final := `{"e":"kline","E":1787381100000,"s":"BTCUSDT","k":{"t":1787380800000,"T":1787381099999,"s":"BTCUSDT","i":"5m","f":1,"L":9,"o":"77500.00","c":"77600.00","h":"77610.00","l":"77490.00","v":"9.50000000","n":899,"x":true,"q":"735000.00","V":"4.00","Q":"310000.00","B":"0"}}`
 
 	c := b.connFor(MarketPerp, classMarket)
-	b.processMessage(c, []byte(interim))
-	b.processMessage(c, []byte(final))
+	b.processMessage(c, binanceFrame{data: []byte(interim)})
+	b.processMessage(c, binanceFrame{data: []byte(final)})
 
 	if len(*got) != 2 {
 		t.Fatalf("expected 2 events (interim + final), got %d", len(*got))
@@ -240,7 +240,7 @@ func TestBinanceParseFuturesBookTicker(t *testing.T) {
 
 	// Futures bookTicker includes the event type field.
 	raw := `{"e":"bookTicker","u":400900217,"E":1568014460893,"T":1568014460891,"s":"BTCUSDT","b":"25.35190000","B":"31.21000000","a":"25.36520000","A":"40.66000000"}`
-	b.processMessage(b.connFor(MarketPerp, classPublic), []byte(raw))
+	b.processMessage(b.connFor(MarketPerp, classPublic), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -266,7 +266,7 @@ func TestBinanceParseSpotBookTicker(t *testing.T) {
 
 	// Spot bookTicker has no event type field.
 	raw := `{"u":400900217,"s":"BTCUSDT","b":"25.35190000","B":"31.21000000","a":"25.36520000","A":"40.66000000"}`
-	b.processMessage(b.connFor(MarketSpot, classSpot), []byte(raw))
+	b.processMessage(b.connFor(MarketSpot, classSpot), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -285,7 +285,7 @@ func TestBinanceUnsubscribedSymbolIgnored(t *testing.T) {
 	// Subscribe to ethusdt but feed a btcusdt frame.
 	b.SubscribeBookTicker(context.Background(), MarketSpot, []string{"ethusdt"})
 	raw := `{"u":1,"s":"BTCUSDT","b":"1.0","B":"1","a":"1.1","A":"1"}`
-	b.processMessage(b.connFor(MarketSpot, classSpot), []byte(raw))
+	b.processMessage(b.connFor(MarketSpot, classSpot), binanceFrame{data: []byte(raw)})
 	if len(*got) != 0 {
 		t.Fatalf("expected no event for unsubscribed symbol, got %d", len(*got))
 	}
@@ -296,7 +296,7 @@ func TestBinanceParseAggTrade(t *testing.T) {
 	b.SubscribeTrades(context.Background(), MarketPerp, []string{"btcusdt"})
 
 	raw := `{"e":"aggTrade","E":1628843331742,"s":"BTCUSDT","a":105688535,"p":"46063.00","q":"0.005","f":188354417,"l":188354417,"T":1628843331590,"m":false}`
-	b.processMessage(b.connFor(MarketPerp, classMarket), []byte(raw))
+	b.processMessage(b.connFor(MarketPerp, classMarket), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -319,7 +319,7 @@ func TestBinanceParseKline(t *testing.T) {
 	// Real Binance frame (includes f/L/V/Q/B fields) — L (last trade id) must
 	// not collide case-insensitively with the Low price field (tag "l").
 	raw := `{"e":"kline","E":1787380868016,"s":"BTCUSDT","k":{"t":1787380860000,"T":1787380919999,"s":"BTCUSDT","i":"1m","f":6601225492,"L":6601226390,"o":"77560.64000000","c":"77539.56000000","h":"77568.87000000","l":"77539.56000000","v":"2.89566000","n":899,"x":false,"q":"224590.84896810","V":"1.51980000","Q":"117873.71400110","B":"0"}}`
-	b.processMessage(b.connFor(MarketSpot, classSpot), []byte(raw))
+	b.processMessage(b.connFor(MarketSpot, classSpot), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -379,7 +379,7 @@ func TestBinanceHandleDepth(t *testing.T) {
 
 	// Diff update: U == last+1, so it applies.
 	raw := `{"e":"depthUpdate","E":1628843331742,"s":"BTCUSDT","U":101,"u":101,"b":[["100.0","0"],["99.5","4.0"]],"a":[["101.0","1.0"]]}`
-	b.processMessage(b.connFor(MarketSpot, classSpot), []byte(raw))
+	b.processMessage(b.connFor(MarketSpot, classSpot), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -413,7 +413,7 @@ func TestBinanceDepthStaleUpdateIgnored(t *testing.T) {
 
 	// FinalUpdateID <= lastUpdateID → stale, ignored.
 	raw := `{"e":"depthUpdate","s":"BTCUSDT","U":99,"u":100,"b":[["100.0","5.0"]],"a":[]}`
-	b.processMessage(b.connFor(MarketPerp, classPublic), []byte(raw))
+	b.processMessage(b.connFor(MarketPerp, classPublic), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 0 {
 		t.Fatalf("expected no event for stale update, got %d", len(*got))
@@ -427,7 +427,7 @@ func TestBinanceHandlePartialDepth(t *testing.T) {
 	// Partial depth frames carry "e":"depthUpdate" and a top-N snapshot
 	// (plus pu, which the parser ignores) — no local book involvement.
 	raw := `{"e":"depthUpdate","E":1628843331742,"s":"BTCUSDT","U":157,"u":157,"pu":157,"b":[["46000.00","1.500"],["45999.50","0.200"]],"a":[["46001.00","2.000"],["46001.50","0.100"]]}`
-	b.processMessage(b.connFor(MarketPerp, classPublic), []byte(raw))
+	b.processMessage(b.connFor(MarketPerp, classPublic), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))

@@ -80,7 +80,7 @@ func TestRTDSProcessBinancePrice(t *testing.T) {
 	r.SubscribeCryptoPrices(context.Background(), []string{"BTCUSDT"})
 
 	raw := `{"topic":"crypto_prices","type":"update","timestamp":1787312179781,"payload":{"symbol":"BTCUSDT","timestamp":1787312179781,"value":76578.37804472372,"full_accuracy_value":"76578.37804472372"}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -104,7 +104,7 @@ func TestRTDSProcessChainlinkPrice(t *testing.T) {
 	// Chainlink full_accuracy_value is a raw integer scaled by 10^18 — the
 	// numeric "value" is the actual price.
 	raw := `{"topic":"crypto_prices_chainlink","type":"update","timestamp":1787378918006,"payload":{"symbol":"eth/usd","timestamp":1787378917000,"value":2434.24334265,"full_accuracy_value":"2434243342650000000000"}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -127,7 +127,7 @@ func TestRTDSProcessChainlinkSnapshot(t *testing.T) {
 
 	// Chainlink snapshot arrives on the crypto_prices topic with type subscribe.
 	raw := `{"topic":"crypto_prices","type":"subscribe","timestamp":1787378917136,"payload":{"symbol":"eth/usd","data":[{"timestamp":1787378858000,"value":2431.19},{"timestamp":1787378860000,"value":2431.21}]}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -151,7 +151,7 @@ func TestRTDSProcessChainlinkTWAP(t *testing.T) {
 	// Incoming events carry the per-window wire topic and window_s in the
 	// payload.
 	raw := `{"topic":"crypto_prices_twap_sixty","type":"update","timestamp":1787378918006,"payload":{"symbol":"btc/usd","timestamp":1787378917000,"value":"72913.515000000000000000","window_s":60}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -177,7 +177,7 @@ func TestRTDSProcessChainlinkTWAP30(t *testing.T) {
 	r.SubscribeChainlinkTWAP(context.Background(), 30, []string{"eth/usd"})
 
 	raw := `{"topic":"crypto_prices_twap_thirty","type":"update","timestamp":1,"payload":{"symbol":"eth/usd","value":"3000.5","window_s":30}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -194,7 +194,7 @@ func TestRTDSChainlinkTWAPWindowIsolation(t *testing.T) {
 
 	// A 30s-window update (different wire topic) is not subscribed → no event.
 	raw := `{"topic":"crypto_prices_twap_thirty","type":"update","timestamp":1,"payload":{"symbol":"btc/usd","value":"1.5","window_s":30}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 0 {
 		t.Fatalf("expected 0 events (window isolation), got %d", len(*got))
@@ -228,7 +228,7 @@ func TestRTDSProcessEquityPrice(t *testing.T) {
 	r.SubscribeEquityPrices(context.Background(), []string{"AAPL"})
 
 	raw := `{"topic":"equity_prices","type":"update","timestamp":1782753357257,"payload":{"symbol":"aapl","timestamp":1782753357213,"value":189.42,"full_accuracy_value":"189.4217","received_at":1782753357220,"is_carried_forward":true}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -247,7 +247,7 @@ func TestRTDSProcessEquitySnapshot(t *testing.T) {
 	r.SubscribeEquityPrices(context.Background(), []string{"aapl"})
 
 	raw := `{"topic":"equity_prices","type":"subscribe","timestamp":1782753357257,"payload":{"symbol":"aapl","data":[{"timestamp":1782753297000,"value":189.38},{"timestamp":1782753357000,"value":189.42}]}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -267,7 +267,7 @@ func TestRTDSTopicIsolation(t *testing.T) {
 	r.SubscribeCryptoPrices(context.Background(), []string{"ethusdt"})
 
 	raw := `{"topic":"crypto_prices_chainlink","type":"update","timestamp":1,"payload":{"symbol":"eth/usd","value":2434.2}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 0 {
 		t.Fatalf("expected 0 events (topic isolation), got %d", len(*got))
@@ -279,7 +279,7 @@ func TestRTDSFiltersUnsubscribedSymbols(t *testing.T) {
 	r.SubscribeCryptoPrices(context.Background(), []string{"ethusdt"})
 
 	raw := `{"topic":"crypto_prices","type":"update","timestamp":1,"payload":{"symbol":"btcusdt","value":76578.37}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 0 {
 		t.Fatalf("expected 0 events for unsubscribed symbol, got %d", len(*got))
@@ -291,7 +291,7 @@ func TestRTDSFallbackEnvelopeTimestamp(t *testing.T) {
 	r.SubscribeCryptoPrices(context.Background(), []string{"btcusdt"})
 
 	raw := `{"topic":"crypto_prices","type":"update","timestamp":1000,"payload":{"symbol":"btcusdt","value":10.5}}`
-	r.processMessage([]byte(raw))
+	r.processMessage(rtdsFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -306,9 +306,9 @@ func TestRTDSIgnoresEmptyFrames(t *testing.T) {
 	r, got := newTestRTDSClient(t)
 	r.SubscribeCryptoPrices(context.Background(), []string{"btcusdt"})
 
-	r.processMessage([]byte(""))
-	r.processMessage([]byte(" \n\t "))
-	r.processMessage([]byte(`{"topic":"other","type":"x","payload":{}}`))
+	r.processMessage(rtdsFrame{data: []byte("")})
+	r.processMessage(rtdsFrame{data: []byte(" \n\t ")})
+	r.processMessage(rtdsFrame{data: []byte(`{"topic":"other","type":"x","payload":{}}`)})
 
 	if len(*got) != 0 {
 		t.Fatalf("expected 0 events for empty/ignored frames, got %d", len(*got))

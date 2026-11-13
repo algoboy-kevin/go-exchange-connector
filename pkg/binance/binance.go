@@ -15,6 +15,7 @@ import (
 	"time"
 
 	connector "github.com/algoboy-kevin/go-exchange-connector"
+	"github.com/algoboy-kevin/go-exchange-connector/internal/framestat"
 	ws "github.com/algoboy-kevin/go-exchange-connector/pkg/websocket"
 	coderws "github.com/coder/websocket"
 )
@@ -34,6 +35,10 @@ const (
 	perpRESTURL = "https://fapi.binance.com"
 
 	defaultReconnectIntervalMs = 1000
+
+	// defaultEventQueueSize is the depth of the per-connection decoded-frame
+	// queue (read loop -> dispatcher) when Options.EventQueueSize is unset.
+	defaultEventQueueSize = 8192
 )
 
 // Options overrides the Binance endpoints a WSBinance connects to. The zero
@@ -52,6 +57,12 @@ type Options struct {
 	// PerpREST is the USDⓈ-M REST base used for depth snapshots.
 	// Default: https://fapi.binance.com (testnet: https://demo-fapi.binance.com).
 	PerpREST string
+	// EventQueueSize is the depth of each connection's decoded-frame queue
+	// (read loop -> dispatcher). A frame the queue cannot hold is dropped and
+	// counted (see Stats / SetOnFrameDropped). Zero or negative selects the
+	// default 8192; a negative value is a caller bug and falls back to the
+	// default rather than disabling the stream.
+	EventQueueSize int
 }
 
 // resolved fills in the production defaults for any empty field.
@@ -64,6 +75,9 @@ func (o Options) resolved() Options {
 	}
 	if o.PerpREST == "" {
 		o.PerpREST = perpRESTURL
+	}
+	if o.EventQueueSize <= 0 {
+		o.EventQueueSize = defaultEventQueueSize
 	}
 	return o
 }
@@ -141,6 +155,12 @@ type WSBinance struct {
 	// deliberate Disconnect()), tagged with the market whose connection
 	// dropped. See SetOnDisconnect.
 	onDisconnectHook func(MarketType, error)
+
+	// connSeq hands out connection generations. It is shared by every
+	// connection this manager owns (spot, perp market, perp public), so a
+	// ConnID names exactly one connection instance across the whole manager —
+	// the two perp stream classes never share a generation number.
+	connSeq atomic.Uint64
 }
 
 // binanceConn is one class's WebSocket connection plus its local stream
@@ -156,8 +176,22 @@ type binanceConn struct {
 	streams map[string]struct{} // full stream names, e.g. "btcusdt@bookTicker"
 	nextID  atomic.Int64
 
-	eventCh        chan []byte
+	// fa is the frame accounting (FrameID source, exact read/drop/drain
+	// counters, queue depth/high-water, connection generation, drop hook).
+	fa framestat.Accounting
+
+	eventCh        chan binanceFrame
 	dispatchCancel context.CancelFunc
+}
+
+// binanceFrame is a raw venue frame plus its provenance, stamped on the read
+// loop before the queue so a frame that is later dropped still consumed a
+// FrameID and a read.
+type binanceFrame struct {
+	data   []byte
+	id     uint64    // FrameID (never reset across reconnects)
+	connID uint64    // connection generation the frame arrived on
+	rx     time.Time // read time; reported as DroppedFrame.At
 }
 
 // wsURL returns the WebSocket endpoint for this connection's market/class.
@@ -215,8 +249,9 @@ func newBinanceConn(owner *WSBinance, mkt MarketType, class streamClass) *binanc
 		BaseWebSocket: &ws.BaseWebSocket{},
 		owner:         owner,
 		streams:       make(map[string]struct{}),
-		eventCh:       make(chan []byte, 8192),
+		eventCh:       make(chan binanceFrame, owner.opts.EventQueueSize),
 	}
+	c.fa.SetQueueCap(owner.opts.EventQueueSize)
 
 	c.ShouldConnect = func() bool {
 		c.mu.RLock()
@@ -247,6 +282,60 @@ func (b *WSBinance) SetOnStatusChange(fn func(MarketType, ws.ConnectionStatus)) 
 // before Start.
 func (b *WSBinance) SetOnDisconnect(fn func(MarketType, error)) {
 	b.onDisconnectHook = fn
+}
+
+// SetOnFrameDropped registers a callback invoked once for every frame that
+// never reached a dispatcher, on the goroutine that discarded it: the read loop
+// for a frame the queue could not hold (DroppedFrame.Cause == DropQueueFull),
+// the disconnect path for a frame discarded with the queue
+// (DropDrainedOnDisconnect). It applies to every connection of this manager;
+// the hook must be cheap (no blocking, no I/O) because it runs on the read loop.
+//
+// The counters behind Stats() count drops whether or not a hook is set, and the
+// hook is only called when one is. FrameID gaps seen by a consumer inside one
+// ConnID match the reported drops exactly: every frame read consumes an ID,
+// whether it is delivered, dropped or drained.
+func (b *WSBinance) SetOnFrameDropped(fn func(connector.DroppedFrame)) {
+	for _, byClass := range b.conns {
+		for _, c := range byClass {
+			c.fa.SetOnDrop(fn)
+		}
+	}
+}
+
+// Stats returns the frame accounting for a market's stream connections.
+//
+// Spot uses one connection (spot) and USDⓈ-M perpetual uses two (market:
+// aggTrade/kline/markPrice; public: bookTicker/depth), so for MarketPerp the
+// counters, QueueLen/QueueCap and QueueHighWater are the SUM over both
+// connections, Disconnects is the sum, and ConnID is the highest current
+// generation of the two. ConnIDs are unique across the whole manager (see
+// connSeq), so a DroppedFrame's ConnID always identifies the connection that
+// lost the frame. The bool is false for an invalid market type.
+func (b *WSBinance) Stats(mkt MarketType) (connector.FrameStats, bool) {
+	byClass, ok := b.conns[mkt]
+	if !ok {
+		return connector.FrameStats{}, false
+	}
+	var out connector.FrameStats
+	for _, c := range byClass {
+		out = addFrameStats(out, c.fa.Snapshot())
+	}
+	return out, true
+}
+
+// addFrameStats merges two snapshots of the same market's connections.
+func addFrameStats(a, b connector.FrameStats) connector.FrameStats {
+	return connector.FrameStats{
+		FramesRead:     a.FramesRead + b.FramesRead,
+		FramesDropped:  a.FramesDropped + b.FramesDropped,
+		FramesDrained:  a.FramesDrained + b.FramesDrained,
+		QueueLen:       a.QueueLen + b.QueueLen,
+		QueueCap:       a.QueueCap + b.QueueCap,
+		QueueHighWater: a.QueueHighWater + b.QueueHighWater,
+		ConnID:         max(a.ConnID, b.ConnID),
+		Disconnects:    a.Disconnects + b.Disconnects,
+	}
 }
 
 // SetDispatcher routes events dispatched by the connector (BinanceBookTickerEvent,
@@ -614,6 +703,12 @@ func (c *binanceConn) writeSubscribe(ctx context.Context, conn *coderws.Conn, me
 // ─────────────────────────────────────────────────────────────
 
 func (c *binanceConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
+	// A new generation: every frame read from this socket is stamped with it,
+	// so a consumer can tell a FrameID gap (local loss) from a reconnect (an
+	// unknowable gap). The counter is shared with the other connections of
+	// this manager, so generations are unique per connection instance.
+	c.fa.SetConnID(c.owner.connSeq.Add(1))
+
 	if c.owner.onStatusChange != nil {
 		c.owner.onStatusChange(c.mkt, ws.StatusConnected)
 	}
@@ -647,15 +742,22 @@ func (c *binanceConn) onDisconnect(err error) {
 	}
 
 	// Drop stale buffered events and reset depth books; the next connect
-	// re-snapshots them.
+	// re-snapshots them. Each discarded frame is counted (FramesDrained) and
+	// reported to the drop hook, so a consumer's
+	// read == delivered + dropped + drained identity holds across the drop.
 	for {
 		select {
-		case <-c.eventCh:
+		case f := <-c.eventCh:
+			c.fa.Dequeued()
+			c.fa.NoteDrop(f.id, f.connID, f.rx, connector.DropDrainedOnDisconnect)
 		default:
 			goto drained
 		}
 	}
 drained:
+	// Count the disconnect after the drain, so an observer that sees
+	// Disconnects grow also sees FramesDrained settled.
+	c.fa.NoteDisconnect()
 	c.owner.resetDepthBooks(c.mkt)
 
 	if fn := c.owner.onDisconnectHook; fn != nil {
@@ -666,14 +768,24 @@ drained:
 	}
 }
 
-func (c *binanceConn) onMessage(ctx context.Context, data []byte) error {
+// onMessage runs on the read-loop goroutine. It stamps FrameID and ConnID here,
+// before the queue, so a frame the queue cannot hold still consumes an ID: the
+// gaps a consumer sees in delivered FrameIDs are exactly the frames that were
+// lost, and FramesRead stays the count of everything the socket delivered.
+func (c *binanceConn) onMessage(_ context.Context, data []byte) error {
+	id := c.fa.Stamp()
+	f := binanceFrame{data: data, id: id, connID: c.fa.ConnID(), rx: time.Now()}
 	select {
-	case c.eventCh <- data:
+	case c.eventCh <- f:
+		c.fa.Enqueued()
 		return nil
 	default:
-		slog.Warn("binance: dropping message, event channel full", "market", c.mkt)
-		return nil
 	}
+	c.fa.NoteDrop(f.id, f.connID, f.rx, connector.DropQueueFull)
+	slog.Warn("binance: dropping message, event channel full",
+		"market", c.mkt, "class", c.class, "frame_id", f.id, "conn_id", f.connID,
+		"queue_cap", c.fa.QueueCap())
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -685,13 +797,17 @@ func (b *WSBinance) eventDispatcher(ctx context.Context, c *binanceConn) {
 		select {
 		case <-ctx.Done():
 			return
-		case data := <-c.eventCh:
-			b.processMessage(c, data)
+		case f := <-c.eventCh:
+			c.fa.Dequeued()
+			b.processMessage(c, f)
 		}
 	}
 }
 
-func (b *WSBinance) processMessage(c *binanceConn, data []byte) {
+// processMessage decodes one queued frame and dispatches the typed event(s) it
+// carries, copying the frame's provenance (FrameID/ConnID) onto each event.
+func (b *WSBinance) processMessage(c *binanceConn, f binanceFrame) {
+	data := f.data
 	if len(bytes.TrimSpace(data)) == 0 {
 		return
 	}
@@ -713,19 +829,19 @@ func (b *WSBinance) processMessage(c *binanceConn, data []byte) {
 
 	switch jsonString(raw["e"]) {
 	case "bookTicker":
-		b.handleBookTicker(c, data)
+		b.handleBookTicker(c, f)
 	case "aggTrade":
-		b.handleAggTrade(c, data)
+		b.handleAggTrade(c, f)
 	case "kline":
-		b.handleKline(c, data)
+		b.handleKline(c, f)
 	case "markPriceUpdate":
-		b.handleMarkPrice(c, data)
+		b.handleMarkPrice(c, f)
 	case "depthUpdate":
-		b.handleDepth(c, data)
+		b.handleDepth(c, f)
 	case "":
 		// Spot bookTicker has no event-type field; partial-depth frames
 		// (unused) are ignored.
-		b.handleSpotBookTicker(c, data, raw)
+		b.handleSpotBookTicker(c, f, raw)
 	default:
 		slog.Debug("binance: ignoring event", "market", c.mkt, "e", jsonString(raw["e"]))
 	}
@@ -769,9 +885,9 @@ type binanceBookTicker struct {
 	BestAskQty   string `json:"A"`
 }
 
-func (b *WSBinance) handleBookTicker(c *binanceConn, data []byte) {
+func (b *WSBinance) handleBookTicker(c *binanceConn, f binanceFrame) {
 	var ev binanceBookTicker
-	if err := json.Unmarshal(data, &ev); err != nil {
+	if err := json.Unmarshal(f.data, &ev); err != nil {
 		slog.Warn("binance: failed to parse bookTicker", "err", err)
 		return
 	}
@@ -782,6 +898,8 @@ func (b *WSBinance) handleBookTicker(c *binanceConn, data []byte) {
 	b.base.DispatchEvent(&connector.BinanceBookTickerEvent{
 		SeqID:        b.base.NextSeqID(),
 		ReceivedAt:   b.base.Now(),
+		FrameID:      f.id,
+		ConnID:       f.connID,
 		Symbol:       ev.Symbol,
 		Market:       string(c.mkt),
 		UpdateID:     ev.UpdateID,
@@ -795,11 +913,11 @@ func (b *WSBinance) handleBookTicker(c *binanceConn, data []byte) {
 
 // handleSpotBookTicker parses the spot bookTicker frame, which has no event
 // type field ("e") — it is identified by the u/s/b/B/a/A string fields.
-func (b *WSBinance) handleSpotBookTicker(c *binanceConn, data []byte, raw map[string]json.RawMessage) {
+func (b *WSBinance) handleSpotBookTicker(c *binanceConn, f binanceFrame, raw map[string]json.RawMessage) {
 	if _, ok := raw["u"]; !ok {
 		return // partial-depth or other frameless message
 	}
-	b.handleBookTicker(c, data)
+	b.handleBookTicker(c, f)
 }
 
 // ── AggTrade ────────────────────────────────────────────────
@@ -817,9 +935,9 @@ type binanceAggTrade struct {
 	IsBuyerMaker bool   `json:"m"`
 }
 
-func (b *WSBinance) handleAggTrade(c *binanceConn, data []byte) {
+func (b *WSBinance) handleAggTrade(c *binanceConn, f binanceFrame) {
 	var ev binanceAggTrade
-	if err := json.Unmarshal(data, &ev); err != nil {
+	if err := json.Unmarshal(f.data, &ev); err != nil {
 		slog.Warn("binance: failed to parse aggTrade", "err", err)
 		return
 	}
@@ -832,6 +950,8 @@ func (b *WSBinance) handleAggTrade(c *binanceConn, data []byte) {
 	b.base.DispatchEvent(&connector.BinanceAggTradeEvent{
 		SeqID:        b.base.NextSeqID(),
 		ReceivedAt:   b.base.Now(),
+		FrameID:      f.id,
+		ConnID:       f.connID,
 		Symbol:       ev.Symbol,
 		Market:       string(c.mkt),
 		TradeID:      ev.AggTradeID,
@@ -875,9 +995,9 @@ type binanceKline struct {
 	Ignore              string `json:"B"`
 }
 
-func (b *WSBinance) handleKline(c *binanceConn, data []byte) {
+func (b *WSBinance) handleKline(c *binanceConn, f binanceFrame) {
 	var ev binanceKlineMsg
-	if err := json.Unmarshal(data, &ev); err != nil {
+	if err := json.Unmarshal(f.data, &ev); err != nil {
 		slog.Warn("binance: failed to parse kline", "err", err)
 		return
 	}
@@ -888,6 +1008,8 @@ func (b *WSBinance) handleKline(c *binanceConn, data []byte) {
 	b.base.DispatchEvent(&connector.BinanceKlineEvent{
 		SeqID:       b.base.NextSeqID(),
 		ReceivedAt:  b.base.Now(),
+		FrameID:     f.id,
+		ConnID:      f.connID,
 		Symbol:      ev.Symbol,
 		Market:      string(c.mkt),
 		Interval:    ev.Kline.Interval,
@@ -922,9 +1044,9 @@ type binanceMarkPrice struct {
 	NextFundingTime int64  `json:"T"`
 }
 
-func (b *WSBinance) handleMarkPrice(c *binanceConn, data []byte) {
+func (b *WSBinance) handleMarkPrice(c *binanceConn, f binanceFrame) {
 	var ev binanceMarkPrice
-	if err := json.Unmarshal(data, &ev); err != nil {
+	if err := json.Unmarshal(f.data, &ev); err != nil {
 		slog.Warn("binance: failed to parse markPrice", "err", err)
 		return
 	}
@@ -936,6 +1058,8 @@ func (b *WSBinance) handleMarkPrice(c *binanceConn, data []byte) {
 	b.base.DispatchEvent(&connector.BinanceMarkPriceEvent{
 		SeqID:           b.base.NextSeqID(),
 		ReceivedAt:      now,
+		FrameID:         f.id,
+		ConnID:          f.connID,
 		Symbol:          ev.Symbol,
 		Market:          string(c.mkt),
 		MarkPrice:       ev.MarkPrice,
@@ -960,9 +1084,9 @@ type binanceDepthUpdate struct {
 	AsksRaw       json.RawMessage `json:"a"`
 }
 
-func (b *WSBinance) handleDepth(c *binanceConn, data []byte) {
+func (b *WSBinance) handleDepth(c *binanceConn, f binanceFrame) {
 	var upd binanceDepthUpdate
-	if err := json.Unmarshal(data, &upd); err != nil {
+	if err := json.Unmarshal(f.data, &upd); err != nil {
 		slog.Warn("binance: failed to parse depth update", "err", err)
 		return
 	}
@@ -971,7 +1095,7 @@ func (b *WSBinance) handleDepth(c *binanceConn, data []byte) {
 	// Partial book depth frames (e.g. @depth20@100ms) are full top-N
 	// snapshots — dispatch directly, no local book / REST seeding.
 	if c.subscribedPartialDepth(symbol) != "" {
-		b.handlePartialDepth(c, &upd, symbol)
+		b.handlePartialDepth(c, f, &upd, symbol)
 		return
 	}
 	if !c.isSubscribed(streamFor(symbol, streamDepth)) {
@@ -1013,6 +1137,8 @@ func (b *WSBinance) handleDepth(c *binanceConn, data []byte) {
 	b.base.DispatchEvent(&connector.BinanceDepthEvent{
 		SeqID:        b.base.NextSeqID(),
 		ReceivedAt:   b.base.Now(),
+		FrameID:      f.id,
+		ConnID:       f.connID,
 		Symbol:       upd.Symbol,
 		Market:       string(c.mkt),
 		LastUpdateID: lastID,
@@ -1024,7 +1150,7 @@ func (b *WSBinance) handleDepth(c *binanceConn, data []byte) {
 
 // handlePartialDepth dispatches a partial book depth snapshot. The payload
 // carries only the top-N levels, already sorted by Binance.
-func (b *WSBinance) handlePartialDepth(c *binanceConn, upd *binanceDepthUpdate, symbol string) {
+func (b *WSBinance) handlePartialDepth(c *binanceConn, f binanceFrame, upd *binanceDepthUpdate, symbol string) {
 	bids := make(map[string]string)
 	asks := make(map[string]string)
 	applyLevels(bids, parseBinanceLevels(upd.BidsRaw))
@@ -1032,6 +1158,8 @@ func (b *WSBinance) handlePartialDepth(c *binanceConn, upd *binanceDepthUpdate, 
 	b.base.DispatchEvent(&connector.BinanceDepthEvent{
 		SeqID:        b.base.NextSeqID(),
 		ReceivedAt:   b.base.Now(),
+		FrameID:      f.id,
+		ConnID:       f.connID,
 		Symbol:       upd.Symbol,
 		Market:       string(c.mkt),
 		LastUpdateID: upd.FinalUpdateID,
@@ -1134,6 +1262,19 @@ func (b *WSBinance) snapshotDepthBooks(ctx context.Context, mkt MarketType) erro
 	return firstErr
 }
 
+// depthConnID returns the current connection generation of the connection that
+// carries a market's depth stream (spot single connection; perp public class).
+func (b *WSBinance) depthConnID(mkt MarketType) uint64 {
+	class := classSpot
+	if mkt != MarketSpot {
+		class = classPublic
+	}
+	if c := b.connFor(mkt, class); c != nil {
+		return c.fa.ConnID()
+	}
+	return 0
+}
+
 // snapshotDepthBook fetches a REST depth snapshot and replaces the local book.
 // The book mutex is held across the fetch so diff application is serialized
 // with the snapshot.
@@ -1163,9 +1304,15 @@ func (b *WSBinance) snapshotDepthBook(ctx context.Context, mkt MarketType, symbo
 	bk.lastUpdateID = snap.LastUpdateID
 	bk.snapshotted = true
 
+	// The seeded book was not built from a wire frame, so it carries no
+	// FrameID (0) — that marks it as a re-seed for a consumer reconciling
+	// FrameID gaps — but it does carry the generation of the connection whose
+	// depth stream it belongs to.
 	b.base.DispatchEvent(&connector.BinanceDepthEvent{
 		SeqID:        b.base.NextSeqID(),
 		ReceivedAt:   b.base.Now(),
+		FrameID:      0,
+		ConnID:       b.depthConnID(mkt),
 		Symbol:       strings.ToUpper(symbol),
 		Market:       string(mkt),
 		LastUpdateID: bk.lastUpdateID,

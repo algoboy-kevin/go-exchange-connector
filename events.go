@@ -5,12 +5,85 @@ import (
 	"time"
 )
 
+// ── Frame accounting (shared by every venue adapter) ───────────────
+
+// FrameStats is a point-in-time snapshot of one stream connection's frame
+// accounting. It is read from lock-free atomics, so it is safe to call from any
+// goroutine.
+//
+// The identity that holds once the queue is empty is
+//
+//	FramesRead == delivered + FramesDropped + FramesDrained
+//
+// (plus at most one frame in flight while a dispatcher is decoding). FramesRead
+// counts every frame the venue's socket delivered, before the decode queue,
+// including subscribe acks and frames this adapter did not turn into a typed
+// event — so it is a frame counter, not an event counter.
+//
+// FramesRead, FramesDropped, FramesDrained and Disconnects are lifetime totals
+// for the adapter's connection object: they are never reset across reconnects.
+type FrameStats struct {
+	FramesRead     uint64 `json:"frames_read"`      // frames read from the socket, before the queue
+	FramesDropped  uint64 `json:"frames_dropped"`   // frames discarded because the queue was full
+	FramesDrained  uint64 `json:"frames_drained"`   // frames discarded on disconnect (queued, never decoded)
+	QueueLen       int    `json:"queue_len"`        // frames waiting in the queue now
+	QueueCap       int    `json:"queue_cap"`        // configured queue depth
+	QueueHighWater int    `json:"queue_high_water"` // deepest the queue has ever been
+	ConnID         uint64 `json:"conn_id"`          // current connection generation (0 before the first dial)
+	Disconnects    uint64 `json:"disconnects"`      // connection drops since Start (not deliberate Stop)
+}
+
+// DropCause says why a frame never reached the dispatcher.
+type DropCause string
+
+const (
+	// DropQueueFull: the read loop could not enqueue it because the decode
+	// queue was full. The read loop keeps going; the frame is gone.
+	DropQueueFull DropCause = "queue_full"
+	// DropDrainedOnDisconnect: it was queued when the connection dropped and
+	// the queue was discarded.
+	DropDrainedOnDisconnect DropCause = "drained_on_disconnect"
+)
+
+// DroppedFrame describes one frame that never reached the dispatcher. It is
+// delivered to the SetOnFrameDropped hook on the goroutine that discarded the
+// frame (read loop for DropQueueFull, the disconnect path for
+// DropDrainedOnDisconnect), so the hook must be cheap: no blocking, no I/O.
+type DroppedFrame struct {
+	FrameID uint64    `json:"frame_id"` // the frame's ID; consecutive delivered FrameIDs skip it
+	ConnID  uint64    `json:"conn_id"`  // connection generation the frame arrived on
+	At      time.Time `json:"at"`       // when the frame was read from the socket
+	Cause   DropCause `json:"cause"`
+}
+
 // ── Market events (connector → MarketManager) ───────────────
+
+// Frame provenance (H3) — every event below carries FrameID and ConnID.
+//
+// FrameID is a per-connection monotonic counter stamped on every frame read
+// from the socket, before the internal decode queue, and never reset across
+// reconnects. It is NOT the number of events: subscribe acks, frames for
+// unsubscribed symbols and frames the adapter chooses not to turn into a typed
+// event all consume an ID without producing one, and a frame that is dropped
+// (queue full) or drained (disconnect) consumes an ID and produces none by
+// definition. Use Stats() for the totals and SetOnFrameDropped for the drop
+// signal; do not infer "no loss" from a contiguous run of FrameIDs.
+//
+// ConnID is the connection generation the frame arrived on. A reconnect bumps
+// it; a FrameID gap *within* one ConnID is local loss, a ConnID change is a gap
+// whose size the connector cannot know (frames missed while the socket was down
+// are invisible to it).
+//
+// FrameID 0 marks an event the connector synthesized rather than decoded from a
+// wire frame (a Binance depth book seeded from a REST snapshot), so it is not
+// part of the per-connection FrameID sequence.
 
 // PriceChangeEvent carries one or more price level changes from the exchange.
 type PriceChangeEvent struct {
 	SeqID      int64             `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt time.Time         `json:"received_at"` // local arrival timestamp
+	FrameID    uint64            `json:"frame_id"`    // wire frame this event came from
+	ConnID     uint64            `json:"conn_id"`     // connection generation the frame arrived on
 	Market     string            `json:"market"`
 	Timestamp  time.Time         `json:"timestamp"`
 	Changes    []PriceChangeItem `json:"changes"`
@@ -30,6 +103,8 @@ type PriceChangeItem struct {
 type BookSnapshotEvent struct {
 	SeqID      int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt time.Time `json:"received_at"` // local arrival timestamp
+	FrameID    uint64    `json:"frame_id"`    // wire frame this event came from
+	ConnID     uint64    `json:"conn_id"`     // connection generation the frame arrived on
 	Market     string    `json:"market"`
 	AssetID    string    `json:"asset_id"`
 	Timestamp  time.Time `json:"timestamp"`
@@ -49,6 +124,8 @@ type Level struct {
 type TradeEvent struct {
 	SeqID      int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt time.Time `json:"received_at"` // local arrival timestamp
+	FrameID    uint64    `json:"frame_id"`    // wire frame this event came from
+	ConnID     uint64    `json:"conn_id"`     // connection generation the frame arrived on
 	AssetID    string    `json:"asset_id"`
 	TradeID    string    `json:"trade_id,omitempty"`
 	Side       string    `json:"side"`
@@ -63,6 +140,8 @@ type TradeEvent struct {
 type TickChangeEvent struct {
 	SeqID       int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt  time.Time `json:"received_at"` // local arrival timestamp
+	FrameID     uint64    `json:"frame_id"`    // wire frame this event came from
+	ConnID      uint64    `json:"conn_id"`     // connection generation the frame arrived on
 	AssetID     string    `json:"asset_id"`
 	Market      string    `json:"market,omitempty"`
 	OldTickSize string    `json:"old_tick_size"`
@@ -79,6 +158,8 @@ type TickChangeEvent struct {
 type CryptoPriceEvent struct {
 	SeqID         int64     `json:"seq_id"`                   // monotonic sequence for ordered DES replay
 	ReceivedAt    time.Time `json:"received_at"`              // local arrival timestamp
+	FrameID       uint64    `json:"frame_id"`                 // wire frame this event came from (see the provenance note above)
+	ConnID        uint64    `json:"conn_id"`                  // connection generation the frame arrived on
 	Symbol        string    `json:"symbol"`                   // e.g. "btcusdt" or "eth/usd"
 	Price         string    `json:"price"`                    // decimal string (RTDS "value")
 	Timestamp     time.Time `json:"timestamp"`                // exchange timestamp
@@ -91,6 +172,8 @@ type CryptoPriceEvent struct {
 type EquityPriceEvent struct {
 	SeqID            int64     `json:"seq_id"`                       // monotonic sequence for ordered DES replay
 	ReceivedAt       time.Time `json:"received_at"`                  // local arrival timestamp
+	FrameID          uint64    `json:"frame_id"`                     // wire frame this event came from (see the provenance note above)
+	ConnID           uint64    `json:"conn_id"`                      // connection generation the frame arrived on
 	Symbol           string    `json:"symbol"`                       // e.g. "aapl"
 	Price            string    `json:"price"`                        // decimal string (full_accuracy_value preferred)
 	Timestamp        time.Time `json:"timestamp"`                    // exchange timestamp
@@ -110,6 +193,8 @@ type PriceSnapshotPoint struct {
 type PriceSnapshotEvent struct {
 	SeqID      int64                `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt time.Time            `json:"received_at"` // local arrival timestamp
+	FrameID    uint64               `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID     uint64               `json:"conn_id"`     // connection generation the frame arrived on
 	Source     string               `json:"source"`      // "chainlink" or "equity"
 	Symbol     string               `json:"symbol"`
 	Points     []PriceSnapshotPoint `json:"points"`
@@ -127,6 +212,8 @@ type PriceSnapshotEvent struct {
 type BinanceBookTickerEvent struct {
 	SeqID        int64     `json:"seq_id"`         // monotonic sequence for ordered DES replay
 	ReceivedAt   time.Time `json:"received_at"`    // local arrival timestamp
+	FrameID      uint64    `json:"frame_id"`       // wire frame this event came from (see the provenance note above)
+	ConnID       uint64    `json:"conn_id"`        // connection generation the frame arrived on
 	Symbol       string    `json:"symbol"`         // e.g. "BTCUSDT"
 	Market       string    `json:"market"`         // "spot" or "perp"
 	UpdateID     int64     `json:"update_id"`      // bookTicker update id
@@ -142,6 +229,8 @@ type BinanceBookTickerEvent struct {
 type BinanceAggTradeEvent struct {
 	SeqID        int64     `json:"seq_id"`         // monotonic sequence for ordered DES replay
 	ReceivedAt   time.Time `json:"received_at"`    // local arrival timestamp
+	FrameID      uint64    `json:"frame_id"`       // wire frame this event came from (see the provenance note above)
+	ConnID       uint64    `json:"conn_id"`        // connection generation the frame arrived on
 	Symbol       string    `json:"symbol"`         // e.g. "BTCUSDT"
 	Market       string    `json:"market"`         // "spot" or "perp"
 	TradeID      int64     `json:"trade_id"`       // aggregate trade id
@@ -156,9 +245,23 @@ type BinanceAggTradeEvent struct {
 // BinanceDepthEvent is a full order book snapshot for one symbol, maintained
 // locally from Binance's diff-depth stream (@depth@100ms) seeded by a REST
 // snapshot. Bids are sorted descending (best first), asks ascending.
+//
+// FrameID is 0 on the event produced by a REST re-seed (on connect, or when a
+// FrameID gap in the diff stream is detected): that book was not built from a
+// wire frame. A FrameID-0 event is therefore the consumer-visible signal that
+// the book was rebuilt, and any FrameID gap before it is a counted loss (see
+// Stats() / SetOnFrameDropped).
+//
+// One FrameID nuance specific to this stream: the diff whose FirstUpdateID
+// proves the gap is consumed by the re-seed — its levels are superseded by the
+// snapshot that replaces the book, so it is neither delivered as an event nor
+// counted as a drop. A FrameID gap on a depth stream is therefore
+// FramesDropped + the number of re-seeds, not FramesDropped alone.
 type BinanceDepthEvent struct {
 	SeqID        int64     `json:"seq_id"`         // monotonic sequence for ordered DES replay
 	ReceivedAt   time.Time `json:"received_at"`    // local arrival timestamp
+	FrameID      uint64    `json:"frame_id"`       // wire frame this event came from (see the provenance note above)
+	ConnID       uint64    `json:"conn_id"`        // connection generation the frame arrived on
 	Symbol       string    `json:"symbol"`         // e.g. "BTCUSDT"
 	Market       string    `json:"market"`         // "spot" or "perp"
 	LastUpdateID int64     `json:"last_update_id"` // book's final update id
@@ -173,6 +276,8 @@ type BinanceDepthEvent struct {
 type BinanceKlineEvent struct {
 	SeqID       int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt  time.Time `json:"received_at"` // local arrival timestamp
+	FrameID     uint64    `json:"frame_id"`    // wire frame this event came from (see the provenance note above)
+	ConnID      uint64    `json:"conn_id"`     // connection generation the frame arrived on
 	Symbol      string    `json:"symbol"`      // e.g. "BTCUSDT"
 	Market      string    `json:"market"`      // "spot" or "perp"
 	Interval    string    `json:"interval"`    // "1m", "5m", "15m", "1h", "4h", "1d"
@@ -201,6 +306,8 @@ type BinanceKlineEvent struct {
 type BinanceMarkPriceEvent struct {
 	SeqID           int64     `json:"seq_id"`            // monotonic sequence for ordered DES replay
 	ReceivedAt      time.Time `json:"received_at"`       // local arrival timestamp
+	FrameID         uint64    `json:"frame_id"`          // wire frame this event came from (see the provenance note above)
+	ConnID          uint64    `json:"conn_id"`           // connection generation the frame arrived on
 	Symbol          string    `json:"symbol"`            // e.g. "BTCUSDT"
 	Market          string    `json:"market"`            // "perp"
 	MarkPrice       string    `json:"mark_price"`        // decimal string ("p")
@@ -509,6 +616,8 @@ func HyperliquidNormalizeSide(side string) (string, bool) {
 type MarketResolvedEvent struct {
 	SeqID          int64     `json:"seq_id"`      // monotonic sequence for ordered DES replay
 	ReceivedAt     time.Time `json:"received_at"` // local arrival timestamp
+	FrameID        uint64    `json:"frame_id"`    // wire frame this event came from
+	ConnID         uint64    `json:"conn_id"`     // connection generation the frame arrived on
 	MarketID       string    `json:"market_id"`
 	ConditionID    string    `json:"condition_id,omitempty"`
 	WinningAssetID string    `json:"winning_asset_id"`

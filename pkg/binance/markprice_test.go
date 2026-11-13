@@ -45,7 +45,7 @@ func TestBinanceParseMarkPrice(t *testing.T) {
 	b.SubscribeMarkPrice(context.Background(), MarketPerp, []string{"BTCUSDT"})
 
 	raw := `{"e":"markPriceUpdate","E":1787380860000,"s":"BTCUSDT","p":"77539.56000000","i":"77540.10000000","P":"77500.00000000","r":"0.00010000","T":1787383200000}`
-	b.processMessage(b.connFor(MarketPerp, classMarket), []byte(raw))
+	b.processMessage(b.connFor(MarketPerp, classMarket), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -90,7 +90,7 @@ func TestBinanceParseMarkPriceNegativeFunding(t *testing.T) {
 	b.SubscribeMarkPrice(context.Background(), MarketPerp, []string{"ETHUSDT"})
 
 	raw := `{"e":"markPriceUpdate","E":1787380860000,"s":"ETHUSDT","p":"3000.10","i":"3000.20","P":"3000.00","r":"-0.00012345","T":1787383200000}`
-	b.processMessage(b.connFor(MarketPerp, classMarket), []byte(raw))
+	b.processMessage(b.connFor(MarketPerp, classMarket), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(*got))
@@ -111,7 +111,7 @@ func TestBinanceMarkPriceUnsubscribedIgnored(t *testing.T) {
 	b.SubscribeMarkPrice(context.Background(), MarketPerp, []string{"ethusdt"})
 
 	raw := `{"e":"markPriceUpdate","E":1,"s":"BTCUSDT","p":"1.0","i":"1.0","P":"1.0","r":"0.0","T":2}`
-	b.processMessage(b.connFor(MarketPerp, classMarket), []byte(raw))
+	b.processMessage(b.connFor(MarketPerp, classMarket), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 0 {
 		t.Fatalf("expected no event for unsubscribed symbol, got %d", len(*got))
@@ -127,7 +127,7 @@ func TestMarkPriceExclusiveDispatch(t *testing.T) {
 	b.SubscribeTrades(context.Background(), MarketPerp, []string{"BTCUSDT"})
 
 	raw := `{"e":"markPriceUpdate","E":1787380860000,"s":"BTCUSDT","p":"77539.56","i":"77540.10","P":"77500.00","r":"0.00000000","T":1787383200000}`
-	b.processMessage(b.connFor(MarketPerp, classMarket), []byte(raw))
+	b.processMessage(b.connFor(MarketPerp, classMarket), binanceFrame{data: []byte(raw)})
 
 	if len(*got) != 1 {
 		t.Fatalf("expected exactly 1 event, got %d", len(*got))
