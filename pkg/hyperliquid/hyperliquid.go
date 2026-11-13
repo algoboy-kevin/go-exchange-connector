@@ -170,6 +170,25 @@ type Options struct {
 	// unsubscribe is logged and not retried. With a blocking gate set SubscribePaceMs > 0 so the
 	// replay runs off the connect hook.
 	SendGate func(ctx context.Context, n int) error `json:"-"`
+	// OnMarketFrameDecoded, if non-nil, receives ONE true decode-timing
+	// observation per processed public market frame on the channels l2Book,
+	// trades, bbo and activeAssetCtx, plus one per frame whose envelope could not
+	// be parsed. Other channels (allMids, candle, the account channels, the
+	// subscription/control responses, unknown channels) and the synthetic gap
+	// notice produce none.
+	//
+	// It runs synchronously on the dispatcher's decode goroutine, after the
+	// payload unmarshal and BEFORE typed event conversion, DispatchEvent and
+	// the application dispatcher. The activeAssetCtx interval also includes
+	// its existing subscription lookup between outer and inner decoding;
+	// CompletedAt still excludes typed subscriber work. The callback is on
+	// that hot path. Keep it cheap, non-blocking, I/O-free; do not call Stop or
+	// re-enter the connector from it. Set it before Start. A panic in it is not
+	// recovered (it would fail the same way any other dispatcher panic does).
+	//
+	// Leave it nil — the default — and no clock is read and frame decoding,
+	// event payloads, order and the drop/queue behaviour are unchanged.
+	OnMarketFrameDecoded func(FrameDecodeTiming) `json:"-"`
 	// NoReconnect disables the connector's own redial: after a drop the status stays
 	// disconnected and the supervisor owns the redial. Same as websocket.WSOptions.NoReconnect.
 	NoReconnect bool
@@ -204,6 +223,12 @@ type WSHyperliquid struct {
 	// onDisconnectHook receives the error that ended the connection (nil for a
 	// deliberate Disconnect()). See SetOnDisconnect.
 	onDisconnectHook func(err error)
+
+	// decodeNow is the clock behind Options.OnMarketFrameDecoded observations:
+	// time.Now in production. It is injected only from package tests (there is
+	// deliberately no exported clock option) so StartedAt/CompletedAt can be
+	// asserted exactly.
+	decodeNow func() time.Time
 }
 
 // New creates a stream manager over a connector base, using DefaultOptions.
@@ -237,7 +262,7 @@ func NewWithOptions(base *connector.Connector, opts Options) *WSHyperliquid {
 		opts.EventQueueSize = eventQueueSize
 	}
 
-	h := &WSHyperliquid{base: base, opts: opts}
+	h := &WSHyperliquid{base: base, opts: opts, decodeNow: time.Now}
 	h.conn = newHLConn(h)
 	return h
 }
@@ -1162,24 +1187,35 @@ func (h *WSHyperliquid) processFrame(f frame) {
 		return
 	}
 
+	// start is the decode-timing entry sample: one clock read, taken only when
+	// the optional hook is installed, immediately before the envelope unmarshal.
+	// Zero otherwise, which observeMarketDecode never reads.
+	var start time.Time
+	if h.opts.OnMarketFrameDecoded != nil {
+		start = h.decodeNow()
+	}
+
 	var env struct {
 		Channel string          `json:"channel"`
 		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(f.data, &env); err != nil {
+		// The envelope failed, so even the channel is unknown: report the
+		// failure with an empty Channel for the application to map to "unknown".
+		h.observeMarketDecode(f, "", start, DecodeFailed)
 		h.log().Warn("hyperliquid: undecodable frame", "err", err, "frame", truncate(string(f.data), 256))
 		return
 	}
 
 	switch Channel(env.Channel) {
 	case ChannelL2Book:
-		h.handleL2Book(env.Data, f)
+		h.handleL2Book(env.Data, f, start)
 	case ChannelTrades:
-		h.handleTrades(env.Data, f)
+		h.handleTrades(env.Data, f, start)
 	case ChannelBBO:
-		h.handleBBO(env.Data, f)
+		h.handleBBO(env.Data, f, start)
 	case ChannelActiveAssetCtx:
-		h.handleActiveAssetCtx(env.Data, f)
+		h.handleActiveAssetCtx(env.Data, f, start)
 	case ChannelAllMids:
 		h.handleAllMids(env.Data, f)
 	case ChannelCandle:
@@ -1212,12 +1248,16 @@ func (h *WSHyperliquid) processFrame(f frame) {
 	}
 }
 
-func (h *WSHyperliquid) handleL2Book(data json.RawMessage, f frame) {
+func (h *WSHyperliquid) handleL2Book(data json.RawMessage, f frame, start time.Time) {
 	var book L2BookSnapshot
 	if err := json.Unmarshal(data, &book); err != nil {
+		h.observeMarketDecode(f, ChannelL2Book, start, DecodeFailed)
 		h.log().Warn("hyperliquid: l2Book decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
+	// Observation point: the whole payload decoded. Reported even if the coin is
+	// then filtered out — the decode succeeded, delivery is a separate question.
+	h.observeMarketDecode(f, ChannelL2Book, start, DecodeSucceeded)
 	if !h.subscribed(ChannelL2Book, book.Coin, "") {
 		h.log().Debug("hyperliquid: l2Book frame for unsubscribed coin", "coin", book.Coin)
 		return
@@ -1236,12 +1276,17 @@ func (h *WSHyperliquid) handleL2Book(data json.RawMessage, f frame) {
 	})
 }
 
-func (h *WSHyperliquid) handleTrades(data json.RawMessage, f frame) {
+func (h *WSHyperliquid) handleTrades(data json.RawMessage, f frame, start time.Time) {
 	var trades []Trade
 	if err := json.Unmarshal(data, &trades); err != nil {
+		h.observeMarketDecode(f, ChannelTrades, start, DecodeFailed)
 		h.log().Warn("hyperliquid: trades decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
+	// ONE observation for the whole batch (including an empty or all-filtered
+	// one), taken immediately after the array unmarshal and before any print is
+	// converted or dispatched: N prints are still one wire frame / one decode.
+	h.observeMarketDecode(f, ChannelTrades, start, DecodeSucceeded)
 	// BatchIndex is the print's position in the frame's array and BatchLen the
 	// array's length, so a consumer can tell "these N prints are one venue
 	// event" from "these N prints are N events" — the difference between a
@@ -1274,12 +1319,14 @@ func (h *WSHyperliquid) handleTrades(data json.RawMessage, f frame) {
 	}
 }
 
-func (h *WSHyperliquid) handleBBO(data json.RawMessage, f frame) {
+func (h *WSHyperliquid) handleBBO(data json.RawMessage, f frame, start time.Time) {
 	var bbo BBO
 	if err := json.Unmarshal(data, &bbo); err != nil {
+		h.observeMarketDecode(f, ChannelBBO, start, DecodeFailed)
 		h.log().Warn("hyperliquid: bbo decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
+	h.observeMarketDecode(f, ChannelBBO, start, DecodeSucceeded)
 	if !h.subscribed(ChannelBBO, bbo.Coin, "") {
 		h.log().Debug("hyperliquid: bbo frame for unsubscribed coin", "coin", bbo.Coin)
 		return
@@ -1305,24 +1352,32 @@ func (h *WSHyperliquid) handleBBO(data json.RawMessage, f frame) {
 	h.base.DispatchEvent(ev)
 }
 
-func (h *WSHyperliquid) handleActiveAssetCtx(data json.RawMessage, f frame) {
+func (h *WSHyperliquid) handleActiveAssetCtx(data json.RawMessage, f frame, start time.Time) {
 	var msg struct {
 		Coin string          `json:"coin"`
 		Ctx  json.RawMessage `json:"ctx"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
+		h.observeMarketDecode(f, ChannelActiveAssetCtx, start, DecodeFailed)
 		h.log().Warn("hyperliquid: activeAssetCtx decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
+	// The early subscription check keeps its exact place (checked before the
+	// inner ctx is decoded). A frame that exits here is a PARTIAL decode — the
+	// ctx was never parsed — so it is reported as DecodeSkipped, never success.
 	if !h.subscribed(ChannelActiveAssetCtx, msg.Coin, "") {
+		h.observeMarketDecode(f, ChannelActiveAssetCtx, start, DecodeSkipped)
 		h.log().Debug("hyperliquid: activeAssetCtx frame for unsubscribed coin", "coin", msg.Coin)
 		return
 	}
 	var ctx AssetCtx
 	if err := json.Unmarshal(msg.Ctx, &ctx); err != nil {
+		h.observeMarketDecode(f, ChannelActiveAssetCtx, start, DecodeFailed)
 		h.log().Warn("hyperliquid: activeAssetCtx context decode failed", "coin", msg.Coin, "err", err)
 		return
 	}
+	// Success is only reported after the INNER ctx unmarshal returns.
+	h.observeMarketDecode(f, ChannelActiveAssetCtx, start, DecodeSucceeded)
 	// The venue documents one activeAssetCtx subscription serving both
 	// variants, with ctx typed PerpsAssetCtx (funding, openInterest, oraclePx)
 	// or SpotAssetCtx (the spot-only circulatingSupply). Classify from the
