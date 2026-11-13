@@ -42,6 +42,7 @@ go-exchange-connector/
 | `docs/CONNECTOR_CHANGES.md` | Changes the go-collector needs from this connector |
 | `docs/PERP_COLLECTOR_SPEC.md` | Perp collector spec (open questions in §8) |
 | `docs/authentication.md`, `docs/ctf.md`, `docs/migrating.md` | Auth, CTF and migration notes |
+| CHANGELOG.md | Release notes; 0.10.0 hardening (unreleased) |
 
 ## Verification
 
@@ -363,6 +364,120 @@ Notes — all verified live on 2026-10-04 with `go run ./cmd/test_hyperliquid`:
 - Smoke test / probe: `go run ./cmd/test_hyperliquid -coins BTC,ETH,SOL -duration 75s`
   (add `-info` for the REST client only, `-events` to print every typed event,
   `-fast` for the 5-level book).
+
+## Running the connector under a supervisor
+
+This module owns the socket, not the process. A supervisor that owns a connector should read the
+loss accounting below instead of inferring health from the connection status alone.
+
+### Detecting loss
+
+Every market event carries `FrameID` (a per-connection frame counter, stamped before the decode
+queue, never reset across reconnects) and `ConnID`. `FrameID` counts frames, not events: acks,
+pongs, unsubscribed symbols and dropped frames all consume an ID with no event. `FrameID` 0 marks
+an event the connector synthesized itself (a Binance depth book seeded from REST).
+
+A `FrameID` jump inside one `ConnID` is either local loss or a frame that produced no event (an ack,
+a pong, an unsubscribed symbol): confirm with the drop hook or `Stats()` (`FramesDropped`,
+`FramesDrained`) before treating it as loss. A `ConnID` change is a gap of unknown size. The
+identity is `FramesRead == delivered + FramesDropped + FramesDrained` (plus at most one frame in
+flight).
+
+The drop hook receives the shared `DroppedFrame` from every venue, so one hook is enough. It runs on
+the goroutine that discarded the frame — keep it cheap, no blocking, no I/O.
+
+```go
+hook := func(d connector.DroppedFrame) {
+	// runs on the goroutine that discarded the frame: keep it cheap
+	log.Printf("dropped frame=%d conn=%d cause=%s", d.FrameID, d.ConnID, d.Cause)
+}
+hl.SetOnFrameDropped(hook) // *hyperliquid.WSHyperliquid
+bn.SetOnFrameDropped(hook) // *binance.WSBinance
+pm.SetOnFrameDropped(hook) // *polymarket.WSPolymarketMarket (RTDS has the same method)
+
+st := hl.Stats() // connector.FrameStats; bn.Stats(mkt) also returns a bool
+```
+
+### Hyperliquid account channels: reconcile on a gap
+
+On an account-bearing connection a full queue no longer drops frames: the connection fails and
+reconnects. Before any frame of the new generation, a `HyperliquidGapEvent` is delivered
+(`AccountChannels`, `Cause`, `LostFrames`, `PrevConnID`, `ReceivedAt`, `SeqID`; causes
+`HyperliquidGapQueueOverflow`, `HyperliquidGapDisconnect`).
+
+A consumer must reconcile over REST when it arrives — ignoring it means trading on a stale book.
+Market-only connections are unchanged: drops are counted, no gap event is emitted.
+
+### Reconnect control (dial and send gates)
+
+`WSOptions.NoReconnect` leaves the status disconnected after a drop and gives the redial to the
+supervisor. `WSOptions.DialGate` is consulted before every dial attempt (initial and reconnect): it may block and
+must respect its context, and an error counts as a failed dial, so the backoff escalates and a
+persistent refusal cannot spin into a tight loop. `WSOptions.SendGate` is consulted once per outbound
+frame written by the websocket package (pings, `SendText`, `SendJSON`); `n` is the payload size in
+bytes (0 for control frames), so a message-count budget counts calls. A gate error skips that frame
+only: it never closes the connection. Writes the venue packages make directly on `Conn()` (their own
+subscribe, replay and ping code) are not covered by `SendGate`.
+
+### Binance depth re-seed budget
+
+Depth gaps are detected by the `U`/`u` continuity check and repaired by re-seeding the book from
+REST. Gap-triggered re-seeds are gated: one in flight per book, `Options.DepthReseedMinInterval`
+(default 1s per symbol) and `Options.DepthReseedPerMin` (default 300 per minute, shared by all
+symbols and both markets of one `WSBinance`). HTTP 429/418 pauses all gap re-seeds for `Retry-After`
+(default 60s). Initial per-connect seeding is not gated.
+
+Set `DepthReseedPerMin` to floor(your IP weight budget / weight of one depth request). A
+`depth?limit=50` request weighs 2, so the default 300 spends 600 of a 2,400/min IP budget. Before
+the gate one overloaded symbol measured 2,100-2,766 REST calls per 60s; after it, 33-35.
+`WSBinance.DepthReseedStats()` reports `Triggers == Fetched + Coalesced + Deferred`, plus `Failed`
+and `Paused`.
+
+The trade-off is deliberate: a persistently gapped book delivers far fewer events (a soak run
+delivered 48 of 9,539 frames read) until the consumer keeps up.
+
+### Polymarket ReconnectOnDrop and RTDS ordering
+
+Queued frames are still delivered after a disconnect (never drained), and frames of an asset that is
+mid-resubscribe are no longer dropped at the asset gate. `WSPolymarketMarket.SetReconnectOnDrop`
+(default off) rebuilds the book via `ReconnectMarket` after queue-full drops, at most once per 10s
+per overload episode.
+
+RTDS with several workers can deliver out of `FrameID` order: order by the event's venue
+`Timestamp` and use `FrameID` only for loss detection.
+
+### Logging
+
+`Options.Logger` (hyperliquid, binance), `WSOptions.Logger` (websocket) and `SetLogger` (Polymarket
+market, RTDS, user WS). A nil logger means `slog.Default()` resolved at call time, so behavior and
+messages are unchanged. 25 `slog` calls in the Polymarket REST/CLOB/gamma/relayer clients still use
+the global logger.
+
+### Soak and fuzz
+
+The seeded chaos soak is skipped unless `CONNECTOR_SOAK=1`; `CONNECTOR_SOAK_SECONDS` (default 20)
+and `CONNECTOR_SOAK_SEED` control it. Run one package per command:
+`go test -race -p 1 -run Soak -timeout 280s ./pkg/<pkg>`.
+
+Native fuzz targets: `FuzzProcessFrame` (hyperliquid), `FuzzProcessMessage` (binance),
+`FuzzProcessMessage` and `FuzzRTDSProcessMessage` (polymarket). Run one with
+`go test -run XXX -fuzz=<Target> -fuzztime=45s ./pkg/<pkg>`.
+
+### Known limits
+
+- Polymarket market `Stop()` discards queued frames uncounted.
+- `WSOptions.SendGate` does not cover writes made directly on `Conn()` by the venue packages.
+- `snapshotDepthBook` holds the book mutex across its REST GET; the dispatcher is blocked during a
+  fetch.
+- User streams still apply inline backpressure: no queue, no counters.
+- A quiet-market stale tail and a failed re-seed are logged only.
+- After about 10 consecutive drops the reconnect backoff reaches 20-30s, so a drop-heavy network
+  looks disconnected for that long.
+- Hyperliquid frame counters are a separate implementation from `internal/framestat` (same
+  semantics, same shared types).
+- The default 300/min re-seed budget is a conservative guess.
+- Verified offline against loopback fake servers only: no live venue, soak runs of 60s (not days),
+  no resource-limit tests.
 
 ## Architecture
 
