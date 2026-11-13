@@ -63,6 +63,16 @@ type Options struct {
 	// default 8192; a negative value is a caller bug and falls back to the
 	// default rather than disabling the stream.
 	EventQueueSize int
+
+	// Logger, if non-nil, receives every log line this manager and its
+	// connections write (connect/disconnect, subscription writes, decode
+	// failures, queue-full drops, the websocket layer's reconnect lines).
+	// Leave it nil — the default — to log to slog.Default(), resolved at each
+	// call so a process that swaps the default keeps working.
+	//
+	// Use it to tag one instance, e.g.
+	// opts.Logger = slog.Default().With("venue", "binance", "role", "market").
+	Logger *slog.Logger
 }
 
 // resolved fills in the production defaults for any empty field.
@@ -242,6 +252,17 @@ func NewWithOptions(base *connector.Connector, opts Options) *WSBinance {
 	return b
 }
 
+// log returns the logger this manager logs through: Options.Logger when it was
+// set, otherwise slog.Default() evaluated at CALL time, so a process that swaps
+// the default logger keeps working. Every connection (binanceConn) logs through
+// the same logger, which Start also hands to the websocket layer.
+func (b *WSBinance) log() *slog.Logger {
+	if b.opts.Logger != nil {
+		return b.opts.Logger
+	}
+	return slog.Default()
+}
+
 func newBinanceConn(owner *WSBinance, mkt MarketType, class streamClass) *binanceConn {
 	c := &binanceConn{
 		mkt:           mkt,
@@ -262,9 +283,20 @@ func newBinanceConn(owner *WSBinance, mkt MarketType, class streamClass) *binanc
 	c.OnMessage = c.onMessage
 	c.OnDisconnect = c.onDisconnect
 	c.OnError = func(err error) {
-		slog.Warn("binance: ws error", "market", mkt, "class", class, "err", err)
+		c.log().Warn("binance: ws error", "market", mkt, "class", class, "err", err)
 	}
 	return c
+}
+
+// log routes this connection's lines through its manager's logger, so one
+// injected logger captures the connection and the websocket layer it embeds.
+// A nil owner (only a hand-built conn in a test fixture) falls back to the
+// process default.
+func (c *binanceConn) log() *slog.Logger {
+	if c.owner != nil {
+		return c.owner.log()
+	}
+	return slog.Default()
 }
 
 // SetOnStatusChange registers a callback that fires whenever either
@@ -359,6 +391,23 @@ func (b *WSBinance) Start(ctx context.Context, reconnectIntervalMs int64) error 
 		}
 	}
 
+	opts := b.wsOptions(reconnectIntervalMs)
+
+	for _, mkt := range []MarketType{MarketSpot, MarketPerp} {
+		for _, c := range b.conns[mkt] {
+			if err := c.Connect(ctx, c.wsURL(), opts); err != nil {
+				return fmt.Errorf("binance %s %s: %w", mkt, c.class, err)
+			}
+		}
+	}
+	return nil
+}
+
+// wsOptions builds the connection options every connection of this manager is
+// dialled with. Kept separate from Start, like the other venues' wsOptions, so
+// the transport settings (including the logger wiring) can be asserted without
+// a live socket.
+func (b *WSBinance) wsOptions(reconnectIntervalMs int64) ws.WSOptions {
 	opts := ws.DefaultWSOptions()
 	opts.PingInterval = 5000 // 5s keepalive — Binance drops idle connections
 	// Depth diff frames (@depth@100ms) on liquid symbols routinely exceed
@@ -370,15 +419,10 @@ func (b *WSBinance) Start(ctx context.Context, reconnectIntervalMs int64) error 
 	} else {
 		opts.ReconnectInterval = defaultReconnectIntervalMs
 	}
-
-	for _, mkt := range []MarketType{MarketSpot, MarketPerp} {
-		for _, c := range b.conns[mkt] {
-			if err := c.Connect(ctx, c.wsURL(), opts); err != nil {
-				return fmt.Errorf("binance %s %s: %w", mkt, c.class, err)
-			}
-		}
-	}
-	return nil
+	// Point the BaseWebSocket inside each binanceConn at this manager's logger:
+	// its connect/reconnect/drop lines belong to the same instance.
+	opts.Logger = b.opts.Logger
+	return opts
 }
 
 // Stop shuts down both connections, stops the dispatchers, and clears state.
@@ -584,7 +628,7 @@ func groupStreams(mkt MarketType, streams []string) map[streamClass][]string {
 
 func (b *WSBinance) connFor(mkt MarketType, class streamClass) *binanceConn {
 	if !mkt.valid() {
-		slog.Warn("binance: invalid market type", "market", mkt)
+		b.log().Warn("binance: invalid market type", "market", mkt)
 		return nil
 	}
 	return b.conns[mkt][class]
@@ -680,16 +724,16 @@ func (c *binanceConn) send(ctx context.Context, method string, streams []string)
 	}
 	conn := c.Conn()
 	if conn == nil {
-		slog.Info("binance: send DROPPED (conn nil)", "market", c.mkt, "method", method, "streams", streams)
+		c.log().Info("binance: send DROPPED (conn nil)", "market", c.mkt, "method", method, "streams", streams)
 		return
 	}
 	if err := c.writeSubscribe(ctx, conn, method, streams); err != nil {
-		slog.Warn("binance: failed to send subscription", "market", c.mkt, "method", method, "err", err)
+		c.log().Warn("binance: failed to send subscription", "market", c.mkt, "method", method, "err", err)
 	}
 }
 
 func (c *binanceConn) writeSubscribe(ctx context.Context, conn *coderws.Conn, method string, streams []string) error {
-	slog.Info("binance: writeSubscribe", "market", c.mkt, "method", method, "streams", streams)
+	c.log().Info("binance: writeSubscribe", "market", c.mkt, "method", method, "streams", streams)
 	req := binanceSubRequest{Method: method, Params: streams, ID: c.nextID.Add(1)}
 	data, err := json.Marshal(req)
 	if err != nil {
@@ -715,12 +759,12 @@ func (c *binanceConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 
 	// Re-send every active subscription.
 	if streams := c.allStreams(); len(streams) > 0 {
-		slog.Info("binance: onConnect re-sending", "market", c.mkt, "streams", streams)
+		c.log().Info("binance: onConnect re-sending", "market", c.mkt, "streams", streams)
 		if err := c.writeSubscribe(ctx, conn, binanceMethodSubscribe, streams); err != nil {
 			return err
 		}
 	} else {
-		slog.Info("binance: onConnect no streams", "market", c.mkt)
+		c.log().Info("binance: onConnect no streams", "market", c.mkt)
 	}
 
 	// Seed depth books from REST snapshots on the connection that carries
@@ -728,7 +772,7 @@ func (c *binanceConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 	// logged, not fatal — bookTicker/trade/kline streams keep working.
 	if c.class == classSpot || c.class == classPublic {
 		if err := c.owner.snapshotDepthBooks(ctx, c.mkt); err != nil {
-			slog.Warn("binance: depth snapshot failed", "market", c.mkt, "err", err)
+			c.log().Warn("binance: depth snapshot failed", "market", c.mkt, "err", err)
 		}
 	}
 	return nil
@@ -736,9 +780,9 @@ func (c *binanceConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 
 func (c *binanceConn) onDisconnect(err error) {
 	if closeCode := coderws.CloseStatus(err); closeCode != -1 {
-		slog.Info("binance: disconnected", "market", c.mkt, "reason", err, "close_code", closeCode)
+		c.log().Info("binance: disconnected", "market", c.mkt, "reason", err, "close_code", closeCode)
 	} else {
-		slog.Info("binance: disconnected", "market", c.mkt, "reason", err)
+		c.log().Info("binance: disconnected", "market", c.mkt, "reason", err)
 	}
 
 	// Drop stale buffered events and reset depth books; the next connect
@@ -782,7 +826,7 @@ func (c *binanceConn) onMessage(_ context.Context, data []byte) error {
 	default:
 	}
 	c.fa.NoteDrop(f.id, f.connID, f.rx, connector.DropQueueFull)
-	slog.Warn("binance: dropping message, event channel full",
+	c.log().Warn("binance: dropping message, event channel full",
 		"market", c.mkt, "class", c.class, "frame_id", f.id, "conn_id", f.connID,
 		"queue_cap", c.fa.QueueCap())
 	return nil
@@ -814,7 +858,7 @@ func (b *WSBinance) processMessage(c *binanceConn, f binanceFrame) {
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
-		slog.Warn("binance: failed to parse message", "market", c.mkt, "err", err)
+		b.log().Warn("binance: failed to parse message", "market", c.mkt, "err", err)
 		return
 	}
 
@@ -822,7 +866,7 @@ func (b *WSBinance) processMessage(c *binanceConn, f binanceFrame) {
 	if _, hasID := raw["id"]; hasID {
 		var ack binanceSubAck
 		if err := json.Unmarshal(data, &ack); err == nil && ack.Error != nil {
-			slog.Warn("binance: subscribe error", "market", c.mkt, "err", ack.Error)
+			b.log().Warn("binance: subscribe error", "market", c.mkt, "err", ack.Error)
 		}
 		return
 	}
@@ -843,7 +887,7 @@ func (b *WSBinance) processMessage(c *binanceConn, f binanceFrame) {
 		// (unused) are ignored.
 		b.handleSpotBookTicker(c, f, raw)
 	default:
-		slog.Debug("binance: ignoring event", "market", c.mkt, "e", jsonString(raw["e"]))
+		b.log().Debug("binance: ignoring event", "market", c.mkt, "e", jsonString(raw["e"]))
 	}
 }
 
@@ -888,7 +932,7 @@ type binanceBookTicker struct {
 func (b *WSBinance) handleBookTicker(c *binanceConn, f binanceFrame) {
 	var ev binanceBookTicker
 	if err := json.Unmarshal(f.data, &ev); err != nil {
-		slog.Warn("binance: failed to parse bookTicker", "err", err)
+		b.log().Warn("binance: failed to parse bookTicker", "err", err)
 		return
 	}
 	symbol := normalizeSymbol(ev.Symbol)
@@ -938,12 +982,12 @@ type binanceAggTrade struct {
 func (b *WSBinance) handleAggTrade(c *binanceConn, f binanceFrame) {
 	var ev binanceAggTrade
 	if err := json.Unmarshal(f.data, &ev); err != nil {
-		slog.Warn("binance: failed to parse aggTrade", "err", err)
+		b.log().Warn("binance: failed to parse aggTrade", "err", err)
 		return
 	}
 	symbol := normalizeSymbol(ev.Symbol)
 	if !c.isSubscribed(streamFor(symbol, streamAggTrade)) {
-		slog.Info("binance: aggTrade dropped, not subscribed", "market", c.mkt, "symbol", ev.Symbol, "stream", streamFor(symbol, streamAggTrade))
+		b.log().Info("binance: aggTrade dropped, not subscribed", "market", c.mkt, "symbol", ev.Symbol, "stream", streamFor(symbol, streamAggTrade))
 		return
 	}
 
@@ -998,7 +1042,7 @@ type binanceKline struct {
 func (b *WSBinance) handleKline(c *binanceConn, f binanceFrame) {
 	var ev binanceKlineMsg
 	if err := json.Unmarshal(f.data, &ev); err != nil {
-		slog.Warn("binance: failed to parse kline", "err", err)
+		b.log().Warn("binance: failed to parse kline", "err", err)
 		return
 	}
 	symbol := normalizeSymbol(ev.Symbol)
@@ -1047,7 +1091,7 @@ type binanceMarkPrice struct {
 func (b *WSBinance) handleMarkPrice(c *binanceConn, f binanceFrame) {
 	var ev binanceMarkPrice
 	if err := json.Unmarshal(f.data, &ev); err != nil {
-		slog.Warn("binance: failed to parse markPrice", "err", err)
+		b.log().Warn("binance: failed to parse markPrice", "err", err)
 		return
 	}
 	symbol := normalizeSymbol(ev.Symbol)
@@ -1087,7 +1131,7 @@ type binanceDepthUpdate struct {
 func (b *WSBinance) handleDepth(c *binanceConn, f binanceFrame) {
 	var upd binanceDepthUpdate
 	if err := json.Unmarshal(f.data, &upd); err != nil {
-		slog.Warn("binance: failed to parse depth update", "err", err)
+		b.log().Warn("binance: failed to parse depth update", "err", err)
 		return
 	}
 	symbol := normalizeSymbol(upd.Symbol)

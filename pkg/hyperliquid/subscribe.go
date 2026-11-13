@@ -3,7 +3,6 @@ package hyperliquid
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -172,7 +171,7 @@ sendLoop:
 				retErr = ctxErr
 			} else {
 				// The connection is dying; the reconnect replay sends the rest.
-				slog.Warn("hyperliquid: SubscribeMany write failed", "subscription", key, "err", err)
+				h.log().Warn("hyperliquid: SubscribeMany write failed", "subscription", key, "err", err)
 			}
 			break sendLoop
 		}
@@ -429,13 +428,13 @@ func (c *hlConn) replay(st *connState, subs []Subscription) {
 	n := 0
 	for _, sub := range subs {
 		if st.ctx.Err() != nil {
-			slog.Debug("hyperliquid: replay cancelled", "conn_id", st.id, "sent", n, "of", len(subs))
+			c.log().Debug("hyperliquid: replay cancelled", "conn_id", st.id, "sent", n, "of", len(subs))
 			return
 		}
 		out, err := c.sendSubscribe(st.ctx, st, sub, nil)
 		if err != nil {
 			if st.ctx.Err() == nil {
-				slog.Warn("hyperliquid: replay write failed, stopping replay",
+				c.log().Warn("hyperliquid: replay write failed, stopping replay",
 					"conn_id", st.id, "subscription", sub.Key(), "err", err)
 			}
 			return
@@ -447,7 +446,7 @@ func (c *hlConn) replay(st *connState, subs []Subscription) {
 			return // the connection state was replaced
 		}
 	}
-	slog.Info("hyperliquid: subscriptions replayed", "conn_id", st.id, "sent", n,
+	c.log().Info("hyperliquid: subscriptions replayed", "conn_id", st.id, "sent", n,
 		"subscriptions", len(subs), "took", time.Since(start).Round(time.Millisecond).String())
 }
 
@@ -535,7 +534,7 @@ func (h *WSHyperliquid) handleSubscriptionResponse(data json.RawMessage, f frame
 		Subscription *Subscription `json:"subscription"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil || resp.Subscription == nil {
-		slog.Debug("hyperliquid: unrecognised subscription response", "data", truncate(string(data), 256))
+		h.log().Debug("hyperliquid: unrecognised subscription response", "data", truncate(string(data), 256))
 		return
 	}
 	if resp.Method != "subscribe" {

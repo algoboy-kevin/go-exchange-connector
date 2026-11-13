@@ -15,7 +15,10 @@
 //	defer ws.Close()
 package websocket
 
-import "context"
+import (
+	"context"
+	"log/slog"
+)
 
 // ─────────────────────────────────────────────────────────────
 // Connection status
@@ -148,6 +151,18 @@ type WSOptions struct {
 	// (go-mm-driver, GMS: stop the adapter, back off, dial a new one) and a
 	// second reconnect policy underneath that one would fight it.
 	NoReconnect bool `json:"no_reconnect,omitempty"`
+
+	// Logger, if non-nil, receives every log line this package writes for the
+	// connection (connect/disconnect, reconnect/backoff, pong and staleness
+	// watchdogs, hook panics). Leave it nil to keep the historical behaviour,
+	// which is slog.Default() resolved at each call — not at Connect time, so
+	// a process that swaps the default logger keeps working.
+	//
+	// It exists so several stream managers in one process can carry their own
+	// attributes (e.g. With("venue","hl","role","account")) and so tests can
+	// capture a single instance's output. A *slog.Logger is not a JSON value;
+	// the field is excluded from marshalling.
+	Logger *slog.Logger `json:"-"`
 }
 
 // DefaultWSOptions returns sensible defaults for a production WebSocket connection.

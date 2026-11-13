@@ -91,6 +91,10 @@ type WSPolymarketRTDS struct {
 	// Config.ReadLimitBytes (0 → 1 MiB default).
 	readLimit int64
 
+	// logger overrides where this stream's log lines go (see SetLogger). nil —
+	// the default — means slog.Default(), resolved at each call.
+	logger *slog.Logger
+
 	onStatusChange func(ws.ConnectionStatus)
 
 	// onDisconnectHook receives the error that ended the connection (nil for a
@@ -157,7 +161,7 @@ func NewWSPolymarketRTDS(base *connector.Connector) *WSPolymarketRTDS {
 	r.OnMessage = r.onMessage
 	r.OnDisconnect = r.onDisconnect
 	r.OnError = func(err error) {
-		slog.Warn("rtds: error", "err", err)
+		r.log().Warn("rtds: error", "err", err)
 	}
 
 	return r
@@ -250,6 +254,24 @@ func (r *WSPolymarketRTDS) SetReadLimitBytes(n int64) {
 	r.readLimit = resolveReadLimit(n)
 }
 
+// SetLogger routes every log line this stream writes — and, through the
+// connection options it builds, the embedded BaseWebSocket's connect/reconnect/
+// drop lines — to l. Passing nil (the default) restores slog.Default(),
+// resolved at each call so a process that swaps the default keeps working.
+// Call it before Start; see the other Set* setters.
+func (r *WSPolymarketRTDS) SetLogger(l *slog.Logger) {
+	r.logger = l
+}
+
+// log returns the logger this stream logs through: the injected one when set,
+// otherwise slog.Default() evaluated at CALL time.
+func (r *WSPolymarketRTDS) log() *slog.Logger {
+	if r.logger != nil {
+		return r.logger
+	}
+	return slog.Default()
+}
+
 // wsOptions builds the connection options for the RTDS channel. Kept separate
 // from Start so the transport settings can be asserted without a live socket.
 func (r *WSPolymarketRTDS) wsOptions(reconnectIntervalMs int64) ws.WSOptions {
@@ -261,6 +283,9 @@ func (r *WSPolymarketRTDS) wsOptions(reconnectIntervalMs int64) ws.WSOptions {
 		opts.ReconnectInterval = defaultReconnectIntervalMs
 	}
 	opts.ReadLimit = r.readLimit
+	// The BaseWebSocket inside this stream logs connect/reconnect/drop lines;
+	// point them at the same logger as the stream itself.
+	opts.Logger = r.logger
 	return opts
 }
 
@@ -465,11 +490,11 @@ func (r *WSPolymarketRTDS) sendEntries(ctx context.Context, action string, entri
 	req := rtdsSubscriptionRequest{Action: action, Subscriptions: entries}
 	data, err := json.Marshal(req)
 	if err != nil {
-		slog.Warn("rtds: failed to marshal subscription", "action", action, "err", err)
+		r.log().Warn("rtds: failed to marshal subscription", "action", action, "err", err)
 		return
 	}
 	if err := conn.Write(ctx, coderws.MessageText, data); err != nil {
-		slog.Warn("rtds: failed to send subscription", "action", action, "err", err)
+		r.log().Warn("rtds: failed to send subscription", "action", action, "err", err)
 	}
 }
 
@@ -569,7 +594,7 @@ func (r *WSPolymarketRTDS) onConnect(ctx context.Context, conn *coderws.Conn) er
 	// this socket is stamped with it, so a consumer can tell a FrameID gap
 	// (local loss) from a reconnect (an unknowable gap).
 	r.fa.SetConnID(uint64(attempt))
-	slog.Info("rtds: connected", "attempt", attempt)
+	r.log().Info("rtds: connected", "attempt", attempt)
 
 	if r.onStatusChange != nil {
 		r.onStatusChange(ws.StatusConnected)
@@ -640,9 +665,9 @@ func (r *WSPolymarketRTDS) onDisconnect(err error) {
 	r.fa.NoteDisconnect()
 
 	if closeCode := coderws.CloseStatus(err); closeCode != -1 {
-		slog.Info("rtds: disconnected", "reason", err, "close_code", closeCode)
+		r.log().Info("rtds: disconnected", "reason", err, "close_code", closeCode)
 	} else {
-		slog.Info("rtds: disconnected", "reason", err)
+		r.log().Info("rtds: disconnected", "reason", err)
 	}
 
 	if r.onDisconnectHook != nil {
@@ -667,7 +692,7 @@ func (r *WSPolymarketRTDS) onMessage(_ context.Context, data []byte) error {
 	default:
 	}
 	r.fa.NoteDrop(f.id, f.connID, f.rx, connector.DropQueueFull)
-	slog.Warn("rtds: dropping message, event channel full",
+	r.log().Warn("rtds: dropping message, event channel full",
 		"frame_id", f.id, "conn_id", f.connID, "queue_cap", r.fa.QueueCap(),
 		"dropped", r.fa.Snapshot().FramesDropped)
 	return nil
@@ -698,7 +723,7 @@ func (r *WSPolymarketRTDS) processMessage(f rtdsFrame) {
 
 	var msg rtdsMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
-		slog.Warn("rtds: failed to parse message", "err", err)
+		r.log().Warn("rtds: failed to parse message", "err", err)
 		return
 	}
 
@@ -723,14 +748,14 @@ func (r *WSPolymarketRTDS) processMessage(f rtdsFrame) {
 			r.handleEquitySnapshot(msg, f)
 		}
 	default:
-		slog.Debug("rtds: ignoring topic", "topic", msg.Topic)
+		r.log().Debug("rtds: ignoring topic", "topic", msg.Topic)
 	}
 }
 
 func (r *WSPolymarketRTDS) handleCryptoPrice(msg rtdsMessage, source, topic string, f rtdsFrame) {
 	var payload rtdsCryptoPricePayload
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-		slog.Warn("rtds: failed to parse crypto price payload", "err", err)
+		r.log().Warn("rtds: failed to parse crypto price payload", "err", err)
 		return
 	}
 	if !r.isSubscribed(topic, payload.Symbol) {
@@ -764,7 +789,7 @@ func (r *WSPolymarketRTDS) handleChainlinkTWAP(msg rtdsMessage, f rtdsFrame) {
 	}
 	var payload rtdsChainlinkTWAPPayload
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-		slog.Warn("rtds: failed to parse chainlink twap payload", "err", err)
+		r.log().Warn("rtds: failed to parse chainlink twap payload", "err", err)
 		return
 	}
 	if !r.isSubscribed(subsKey(rtdsChainlinkTWAPTopic, window), payload.Symbol) {
@@ -787,7 +812,7 @@ func (r *WSPolymarketRTDS) handleChainlinkTWAP(msg rtdsMessage, f rtdsFrame) {
 func (r *WSPolymarketRTDS) handleEquityPrice(msg rtdsMessage, f rtdsFrame) {
 	var payload rtdsEquityPricePayload
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-		slog.Warn("rtds: failed to parse equity price payload", "err", err)
+		r.log().Warn("rtds: failed to parse equity price payload", "err", err)
 		return
 	}
 	if !r.isSubscribed(rtdsEquityPriceTopic, payload.Symbol) {
@@ -810,7 +835,7 @@ func (r *WSPolymarketRTDS) handleEquityPrice(msg rtdsMessage, f rtdsFrame) {
 func (r *WSPolymarketRTDS) handlePriceSnapshot(msg rtdsMessage, source, topic string, f rtdsFrame) {
 	var payload rtdsPriceSnapshotPayload
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-		slog.Warn("rtds: failed to parse price snapshot payload", "err", err)
+		r.log().Warn("rtds: failed to parse price snapshot payload", "err", err)
 		return
 	}
 	if !r.isSubscribed(topic, payload.Symbol) {

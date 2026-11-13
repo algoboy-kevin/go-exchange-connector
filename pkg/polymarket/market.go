@@ -88,6 +88,10 @@ type WSPolymarketMarket struct {
 	// Config.ReadLimitBytes (0 → 1 MiB default).
 	readLimit int64
 
+	// logger overrides where this stream's log lines go (see SetLogger). nil —
+	// the default — means slog.Default(), resolved at each call.
+	logger *slog.Logger
+
 	writeMu sync.Mutex // serializes WS writes (onConnect + flushPending)
 }
 
@@ -127,6 +131,24 @@ func (pm *WSPolymarketMarket) SetEventQueueSize(n int) {
 // BookSnapshotEvent the new connection's handshake delivers.
 func (pm *WSPolymarketMarket) SetReconnectOnDrop(on bool) {
 	pm.reconnectOnDrop = on
+}
+
+// SetLogger routes every log line this stream writes — and, through the
+// connection options it builds, the embedded BaseWebSocket's connect/reconnect/
+// drop lines — to l. Passing nil (the default) restores slog.Default(),
+// resolved at each call so a process that swaps the default keeps working.
+// Call it before Start; see the other Set* setters.
+func (pm *WSPolymarketMarket) SetLogger(l *slog.Logger) {
+	pm.logger = l
+}
+
+// log returns the logger this stream logs through: the injected one when set,
+// otherwise slog.Default() evaluated at CALL time.
+func (pm *WSPolymarketMarket) log() *slog.Logger {
+	if pm.logger != nil {
+		return pm.logger
+	}
+	return slog.Default()
 }
 
 // SetOnFrameDropped registers a callback invoked once for every frame that
@@ -207,7 +229,7 @@ func NewWSPolymarketMarket(base *connector.Connector, cfg Config) *WSPolymarketM
 	pm.OnMessage = pm.onMessage
 	pm.OnDisconnect = pm.onDisconnect
 	pm.OnError = func(err error) {
-		slog.Warn("market WS: error", "err", err)
+		pm.log().Warn("market WS: error", "err", err)
 	}
 
 	return pm
@@ -266,6 +288,9 @@ func (pm *WSPolymarketMarket) wsOptions(reconnectIntervalMs int64) ws.WSOptions 
 	// reconnect re-pulls the same snapshot — a drop/reconnect loop that loses
 	// exactly the deepest, most liquid books.
 	opts.ReadLimit = pm.readLimit
+	// The BaseWebSocket inside this stream logs connect/reconnect/drop lines;
+	// point them at the same logger as the stream itself.
+	opts.Logger = pm.logger
 	return opts
 }
 
@@ -395,7 +420,7 @@ func (pm *WSPolymarketMarket) flushPending(ctx context.Context) {
 		}
 	}
 	if firstErr != nil {
-		slog.Warn("market WS: failed to send subscription update", "err", firstErr)
+		pm.log().Warn("market WS: failed to send subscription update", "err", firstErr)
 		// Re-queue so the next flush (or reconnect, via onDisconnect) retries.
 		pm.pendingMu.Lock()
 		for _, id := range toAdd {
@@ -492,12 +517,12 @@ func (pm *WSPolymarketMarket) onDisconnect(err error) {
 	// Extract close info.
 	closeCode := coderws.CloseStatus(err)
 	if closeCode != -1 {
-		slog.Info("market WS: disconnected",
+		pm.log().Info("market WS: disconnected",
 			"reason", err,
 			"close_code", closeCode,
 		)
 	} else {
-		slog.Info("market WS: disconnected", "reason", err)
+		pm.log().Info("market WS: disconnected", "reason", err)
 	}
 
 	if pm.onDisconnectHook != nil {
@@ -529,7 +554,7 @@ func (pm *WSPolymarketMarket) onMessage(_ context.Context, data []byte) error {
 	pm.fa.NoteDrop(f.id, f.connID, f.rx, connector.DropQueueFull)
 	if now := time.Now().UnixMilli(); now-pm.lastDropLog.Load() >= 5000 {
 		pm.lastDropLog.Store(now)
-		slog.Warn("market WS: queue full, dropping frames",
+		pm.log().Warn("market WS: queue full, dropping frames",
 			"frame_id", f.id, "conn_id", f.connID,
 			"queue_cap", pm.fa.QueueCap(), "dropped_total", pm.dropped.Load())
 	}
@@ -554,7 +579,7 @@ func (pm *WSPolymarketMarket) reconnectAfterDrop(f marketFrame) {
 	if !pm.lastReconnectDrop.CompareAndSwap(last, now) {
 		return
 	}
-	slog.Warn("market WS: queue full, reconnecting so the book is rebuilt from the handshake snapshot",
+	pm.log().Warn("market WS: queue full, reconnecting so the book is rebuilt from the handshake snapshot",
 		"frame_id", f.id, "conn_id", f.connID, "dropped_total", pm.dropped.Load())
 	pm.Disconnect()
 }
@@ -566,7 +591,7 @@ func (pm *WSPolymarketMarket) reconnectAfterDrop(f marketFrame) {
 func (pm *WSPolymarketMarket) handlePriceChange(f marketFrame, raw json.RawMessage) {
 	var ev PriceChangeWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		slog.Warn("market WS: failed to parse price_change", "err", err)
+		pm.log().Warn("market WS: failed to parse price_change", "err", err)
 		return
 	}
 
@@ -610,7 +635,7 @@ func (pm *WSPolymarketMarket) handlePriceChange(f marketFrame, raw json.RawMessa
 func (pm *WSPolymarketMarket) handleBook(f marketFrame, raw json.RawMessage) {
 	var ev BookWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		slog.Warn("market WS: failed to parse book", "err", err)
+		pm.log().Warn("market WS: failed to parse book", "err", err)
 		return
 	}
 	if !pm.isSubscribed(ev.AssetID) {
@@ -647,7 +672,7 @@ func (pm *WSPolymarketMarket) handleBook(f marketFrame, raw json.RawMessage) {
 func (pm *WSPolymarketMarket) handleLastTradePrice(f marketFrame, raw json.RawMessage) {
 	var ev LastTradePriceWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		slog.Warn("market WS: failed to parse last_trade_price", "err", err)
+		pm.log().Warn("market WS: failed to parse last_trade_price", "err", err)
 		return
 	}
 	if !pm.isSubscribed(ev.AssetID) {
@@ -670,7 +695,7 @@ func (pm *WSPolymarketMarket) handleLastTradePrice(f marketFrame, raw json.RawMe
 func (pm *WSPolymarketMarket) handleTickSizeChange(f marketFrame, raw json.RawMessage) {
 	var ev TickSizeChangeWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		slog.Warn("market WS: failed to parse tick_size_change", "err", err)
+		pm.log().Warn("market WS: failed to parse tick_size_change", "err", err)
 		return
 	}
 	if !pm.isSubscribed(ev.AssetID) {
@@ -693,7 +718,7 @@ func (pm *WSPolymarketMarket) handleTickSizeChange(f marketFrame, raw json.RawMe
 func (pm *WSPolymarketMarket) handleMarketResolved(f marketFrame, raw json.RawMessage) {
 	var ev MarketResolvedWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		slog.Warn("market WS: failed to parse market_resolved", "err", err)
+		pm.log().Warn("market WS: failed to parse market_resolved", "err", err)
 		return
 	}
 
@@ -779,7 +804,7 @@ func (pm *WSPolymarketMarket) latencyLogger(ctx context.Context) {
 		case <-ticker.C:
 			avg, count := pm.latencyTracker.report()
 			if count > 0 {
-				slog.Info("market WS: event latency",
+				pm.log().Info("market WS: event latency",
 					"avg_ms", avg.Milliseconds(),
 					"samples", count,
 				)
@@ -823,7 +848,7 @@ func (pm *WSPolymarketMarket) processMessage(f marketFrame) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		var single json.RawMessage
 		if err2 := json.Unmarshal(data, &single); err2 != nil {
-			slog.Warn("market WS: failed to parse message",
+			pm.log().Warn("market WS: failed to parse message",
 				"err", err2,
 				"raw", truncateBytes(data))
 			return
@@ -849,16 +874,16 @@ func (pm *WSPolymarketMarket) processMessage(f marketFrame) {
 		case "tick_size_change":
 			pm.handleTickSizeChange(f, r)
 		case "new_market":
-			slog.Debug("market WS: new_market event ignored")
+			pm.log().Debug("market WS: new_market event ignored")
 		case "market_resolved":
 			pm.handleMarketResolved(f, r)
 		default:
-			slog.Debug("market WS: unknown event type", "type", envelope.EventType)
+			pm.log().Debug("market WS: unknown event type", "type", envelope.EventType)
 		}
 
 		count := pm.eventCount.Add(1)
 		if count%10000 == 0 {
-			slog.Debug("market WS: events received", "count", count)
+			pm.log().Debug("market WS: events received", "count", count)
 		}
 	}
 }

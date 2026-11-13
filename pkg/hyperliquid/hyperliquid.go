@@ -144,6 +144,16 @@ type Options struct {
 	// connection so the reconnect and gap-event machinery can bound the damage.
 	// Size it for the slowest dispatcher you expect, not the average one.
 	EventQueueSize int
+
+	// Logger, if non-nil, receives every log line this manager and its
+	// connection write (connect/disconnect, subscriptions, decode failures,
+	// queue-full drops, the websocket layer's reconnect lines). Leave it nil —
+	// the default — to log to slog.Default(), resolved at each call so a
+	// process that swaps the default keeps working.
+	//
+	// Use it to tag one instance, e.g.
+	// opts.Logger = slog.Default().With("venue", "hl", "role", "market").
+	Logger *slog.Logger
 }
 
 // DefaultOptions returns the transport defaults.
@@ -211,6 +221,17 @@ func NewWithOptions(base *connector.Connector, opts Options) *WSHyperliquid {
 	h := &WSHyperliquid{base: base, opts: opts}
 	h.conn = newHLConn(h)
 	return h
+}
+
+// log returns the logger this manager logs through: Options.Logger when it was
+// set, otherwise slog.Default() evaluated at CALL time, so a process that swaps
+// the default logger keeps working. The connection (hlConn) logs through the
+// same logger, which is also handed to the websocket layer in Start.
+func (h *WSHyperliquid) log() *slog.Logger {
+	if h.opts.Logger != nil {
+		return h.opts.Logger
+	}
+	return slog.Default()
 }
 
 // SetDispatcher routes the events dispatched by this manager
@@ -317,6 +338,10 @@ func (h *WSHyperliquid) Start(ctx context.Context, reconnectIntervalMs int64) er
 	} else {
 		opts.DisableDataStaleWatchdog = true
 	}
+	// The BaseWebSocket inside hlConn logs connect/reconnect/drop lines; point
+	// them at the same logger as this manager so a per-instance logger sees the
+	// whole connection lifecycle and not just the Hyperliquid-level lines.
+	opts.Logger = h.opts.Logger
 
 	if err := h.conn.Connect(ctx, h.opts.URL, opts); err != nil {
 		cancel()
@@ -627,9 +652,20 @@ func newHLConn(owner *WSHyperliquid) *hlConn {
 	c.OnMessage = c.onMessage
 	c.OnDisconnect = c.onDisconnect
 	c.OnError = func(err error) {
-		slog.Warn("hyperliquid: ws error", "err", err)
+		c.log().Warn("hyperliquid: ws error", "err", err)
 	}
 	return c
+}
+
+// log routes the connection's lines through the owning manager's logger, so one
+// injected logger captures the connection and the websocket layer it embeds.
+// nil owner (only possible in a hand-built conn, e.g. a test fixture) falls
+// back to the process default.
+func (c *hlConn) log() *slog.Logger {
+	if c.owner != nil {
+		return c.owner.log()
+	}
+	return slog.Default()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -727,13 +763,13 @@ func (c *hlConn) writeSub(ctx context.Context, sub Subscription, unsubscribe boo
 	out, err := c.sendSubscribe(ctx, nil, sub, nil)
 	switch {
 	case err != nil:
-		slog.Warn("hyperliquid: write subscription frame",
+		c.log().Warn("hyperliquid: write subscription frame",
 			"subscription", sub.Key(), "unsubscribe", false, "err", err)
 	case out == sendDeferred:
-		slog.Debug("hyperliquid: subscription deferred (not connected)",
+		c.log().Debug("hyperliquid: subscription deferred (not connected)",
 			"subscription", sub.Key(), "unsubscribe", false)
 	case out == sendSent:
-		slog.Debug("hyperliquid: subscription frame sent", "subscription", sub.Key(), "unsubscribe", false)
+		c.log().Debug("hyperliquid: subscription frame sent", "subscription", sub.Key(), "unsubscribe", false)
 	}
 }
 
@@ -747,22 +783,22 @@ func (c *hlConn) writeUnsubscribe(ctx context.Context, sub Subscription) {
 	}
 	c.mu.Unlock()
 	if st == nil {
-		slog.Debug("hyperliquid: subscription deferred (not connected)",
+		c.log().Debug("hyperliquid: subscription deferred (not connected)",
 			"subscription", sub.Key(), "unsubscribe", true)
 		return
 	}
 
 	data, err := UnsubscribeFrame(sub)
 	if err != nil {
-		slog.Warn("hyperliquid: build subscription frame", "subscription", sub.Key(), "err", err)
+		c.log().Warn("hyperliquid: build subscription frame", "subscription", sub.Key(), "err", err)
 		return
 	}
 	if err := st.conn.Write(ctx, coderws.MessageText, data); err != nil {
-		slog.Warn("hyperliquid: write subscription frame",
+		c.log().Warn("hyperliquid: write subscription frame",
 			"subscription", sub.Key(), "unsubscribe", true, "err", err)
 		return
 	}
-	slog.Debug("hyperliquid: subscription frame sent", "subscription", sub.Key(), "unsubscribe", true)
+	c.log().Debug("hyperliquid: subscription frame sent", "subscription", sub.Key(), "unsubscribe", true)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -803,7 +839,7 @@ func (c *hlConn) onConnect(ctx context.Context, conn *coderws.Conn) error {
 			}
 		}
 	}
-	slog.Info("hyperliquid: connected", "url", c.owner.opts.URL, "subscriptions", len(subs),
+	c.log().Info("hyperliquid: connected", "url", c.owner.opts.URL, "subscriptions", len(subs),
 		"conn_id", st.id, "paced", c.paceGap() > 0)
 
 	c.startPing(ctx, conn)
@@ -854,7 +890,7 @@ func (c *hlConn) enqueueGap(connID uint64) {
 		// Unreachable in practice: the queue was just emptied and only this
 		// goroutine enqueues before the read loop starts. Count it anyway rather
 		// than lose the notice silently.
-		slog.Error("hyperliquid: could not enqueue gap event, event queue full",
+		c.log().Error("hyperliquid: could not enqueue gap event, event queue full",
 			"conn_id", connID, "lost_frames", f.gap.lostFrames)
 	}
 }
@@ -875,9 +911,9 @@ func (c *hlConn) onDisconnect(err error) {
 	c.fa.disc.Add(1)
 
 	if err != nil {
-		slog.Info("hyperliquid: disconnected", "reason", err)
+		c.log().Info("hyperliquid: disconnected", "reason", err)
 	} else {
-		slog.Info("hyperliquid: disconnected")
+		c.log().Info("hyperliquid: disconnected")
 	}
 	if fn := c.owner.onDisconnectHook; fn != nil {
 		fn(err)
@@ -919,7 +955,7 @@ func (c *hlConn) onMessage(_ context.Context, data []byte) error {
 	if !c.accountBearing() {
 		// Market data: losing a frame is bad but harmless (the next l2Book
 		// snapshot supersedes it), and the drop is counted and reported.
-		slog.Warn("hyperliquid: dropping frame, event queue full",
+		c.log().Warn("hyperliquid: dropping frame, event queue full",
 			"frame_id", id, "conn_id", connID, "queue_cap", c.fa.cap())
 		return nil
 	}
@@ -930,7 +966,7 @@ func (c *hlConn) onMessage(_ context.Context, data []byte) error {
 	// it, and let onConnect announce the loss with a gap event before any frame
 	// of the new generation is decoded.
 	c.fa.overflowed.Store(true)
-	slog.Warn("hyperliquid: failing account connection, event queue full",
+	c.log().Warn("hyperliquid: failing account connection, event queue full",
 		"frame_id", id, "conn_id", connID, "queue_cap", c.fa.cap(),
 		"dropped", c.fa.dropped.Load(), "drained", c.fa.drained.Load())
 	c.Disconnect()
@@ -990,7 +1026,7 @@ func (c *hlConn) startPing(ctx context.Context, conn *coderws.Conn) {
 				return
 			case <-ticker.C:
 				if err := conn.Write(pingCtx, coderws.MessageText, PingFrame()); err != nil {
-					slog.Warn("hyperliquid: ping write failed", "err", err)
+					c.log().Warn("hyperliquid: ping write failed", "err", err)
 					// Only drop the connection if this is still the current
 					// one — a stale ticker must not kill a healthy reconnect.
 					if c.Conn() == conn {
@@ -1054,7 +1090,7 @@ func (h *WSHyperliquid) processFrame(f frame) {
 		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(f.data, &env); err != nil {
-		slog.Warn("hyperliquid: undecodable frame", "err", err, "frame", truncate(string(f.data), 256))
+		h.log().Warn("hyperliquid: undecodable frame", "err", err, "frame", truncate(string(f.data), 256))
 		return
 	}
 
@@ -1076,16 +1112,16 @@ func (h *WSHyperliquid) processFrame(f frame) {
 	case ChannelUserFills:
 		h.handleUserFills(env.Data, f)
 	case ServerChannelSubscriptionResponse:
-		slog.Debug("hyperliquid: subscription acknowledged", "data", truncate(string(env.Data), 256))
+		h.log().Debug("hyperliquid: subscription acknowledged", "data", truncate(string(env.Data), 256))
 		h.handleSubscriptionResponse(env.Data, f)
 	case ServerChannelPong:
-		slog.Debug("hyperliquid: pong")
+		h.log().Debug("hyperliquid: pong")
 	case ServerChannelError:
 		// The only signal that a subscription was refused. Surfaced as an event
 		// as well as a log: a caller that only mounts a dispatcher must still be
 		// able to notice.
 		msg := decodeErrorFrame(env.Data)
-		slog.Warn("hyperliquid: venue error frame", "error", msg)
+		h.log().Warn("hyperliquid: venue error frame", "error", msg)
 		h.base.DispatchEvent(&connector.HyperliquidErrorEvent{
 			SeqID:      h.base.NextSeqID(),
 			ReceivedAt: f.rx,
@@ -1095,18 +1131,18 @@ func (h *WSHyperliquid) processFrame(f frame) {
 		})
 		h.attributeErrorFrame(msg, f)
 	default:
-		slog.Debug("hyperliquid: ignoring channel", "channel", env.Channel)
+		h.log().Debug("hyperliquid: ignoring channel", "channel", env.Channel)
 	}
 }
 
 func (h *WSHyperliquid) handleL2Book(data json.RawMessage, f frame) {
 	var book L2BookSnapshot
 	if err := json.Unmarshal(data, &book); err != nil {
-		slog.Warn("hyperliquid: l2Book decode failed", "err", err, "data", truncate(string(data), 256))
+		h.log().Warn("hyperliquid: l2Book decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
 	if !h.subscribed(ChannelL2Book, book.Coin, "") {
-		slog.Debug("hyperliquid: l2Book frame for unsubscribed coin", "coin", book.Coin)
+		h.log().Debug("hyperliquid: l2Book frame for unsubscribed coin", "coin", book.Coin)
 		return
 	}
 	ts, synth := msTimeSynth(book.Time, f.rx)
@@ -1126,7 +1162,7 @@ func (h *WSHyperliquid) handleL2Book(data json.RawMessage, f frame) {
 func (h *WSHyperliquid) handleTrades(data json.RawMessage, f frame) {
 	var trades []Trade
 	if err := json.Unmarshal(data, &trades); err != nil {
-		slog.Warn("hyperliquid: trades decode failed", "err", err, "data", truncate(string(data), 256))
+		h.log().Warn("hyperliquid: trades decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
 	// BatchIndex is the print's position in the frame's array and BatchLen the
@@ -1164,11 +1200,11 @@ func (h *WSHyperliquid) handleTrades(data json.RawMessage, f frame) {
 func (h *WSHyperliquid) handleBBO(data json.RawMessage, f frame) {
 	var bbo BBO
 	if err := json.Unmarshal(data, &bbo); err != nil {
-		slog.Warn("hyperliquid: bbo decode failed", "err", err, "data", truncate(string(data), 256))
+		h.log().Warn("hyperliquid: bbo decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
 	if !h.subscribed(ChannelBBO, bbo.Coin, "") {
-		slog.Debug("hyperliquid: bbo frame for unsubscribed coin", "coin", bbo.Coin)
+		h.log().Debug("hyperliquid: bbo frame for unsubscribed coin", "coin", bbo.Coin)
 		return
 	}
 	ts, synth := msTimeSynth(bbo.Time, f.rx)
@@ -1198,16 +1234,16 @@ func (h *WSHyperliquid) handleActiveAssetCtx(data json.RawMessage, f frame) {
 		Ctx  json.RawMessage `json:"ctx"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
-		slog.Warn("hyperliquid: activeAssetCtx decode failed", "err", err, "data", truncate(string(data), 256))
+		h.log().Warn("hyperliquid: activeAssetCtx decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
 	if !h.subscribed(ChannelActiveAssetCtx, msg.Coin, "") {
-		slog.Debug("hyperliquid: activeAssetCtx frame for unsubscribed coin", "coin", msg.Coin)
+		h.log().Debug("hyperliquid: activeAssetCtx frame for unsubscribed coin", "coin", msg.Coin)
 		return
 	}
 	var ctx AssetCtx
 	if err := json.Unmarshal(msg.Ctx, &ctx); err != nil {
-		slog.Warn("hyperliquid: activeAssetCtx context decode failed", "coin", msg.Coin, "err", err)
+		h.log().Warn("hyperliquid: activeAssetCtx context decode failed", "coin", msg.Coin, "err", err)
 		return
 	}
 	// The venue documents one activeAssetCtx subscription serving both
@@ -1240,7 +1276,7 @@ func (h *WSHyperliquid) handleActiveAssetCtx(data json.RawMessage, f frame) {
 func (h *WSHyperliquid) handleAllMids(data json.RawMessage, f frame) {
 	var mids AllMids
 	if err := json.Unmarshal(data, &mids); err != nil {
-		slog.Warn("hyperliquid: allMids decode failed", "err", err, "data", truncate(string(data), 256))
+		h.log().Warn("hyperliquid: allMids decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
 	if !h.subscribed(ChannelAllMids, "", "") {
@@ -1263,7 +1299,7 @@ func (h *WSHyperliquid) handleAllMids(data json.RawMessage, f frame) {
 func (h *WSHyperliquid) handleCandle(data json.RawMessage, f frame) {
 	candles, err := decodeCandles(data)
 	if err != nil {
-		slog.Warn("hyperliquid: candle decode failed", "err", err, "data", truncate(string(data), 256))
+		h.log().Warn("hyperliquid: candle decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
 	for _, c := range candles {
@@ -1307,7 +1343,7 @@ func (h *WSHyperliquid) handleOrderUpdates(data json.RawMessage, f frame) {
 	}
 	var updates []OrderUpdate
 	if err := json.Unmarshal(data, &updates); err != nil {
-		slog.Warn("hyperliquid: orderUpdates decode failed", "err", err, "data", truncate(string(data), 256))
+		h.log().Warn("hyperliquid: orderUpdates decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
 	for i := range updates {
@@ -1341,7 +1377,7 @@ func (h *WSHyperliquid) handleUserFills(data json.RawMessage, f frame) {
 	}
 	var msg UserFills
 	if err := json.Unmarshal(data, &msg); err != nil {
-		slog.Warn("hyperliquid: userFills decode failed", "err", err, "data", truncate(string(data), 256))
+		h.log().Warn("hyperliquid: userFills decode failed", "err", err, "data", truncate(string(data), 256))
 		return
 	}
 	fills := make([]connector.HyperliquidFill, 0, len(msg.Fills))

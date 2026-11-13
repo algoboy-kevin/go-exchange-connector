@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	coderws "github.com/coder/websocket"
@@ -67,6 +68,12 @@ type BaseWebSocket struct {
 	// they are guarded by mu so a Close racing a Connect is -race clean.
 	url  string
 	opts WSOptions
+
+	// logger is the instance logger resolved from WSOptions.Logger at Connect:
+	// nil (the default) means slog.Default() looked up at each call site by
+	// log(). Atomic so the read loops never touch mu for a log line —
+	// log() is called from paths that already hold or are about to hold it.
+	logger atomic.Pointer[slog.Logger]
 
 	// life is the current connection generation: its context, goroutines and
 	// done channel. nil when no Connect has succeeded and after Close. See
@@ -130,6 +137,7 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 	b.opts = opts
 	b.life = life
 	b.mu.Unlock()
+	b.logger.Store(opts.Logger)
 
 	if err := b.dialSync(life); err != nil {
 		// The dial (or its OnConnect hook, or the DialGate) failed. This
@@ -176,7 +184,7 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 		// No supervisor underneath the caller's: after a drop nothing
 		// redials, the status stays disconnected and Close() only has to
 		// stop the read loop and the watchdog (both select on life.ctx).
-		slog.Debug("websocket: NoReconnect set, reconnect loop not started")
+		b.log().Debug("websocket: NoReconnect set, reconnect loop not started")
 	} else {
 		life.goRun(func() { b.reconnLoop(life) })
 	}
@@ -187,7 +195,7 @@ func (b *BaseWebSocket) Connect(ctx context.Context, url string, opts WSOptions)
 	go life.finish()
 
 	// URLs may contain private stream credentials in the path or query.
-	slog.Info("websocket: connected")
+	b.log().Info("websocket: connected")
 	return nil
 }
 
@@ -248,7 +256,7 @@ func (b *BaseWebSocket) Close() {
 	select {
 	case <-life.done:
 	case <-time.After(closeDrainTimeout):
-		slog.Warn("websocket: close timed out waiting for websocket goroutines to exit")
+		b.log().Warn("websocket: close timed out waiting for websocket goroutines to exit")
 	}
 }
 
@@ -472,10 +480,10 @@ func (b *BaseWebSocket) readLoop(life *wsLife) {
 			// reconnLoop, so keep it quiet. Other codes are worth a Warn.
 			if code := coderws.CloseStatus(err); code != -1 {
 				if code == coderws.StatusGoingAway {
-					slog.Debug("websocket: server closed connection (going away)",
+					b.log().Debug("websocket: server closed connection (going away)",
 						"code", code, "reason", err.Error())
 				} else {
-					slog.Warn("websocket: server closed connection",
+					b.log().Warn("websocket: server closed connection",
 						"code", code, "reason", err.Error())
 				}
 			}
@@ -566,7 +574,7 @@ func (b *BaseWebSocket) reconnLoop(life *wsLife) {
 			var flapped bool
 			delay, flapped = nextDelayAfterDrop(delay, baseDelay, maxDelay, minStable, lived)
 			if flapped {
-				slog.Warn("websocket: connection flapping, backing off",
+				b.log().Warn("websocket: connection flapping, backing off",
 					"url", b.urlString(),
 					"lived", lived.Round(time.Millisecond).String(),
 					"next_backoff", delay.String(),
@@ -578,10 +586,10 @@ func (b *BaseWebSocket) reconnLoop(life *wsLife) {
 			}
 		}
 
-		slog.Debug("websocket: reconnecting", "url", b.urlString(), "delay", delay.String())
+		b.log().Debug("websocket: reconnecting", "url", b.urlString(), "delay", delay.String())
 		if err := b.dialSync(life); err != nil {
 			delay = nextBackoff(delay, maxDelay)
-			slog.Warn("websocket: reconnection failed", "error", err, "next_backoff", delay.String())
+			b.log().Warn("websocket: reconnection failed", "error", err, "next_backoff", delay.String())
 			continue
 		}
 
@@ -668,7 +676,7 @@ func (b *BaseWebSocket) startPingLoop(life *wsLife, conn *coderws.Conn) {
 					// installed by a concurrent dialSync (mirror the readLoop
 					// guard).
 					if b.Conn() == conn {
-						slog.Warn("websocket: pong timeout, forcing reconnect", "err", err)
+						b.log().Warn("websocket: pong timeout, forcing reconnect", "err", err)
 						b.Disconnect() // closes conn, fires OnDisconnect, reconnLoop redials
 					}
 					return
@@ -681,6 +689,17 @@ func (b *BaseWebSocket) startPingLoop(life *wsLife, conn *coderws.Conn) {
 // ─────────────────────────────────────────────────────────────
 // Internal: helpers
 // ─────────────────────────────────────────────────────────────
+
+// log returns the logger this connection logs through: WSOptions.Logger when
+// it was set, otherwise slog.Default() evaluated NOW (not at Connect). Every
+// log line in this package goes through here so one injected logger captures
+// exactly one instance's connect/reconnect/drop lines.
+func (b *BaseWebSocket) log() *slog.Logger {
+	if l := b.logger.Load(); l != nil {
+		return l
+	}
+	return slog.Default()
+}
 
 func (b *BaseWebSocket) shouldConnect() bool {
 	if b.ShouldConnect != nil {
@@ -780,7 +799,7 @@ func (b *BaseWebSocket) safeCallOnDisconnect(err error) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("websocket: OnDisconnect panic", "err", r)
+				b.log().Error("websocket: OnDisconnect panic", "err", r)
 			}
 		}()
 		if b.OnDisconnect != nil {
@@ -793,7 +812,7 @@ func (b *BaseWebSocket) safeCallOnError(err error) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("websocket: OnError panic", "err", r)
+				b.log().Error("websocket: OnError panic", "err", r)
 			}
 		}()
 		if b.OnError != nil {
@@ -848,7 +867,7 @@ func (b *BaseWebSocket) dataStaleWatchdog(ctx context.Context) {
 				continue
 			}
 			if since := time.Since(b.lastData()); since >= timeout {
-				slog.Warn("websocket: no data, forcing reconnect", "age", since.String())
+				b.log().Warn("websocket: no data, forcing reconnect", "age", since.String())
 				b.Disconnect()
 			}
 		}

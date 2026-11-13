@@ -38,6 +38,10 @@ type WSPolymarketUserWS struct {
 	// Config.ReadLimitBytes (0 → 1 MiB default).
 	readLimit int64
 
+	// logger overrides where this stream's log lines go (see SetLogger). nil —
+	// the default — means slog.Default(), resolved at each call.
+	logger *slog.Logger
+
 	pingCancel context.CancelFunc
 }
 
@@ -71,7 +75,7 @@ func NewWSPolymarketUserWS(base *connector.Connector, auth UserAuth, handlers Us
 		if u.handlers.OnError != nil {
 			u.handlers.OnError(err)
 		} else {
-			slog.Warn("user WS: error", "err", err)
+			u.log().Warn("user WS: error", "err", err)
 		}
 	}
 
@@ -95,6 +99,24 @@ func (u *WSPolymarketUserWS) SetReadLimitBytes(n int64) {
 	u.readLimit = resolveReadLimit(n)
 }
 
+// SetLogger routes every log line this stream writes — and, through the
+// connection options it builds, the embedded BaseWebSocket's connect/reconnect/
+// drop lines — to l. Passing nil (the default) restores slog.Default(),
+// resolved at each call so a process that swaps the default keeps working.
+// Call it before Start; see the other Set* setters.
+func (u *WSPolymarketUserWS) SetLogger(l *slog.Logger) {
+	u.logger = l
+}
+
+// log returns the logger this stream logs through: the injected one when set,
+// otherwise slog.Default() evaluated at CALL time.
+func (u *WSPolymarketUserWS) log() *slog.Logger {
+	if u.logger != nil {
+		return u.logger
+	}
+	return slog.Default()
+}
+
 // wsOptions builds the connection options for the user channel. Kept separate
 // from Start so the transport settings can be asserted without a live socket.
 func (u *WSPolymarketUserWS) wsOptions() ws.WSOptions {
@@ -105,6 +127,9 @@ func (u *WSPolymarketUserWS) wsOptions() ws.WSOptions {
 	// streaming default for DataStaleTimeout.
 	opts.DataStaleTimeout = 30000
 	opts.ReadLimit = u.readLimit
+	// The BaseWebSocket inside this stream logs connect/reconnect/drop lines;
+	// point them at the same logger as the stream itself.
+	opts.Logger = u.logger
 	return opts
 }
 
@@ -243,7 +268,7 @@ func (u *WSPolymarketUserWS) onDisconnect(err error) {
 	if u.handlers.OnWSClose != nil {
 		u.handlers.OnWSClose()
 	} else {
-		slog.Debug("user WS: disconnected")
+		u.log().Debug("user WS: disconnected")
 	}
 }
 
@@ -275,7 +300,7 @@ func (u *WSPolymarketUserWS) onMessage(ctx context.Context, data []byte) error {
 		case "trade":
 			u.handleTrade(r)
 		default:
-			slog.Debug("user WS: unknown event type", "type", envelope.EventType)
+			u.log().Debug("user WS: unknown event type", "type", envelope.EventType)
 		}
 	}
 	return nil
@@ -284,7 +309,7 @@ func (u *WSPolymarketUserWS) onMessage(ctx context.Context, data []byte) error {
 func (u *WSPolymarketUserWS) handleOrder(raw json.RawMessage) {
 	var ev OrderWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		slog.Warn("user WS: failed to parse order", "err", err)
+		u.log().Warn("user WS: failed to parse order", "err", err)
 		return
 	}
 
@@ -320,7 +345,7 @@ func (u *WSPolymarketUserWS) handleOrder(raw json.RawMessage) {
 func (u *WSPolymarketUserWS) handleTrade(raw json.RawMessage) {
 	var ev TradeWSEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		slog.Warn("user WS: failed to parse trade", "err", err)
+		u.log().Warn("user WS: failed to parse trade", "err", err)
 		return
 	}
 
