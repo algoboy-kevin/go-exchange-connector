@@ -154,6 +154,19 @@ type Options struct {
 	// Use it to tag one instance, e.g.
 	// opts.Logger = slog.Default().With("venue", "hl", "role", "market").
 	Logger *slog.Logger
+
+	// DialGate, if non-nil, is consulted before EVERY dial attempt (the initial Start and every
+	// reconnect). It may block (a rate limiter's Take) and must respect ctx. A non-nil error means
+	// "do not dial now": Start returns it wrapped, and the reconnect loop treats it as a failed
+	// attempt (backoff escalates). Same contract as websocket.WSOptions.DialGate.
+	DialGate func(ctx context.Context) error `json:"-"`
+	// SendGate, if non-nil, is consulted before outbound frames; n is the payload size in bytes.
+	// Today it already covers the websocket layer's own pings; card H6b extends it to every frame
+	// this manager writes. Same contract as websocket.WSOptions.SendGate.
+	SendGate func(ctx context.Context, n int) error `json:"-"`
+	// NoReconnect disables the connector's own redial: after a drop the status stays
+	// disconnected and the supervisor owns the redial. Same as websocket.WSOptions.NoReconnect.
+	NoReconnect bool
 }
 
 // DefaultOptions returns the transport defaults.
@@ -350,6 +363,9 @@ func (h *WSHyperliquid) Start(ctx context.Context, reconnectIntervalMs int64) er
 	// them at the same logger as this manager so a per-instance logger sees the
 	// whole connection lifecycle and not just the Hyperliquid-level lines.
 	opts.Logger = h.opts.Logger
+	opts.DialGate = h.opts.DialGate
+	opts.SendGate = h.opts.SendGate
+	opts.NoReconnect = h.opts.NoReconnect
 
 	if err := h.conn.Connect(ctx, h.opts.URL, opts); err != nil {
 		cancel()
