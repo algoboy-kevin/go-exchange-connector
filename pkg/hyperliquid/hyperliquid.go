@@ -298,14 +298,22 @@ func (h *WSHyperliquid) SetRawFrameHandler(fn func(frame []byte, rx time.Time)) 
 // Keep it cheap: it runs on the read loop (a blocking or I/O-bound hook
 // throttles frame reads, which is how a connector talks itself into a drop) and
 // it runs once per drained frame during disconnect handling.
-func (h *WSHyperliquid) SetOnFrameDropped(fn func(DroppedFrame)) {
+func (h *WSHyperliquid) SetOnFrameDropped(fn func(connector.DroppedFrame)) {
 	h.conn.fa.setOnDrop(fn)
 }
 
 // Stats returns the frame accounting snapshot: frames read, dropped and
 // drained, the decode queue's depth/capacity/high-water, the current connection
 // generation and the disconnect count. Lock-free and safe from any goroutine.
-func (h *WSHyperliquid) Stats() Stats {
+//
+// The type is the shared connector.FrameStats used by every venue adapter. The
+// identity that holds at any instant is
+//
+//	FramesRead == delivered + FramesDropped + FramesDrained + inFlight
+//
+// where inFlight is 0 or 1 (the frame the dispatcher is decoding) and delivered
+// is whatever the consumer counted. See the H2 report for the loopback test.
+func (h *WSHyperliquid) Stats() connector.FrameStats {
 	return h.conn.fa.snapshot(h.conn.sm.connID.Load())
 }
 
@@ -951,7 +959,7 @@ func (c *hlConn) onMessage(_ context.Context, data []byte) error {
 	default:
 	}
 
-	c.fa.noteDrop(f, DropQueueFull)
+	c.fa.noteDrop(f, connector.DropQueueFull)
 	if !c.accountBearing() {
 		// Market data: losing a frame is bad but harmless (the next l2Book
 		// snapshot supersedes it), and the drop is counted and reported.
@@ -995,7 +1003,7 @@ func (c *hlConn) drainEvents() {
 		select {
 		case f := <-c.eventCh:
 			c.fa.dequeued()
-			c.fa.noteDrop(f, DropDrainedOnDisconnect)
+			c.fa.noteDrop(f, connector.DropDrainedOnDisconnect)
 		default:
 			return
 		}

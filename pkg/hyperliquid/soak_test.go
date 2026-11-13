@@ -408,8 +408,8 @@ func TestSoakHyperliquidMarket(t *testing.T) {
 	waitSoak(t, "the first connection", 5*time.Second, func() bool { return v.numConns() == 1 })
 
 	var droppedMu sync.Mutex
-	var droppedFrames []DroppedFrame
-	h.SetOnFrameDropped(func(f DroppedFrame) {
+	var droppedFrames []connector.DroppedFrame
+	h.SetOnFrameDropped(func(f connector.DroppedFrame) {
 		droppedMu.Lock()
 		droppedFrames = append(droppedFrames, f)
 		droppedMu.Unlock()
@@ -515,7 +515,7 @@ func TestSoakHyperliquidMarket(t *testing.T) {
 	events := append([]*connector.HyperliquidBookEvent(nil), bookEvents...)
 	eventsMu.Unlock()
 	droppedMu.Lock()
-	droppedFs := append([]DroppedFrame(nil), droppedFrames...)
+	droppedFs := append([]connector.DroppedFrame(nil), droppedFrames...)
 	droppedMu.Unlock()
 	reads := raw.snapshot()
 
@@ -546,9 +546,9 @@ func TestSoakHyperliquidMarket(t *testing.T) {
 	for _, f := range droppedFs {
 		dropSet[f.FrameID]++
 		switch f.Cause {
-		case DropQueueFull:
+		case connector.DropQueueFull:
 			queueFull++
-		case DropDrainedOnDisconnect:
+		case connector.DropDrainedOnDisconnect:
 			drainedHook++
 		default:
 			t.Fatalf("drop hook reported undocumented cause %q", f.Cause)
@@ -733,8 +733,8 @@ func TestSoakHyperliquidAccount(t *testing.T) {
 	waitSoak(t, "the first connection", 5*time.Second, func() bool { return v.numConns() == 1 })
 
 	var droppedMu sync.Mutex
-	var droppedFrames []DroppedFrame
-	h.SetOnFrameDropped(func(f DroppedFrame) {
+	var droppedFrames []connector.DroppedFrame
+	h.SetOnFrameDropped(func(f connector.DroppedFrame) {
 		droppedMu.Lock()
 		droppedFrames = append(droppedFrames, f)
 		droppedMu.Unlock()
@@ -830,7 +830,7 @@ func TestSoakHyperliquidAccount(t *testing.T) {
 	discTrace := append([]string(nil), discLog...)
 	discMu.Unlock()
 	droppedMu.Lock()
-	droppedFs := append([]DroppedFrame(nil), droppedFrames...)
+	droppedFs := append([]connector.DroppedFrame(nil), droppedFrames...)
 	droppedMu.Unlock()
 	writtenMu.Lock()
 	w := map[int][]int64{}
@@ -897,9 +897,9 @@ func TestSoakHyperliquidAccount(t *testing.T) {
 	for _, f := range droppedFs {
 		droppedIDs[f.FrameID] = true
 		switch f.Cause {
-		case DropQueueFull:
+		case connector.DropQueueFull:
 			queueFull++
-		case DropDrainedOnDisconnect:
+		case connector.DropDrainedOnDisconnect:
 			drainedHook++
 		default:
 			t.Fatalf("drop hook reported undocumented cause %q", f.Cause)

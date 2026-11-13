@@ -39,6 +39,7 @@ type DropCause string
 const (
 	// DropQueueFull: the read loop could not enqueue it because the decode
 	// queue was full. The read loop keeps going; the frame is gone.
+	// On a Hyperliquid account-bearing connection a full queue fails the connection instead (see HyperliquidGapEvent).
 	DropQueueFull DropCause = "queue_full"
 	// DropDrainedOnDisconnect: it was queued when the connection dropped and
 	// the queue was discarded.

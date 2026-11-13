@@ -302,8 +302,8 @@ func TestOnFrameDroppedQueueFull(t *testing.T) {
 	h.conn.sm.connID.Store(3)
 
 	var mu sync.Mutex
-	var drops []DroppedFrame
-	h.SetOnFrameDropped(func(df DroppedFrame) {
+	var drops []connector.DroppedFrame
+	h.SetOnFrameDropped(func(df connector.DroppedFrame) {
 		mu.Lock()
 		drops = append(drops, df)
 		mu.Unlock()
@@ -333,8 +333,8 @@ func TestOnFrameDroppedQueueFull(t *testing.T) {
 	if d.FrameID != 3 {
 		t.Errorf("DroppedFrame.FrameID = %d, want 3 (the third frame read)", d.FrameID)
 	}
-	if d.ConnID != 3 || d.Cause != DropQueueFull || d.At.IsZero() {
-		t.Errorf("DroppedFrame = %+v, want conn 3 / cause %q / non-zero At", d, DropQueueFull)
+	if d.ConnID != 3 || d.Cause != connector.DropQueueFull || d.At.IsZero() {
+		t.Errorf("DroppedFrame = %+v, want conn 3 / cause %q / non-zero At", d, connector.DropQueueFull)
 	}
 
 	// A market-only connection keeps reading: nothing else was dispatched and
@@ -390,7 +390,7 @@ func TestSlowConsumerExactDropAccounting(t *testing.T) {
 
 	rec := &eventRecorder{}
 	var hookMu sync.Mutex
-	var hookDrops []DroppedFrame
+	var hookDrops []connector.DroppedFrame
 
 	v := newScriptVenue(t, func(gen int, c *coderws.Conn, v *scriptVenue) {
 		if gen != 0 {
@@ -403,7 +403,7 @@ func TestSlowConsumerExactDropAccounting(t *testing.T) {
 		rec.add(ev) // record in dispatch order, then stall
 		<-gate
 	}, func(h *WSHyperliquid) {
-		h.SetOnFrameDropped(func(df DroppedFrame) {
+		h.SetOnFrameDropped(func(df connector.DroppedFrame) {
 			hookMu.Lock()
 			hookDrops = append(hookDrops, df)
 			hookMu.Unlock()
@@ -482,15 +482,15 @@ func TestSlowConsumerExactDropAccounting(t *testing.T) {
 	}
 
 	hookMu.Lock()
-	drops := append([]DroppedFrame(nil), hookDrops...)
+	drops := append([]connector.DroppedFrame(nil), hookDrops...)
 	hookMu.Unlock()
 	if uint64(len(drops)) != st.FramesDropped {
 		t.Errorf("drop hook calls = %d, FramesDropped = %d", len(drops), st.FramesDropped)
 	}
 	hookIDs := make(map[uint64]bool, len(drops))
 	for _, d := range drops {
-		if d.Cause != DropQueueFull {
-			t.Errorf("DroppedFrame cause = %q, want %q", d.Cause, DropQueueFull)
+		if d.Cause != connector.DropQueueFull {
+			t.Errorf("DroppedFrame cause = %q, want %q", d.Cause, connector.DropQueueFull)
 		}
 		if d.ConnID != 1 {
 			t.Errorf("DroppedFrame.ConnID = %d, want 1", d.ConnID)
@@ -520,7 +520,7 @@ func TestDrainOnDisconnectIsCounted(t *testing.T) {
 
 	rec := &eventRecorder{}
 	var hookMu sync.Mutex
-	var drainedFrames []DroppedFrame
+	var drainedFrames []connector.DroppedFrame
 
 	wrote := make(chan struct{})
 	v := newScriptVenue(t, func(gen int, c *coderws.Conn, v *scriptVenue) {
@@ -535,9 +535,9 @@ func TestDrainOnDisconnectIsCounted(t *testing.T) {
 		rec.add(ev)
 		<-gate
 	}, func(h *WSHyperliquid) {
-		h.SetOnFrameDropped(func(df DroppedFrame) {
+		h.SetOnFrameDropped(func(df connector.DroppedFrame) {
 			hookMu.Lock()
-			if df.Cause == DropDrainedOnDisconnect {
+			if df.Cause == connector.DropDrainedOnDisconnect {
 				drainedFrames = append(drainedFrames, df)
 			}
 			hookMu.Unlock()
@@ -793,7 +793,7 @@ func TestAccountOverflowFailsConnectionAndGaps(t *testing.T) {
 
 	rec := &eventRecorder{}
 	var discMu sync.Mutex
-	var discStats []Stats
+	var discStats []connector.FrameStats
 
 	v := newScriptVenue(t, func(gen int, c *coderws.Conn, v *scriptVenue) {
 		switch gen {
@@ -1158,7 +1158,7 @@ func BenchmarkFrameAccountingDropNoHook(b *testing.B) {
 	f := frame{id: 1, connID: 1, rx: time.Now()}
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		fa.noteDrop(f, DropQueueFull)
+		fa.noteDrop(f, connector.DropQueueFull)
 	}
 }
 

@@ -3,69 +3,9 @@ package hyperliquid
 import (
 	"sync"
 	"sync/atomic"
-	"time"
+
+	connector "github.com/algoboy-kevin/go-exchange-connector"
 )
-
-// Stats is a point-in-time snapshot of one WSHyperliquid's frame accounting.
-// It is read from lock-free atomics, so Stats is safe to call from any
-// goroutine, including a dispatcher handler and a signal handler.
-//
-// The identity that holds at any instant is
-//
-//	FramesRead == FramesDelivered + FramesDropped + FramesDrained + inFlight
-//
-// where inFlight is 0 or 1 (the frame the dispatcher is currently decoding) and
-// FramesDelivered is not tracked here (it is whatever the consumer counted).
-// See the H2 report for the loopback test that asserts it.
-type Stats struct {
-	// FramesRead counts every frame handed to the read loop, before the decode
-	// queue — including pongs, acks, error frames and frames for unsubscribed
-	// coins. Every frame read consumes exactly one FrameID.
-	FramesRead uint64
-	// FramesDropped counts frames discarded because the decode queue was full.
-	FramesDropped uint64
-	// FramesDrained counts frames discarded on disconnect: queued but never
-	// decoded, so never delivered to the dispatcher.
-	FramesDrained uint64
-	// QueueLen is the number of frames currently waiting in the decode queue.
-	QueueLen int
-	// QueueCap is the configured depth of the decode queue
-	// (Options.EventQueueSize, default 8192).
-	QueueCap int
-	// QueueHighWater is the deepest the decode queue has ever been. It equals
-	// QueueCap once a drop has happened.
-	QueueHighWater int
-	// ConnID is the current connection generation (0 before the first connect).
-	ConnID uint64
-	// Disconnects counts connection drops since Start (not deliberate Stop).
-	Disconnects uint64
-}
-
-// DropCause says why a frame never reached the dispatcher.
-type DropCause string
-
-const (
-	// DropQueueFull: the read loop could not enqueue it because the decode
-	// queue was full. On a market-only connection the read loop keeps going;
-	// on an account-bearing connection it fails the connection instead (see
-	// HyperliquidGapEvent).
-	DropQueueFull DropCause = "queue_full"
-	// DropDrainedOnDisconnect: it was queued when the connection dropped and
-	// the queue was discarded (account frames included: this is the loss the
-	// gap event exists to announce).
-	DropDrainedOnDisconnect DropCause = "drained_on_disconnect"
-)
-
-// DroppedFrame describes one frame that never reached the dispatcher. It is
-// delivered to the SetOnFrameDropped hook on the goroutine that discarded the
-// frame (read loop for DropQueueFull, the disconnect path for
-// DropDrainedOnDisconnect), so the hook must be cheap: no blocking, no I/O.
-type DroppedFrame struct {
-	FrameID uint64    // the frame's ID; consecutive delivered FrameIDs skip it
-	ConnID  uint64    // connection generation the frame arrived on
-	At      time.Time // the frame's read time
-	Cause   DropCause
-}
 
 // frameAccounting is the atomic counter block of an hlConn. The zero value is
 // ready to use; queueCap must be set once, before the read loop starts.
@@ -86,7 +26,7 @@ type frameAccounting struct {
 	queueCap   int
 
 	dropMu sync.RWMutex
-	onDrop func(DroppedFrame)
+	onDrop func(connector.DroppedFrame)
 }
 
 func (a *frameAccounting) cap() int {
@@ -112,12 +52,12 @@ func (a *frameAccounting) enqueued() {
 func (a *frameAccounting) dequeued() { a.queueLen.Add(-1) }
 
 // noteDrop counts a discarded frame and, if a hook is registered, reports it.
-func (a *frameAccounting) noteDrop(f frame, cause DropCause) {
+func (a *frameAccounting) noteDrop(f frame, cause connector.DropCause) {
 	a.lostSinceGap.Add(1)
 	switch cause {
-	case DropQueueFull:
+	case connector.DropQueueFull:
 		a.dropped.Add(1)
-	case DropDrainedOnDisconnect:
+	case connector.DropDrainedOnDisconnect:
 		a.drained.Add(1)
 	}
 	a.dropMu.RLock()
@@ -126,17 +66,17 @@ func (a *frameAccounting) noteDrop(f frame, cause DropCause) {
 	if fn == nil {
 		return
 	}
-	fn(DroppedFrame{FrameID: f.id, ConnID: f.connID, At: f.rx, Cause: cause})
+	fn(connector.DroppedFrame{FrameID: f.id, ConnID: f.connID, At: f.rx, Cause: cause})
 }
 
-func (a *frameAccounting) setOnDrop(fn func(DroppedFrame)) {
+func (a *frameAccounting) setOnDrop(fn func(connector.DroppedFrame)) {
 	a.dropMu.Lock()
 	a.onDrop = fn
 	a.dropMu.Unlock()
 }
 
-func (a *frameAccounting) snapshot(connID uint64) Stats {
-	return Stats{
+func (a *frameAccounting) snapshot(connID uint64) connector.FrameStats {
+	return connector.FrameStats{
 		FramesRead:     a.read.Load(),
 		FramesDropped:  a.dropped.Load(),
 		FramesDrained:  a.drained.Load(),
